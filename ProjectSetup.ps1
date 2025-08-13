@@ -1,5 +1,5 @@
 # Go to your project folder
-cd "C:\Projects\M365RoadMap"
+cd "C:\echomediaai\M365RoadMap"
 
 # Initialize a new Git repository (creates .git)
 git init
