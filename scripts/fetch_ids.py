@@ -2,23 +2,26 @@
 """
 Auto-discovers Microsoft 365 Roadmap feature IDs by scraping the public roadmap pages.
 
-Inputs (CLI):
+Key improvements vs prior version:
+- Loose instance filtering: when include_set is present but the card's instance is missing,
+  we KEEP the card (so we don't drop items whose instance isn't printed on the list page).
+- Loose date filtering: when we can't parse the targeted date, we KEEP the card when any
+  date filter is requested (post-processing will handle precise filtering from the final table).
+- Debug logging and higher default pagination.
+
+CLI:
   --months INT          Number of months back from today (1..6). Mutually exclusive with --since/--until
   --since YYYY-MM-DD    Start date
   --until YYYY-MM-DD    End date
-  --include TEXT        Comma-separated cloud instances to include (e.g. "DoD,GCC,GCC High,Worldwide (Standard Multi-Tenant)")
+  --include TEXT        Comma-separated cloud instances to include
   --exclude TEXT        Comma-separated instances to exclude
-  --status TEXT         Optional: filter by status (comma-separated; e.g. "In development,Rolling out,Launched")
-  --max-pages INT       Safety limit for pagination (default 20)
+  --max-pages INT       Pagination cap (default 30)
   --emit TEXT           Output format: "csv" or "list" (default "list")
+  --debug               Print discovery diagnostics
 
 Output:
-  Prints a comma-separated list of feature IDs (default) OR CSV with columns:
+  Prints comma-separated IDs (list) OR CSV with columns:
     id,title,status,phase,targeted_dates,cloud_instance,link
-
-Notes:
-  - This scrapes the public roadmap UI. If Microsoft changes markup, selectors may need an update.
-  - Be polite: we sleep briefly between pages.
 """
 
 import argparse
@@ -27,14 +30,12 @@ import sys
 import time
 import re
 from datetime import datetime, timedelta
-from urllib.parse import urljoin, urlencode
+from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
 
 BASE = "https://www.microsoft.com/en-us/microsoft-365/roadmap"
-
-# ---------- Helpers ----------
 
 def parse_args():
     ap = argparse.ArgumentParser()
@@ -43,9 +44,9 @@ def parse_args():
     ap.add_argument("--until", type=str, default="")
     ap.add_argument("--include", type=str, default="")
     ap.add_argument("--exclude", type=str, default="")
-    ap.add_argument("--status", type=str, default="")
-    ap.add_argument("--max-pages", type=int, default=20)
+    ap.add_argument("--max-pages", type=int, default=30)
     ap.add_argument("--emit", type=str, default="list", choices=["list", "csv"])
+    ap.add_argument("--debug", action="store_true")
     return ap.parse_args()
 
 def norm_instance(s: str) -> str:
@@ -61,14 +62,18 @@ def norm_instance(s: str) -> str:
         return "gcc"
     return s.strip()
 
-def within_date(target_text: str, since_dt, until_dt, months):
+def within_date_loose(target_text: str, since_dt, until_dt, months) -> bool:
+    """Loose date filter: if parsing fails or missing, KEEP the card when any date filter is requested."""
+    # If no date filter requested, accept all
     if not (since_dt or until_dt or months):
         return True
 
-    # Normalize forms like "September CY2025" / "Q4 CY2025" / "H2 CY2025" / "2025"
     txt = (target_text or "").replace("CY", "").strip()
+    if not txt or txt.lower() in ("tbd", "unknown", "n/a"):
+        # Can't parse from list page -> keep it; post-processing will filter precisely later
+        return True
 
-    # Month Year
+    # Try standard formats
     for fmt in ("%B %Y", "%Y-%m-%d"):
         try:
             dt = datetime.strptime(txt, fmt)
@@ -100,8 +105,8 @@ def within_date(target_text: str, since_dt, until_dt, months):
         dt = datetime(int(m.group(1)), 1, 1)
         return _dt_within(dt, since_dt, until_dt, months)
 
-    # If unparseable (e.g., "TBD"), exclude from date filtering
-    return False
+    # Unparseable -> keep
+    return True
 
 def _dt_within(dt, since_dt, until_dt, months):
     now = datetime.utcnow()
@@ -113,24 +118,18 @@ def _dt_within(dt, since_dt, until_dt, months):
     if until_dt and dt > until_dt: return False
     return True
 
-def matches_status(status_text: str, allowed_statuses):
-    if not allowed_statuses:
-        return True
-    st = (status_text or "").strip().lower()
-    return any(s.strip().lower() == st for s in allowed_statuses)
-
-def instance_allowed(instance_text: str, include_set, exclude_set):
+def instance_allowed_loose(instance_text: str, include_set, exclude_set) -> bool:
+    """Loose instance filter: if include_set is provided but instance is missing, KEEP item."""
     norm = norm_instance(instance_text).lower()
-    if include_set and norm not in include_set:
-        return False
     if exclude_set and norm in exclude_set:
         return False
+    if include_set:
+        if not norm:
+            return True  # keep unknowns; final filter will occur in post-processing
+        return norm in include_set
     return True
 
-# ---------- Scraper ----------
-
 def fetch_page(session, page: int):
-    # Roadmap supports pagination via ?page=, we keep filters client-side here and filter post-parse
     url = f"{BASE}?page={page}"
     resp = session.get(url, timeout=30)
     resp.raise_for_status()
@@ -138,13 +137,12 @@ def fetch_page(session, page: int):
 
 def parse_cards(html):
     """
-    Parse feature cards out of the page.
+    Parse feature cards out of a page.
     Returns list of dicts:
-      id, title, status, phase, targeted_dates, cloud_instance, link
+      id,title,status,phase,targeted_dates,cloud_instance,link
     """
     soup = BeautifulSoup(html, "html.parser")
     cards = []
-    # Cards are often divs/anchors containing links like ...roadmap?featureid=498159
     for a in soup.select("a[href*='featureid=']"):
         href = a.get("href", "")
         m = re.search(r"featureid=(\d+)", href)
@@ -153,14 +151,11 @@ def parse_cards(html):
         fid = m.group(1)
         link = href if href.startswith("http") else urljoin(BASE, href)
 
-        # Card root
         card = a.find_parent(["div","li","article"]) or a
-
         text = card.get_text(" ", strip=True)
-        # Try to extract labeled bits (best-effort; site may change)
         title = a.get_text(strip=True) or f"Feature {fid}"
 
-        # Heuristics
+        # Best-effort label extraction
         status = _extract_labeled(text, ["Status:", "status:"])
         phase = _extract_labeled(text, ["Release phase:", "Phase:", "release phase:"])
         targeted = _extract_labeled(text, ["Targeted:", "Targeted Release:", "Dates:", "Targeted dates:"])
@@ -182,7 +177,6 @@ def _extract_labeled(text, labels):
         idx = text.lower().find(lab.lower())
         if idx != -1:
             seg = text[idx + len(lab):].strip()
-            # take up to next label-like break
             seg = seg.split("  ")[0].split("|")[0].split("  •  ")[0].strip()
             return seg
     return ""
@@ -198,47 +192,44 @@ def dedupe(items, key="id"):
         out.append(it)
     return out
 
-# ---------- Main ----------
-
 def main():
     args = parse_args()
 
     include_set = set(x.strip().lower() for x in args.include.split(",")) if args.include else set()
     exclude_set = set(x.strip().lower() for x in args.exclude.split(",")) if args.exclude else set()
-    statuses = [s for s in (args.status or "").split(",") if s.strip()]
     since_dt = datetime.strptime(args.since, "%Y-%m-%d") if args.since else None
     until_dt = datetime.strptime(args.until, "%Y-%m-%d") if args.until else None
 
     session = requests.Session()
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 (compatible; RoadmapScraper/1.0; +https://example.local)"
+        "User-Agent": "Mozilla/5.0 (compatible; RoadmapScraper/1.1; +https://example.local)"
     })
 
     all_cards = []
     for page in range(1, args.max_pages + 1):
         html = fetch_page(session, page)
         cards = parse_cards(html)
+        if args.debug:
+            print(f"[debug] page={page} cards_found={len(cards)}", file=sys.stderr)
         if not cards:
-            # likely no more pages
             break
         all_cards.extend(cards)
-        time.sleep(0.8)  # be polite
+        time.sleep(0.6)  # be polite
 
-    # Dedupe again across pages
     all_cards = dedupe(all_cards, key="id")
 
-    # Apply filters
+    # Apply loose filters
     filtered = []
     for c in all_cards:
-        if not matches_status(c.get("status",""), statuses):
+        if not instance_allowed_loose(c.get("cloud_instance",""), include_set, exclude_set):
             continue
-        if not instance_allowed(c.get("cloud_instance",""), include_set, exclude_set):
-            continue
-        if not within_date(c.get("targeted_dates",""), since_dt, until_dt, args.months):
+        if not within_date_loose(c.get("targeted_dates",""), since_dt, until_dt, args.months):
             continue
         filtered.append(c)
 
-    # Emit
+    if args.debug:
+        print(f"[debug] total_cards={len(all_cards)} kept_after_filters={len(filtered)}", file=sys.stderr)
+
     if args.emit == "csv":
         w = csv.writer(sys.stdout)
         w.writerow(["id","title","status","phase","targeted_dates","cloud_instance","link"])
@@ -253,8 +244,7 @@ def main():
                 c.get("link",""),
             ])
     else:
-        ids = ",".join(c["id"] for c in filtered)
-        print(ids)
+        print(",".join(c["id"] for c in filtered))
 
 if __name__ == "__main__":
     main()
