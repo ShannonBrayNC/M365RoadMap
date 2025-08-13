@@ -65,7 +65,7 @@ jobs:
           else
             echo "No requirements.txt found. Skipping pip install."
           fi
-
+          
       - name: Make scripts executable & normalize line endings
         shell: bash
         run: |
@@ -76,52 +76,29 @@ jobs:
       - name: Ensure sample report exists (first-run safety)
         shell: bash
         run: |
-          mkdir -p output
+          sudo apt-get update && sudo apt-get install -y dos2unix
+          dos2unix scripts/write_sample.sh || true
+          chmod +x scripts/write_sample.sh
           if [ ! -f output/roadmap_report.md ]; then
-            python -c "import os; os.makedirs('output', exist_ok=True); open('output/roadmap_report.md','w',encoding='utf-8').write('''# Example Report
-
-              ## Master Summary Table (all IDs)
-              | ID | Title | Product/Workload | Status | Release phase | Targeted dates | Cloud instance | Short description | Official Roadmap link |
-              |----|-------|------------------|--------|---------------|----------------|----------------|-------------------|-----------------------|
-              | 498159 | Microsoft Teams: Chat Notes | Teams | In development | Targeted | September CY2025 | Worldwide (Standard Multi-Tenant) | Chat-scoped notes with Loop/components | https://www.microsoft.com/en-us/microsoft-365/roadmap?featureid=498159 |
-              | 700001 | Example Feature A | Exchange | Rolling out | Targeted | August CY2025 | GCC | Example description A | https://www.microsoft.com/en-us/microsoft-365/roadmap?featureid=700001 |
-              | 700002 | Example Feature B | SharePoint | In development | Preview | Q4 CY2025 | GCC High | Example description B | https://www.microsoft.com/en-us/microsoft-365/roadmap?featureid=700002 |
-              | 700003 | Example Feature C | Teams | In development | Targeted | H2 CY2025 | DoD | Example description C | https://www.microsoft.com/en-us/microsoft-365/roadmap?featureid=700003 |
-              ''')"
+            bash scripts/write_sample.sh
+          else
+            echo "Sample already present; skipping."
           fi
 
-          - name: Generate Markdown report via API (conditional)
-            # Only gate on skip_generate here (avoid secrets in `if:`)
-            if: ${{ github.event.inputs.skip_generate == 'false' }}
-            shell: bash
-            env:
-              OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-              OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
-              OPENAI_MODEL: ${{ github.event.inputs.model || 'gpt-4o' }}
-              OPENAI_ORG_ID: ${{ secrets.OPENAI_ORG_ID }}
-            run: |
-              if [ -z "${OPENAI_API_KEY:-}" ]; then
-                echo "❌ Missing OPENAI_API_KEY secret. Set it in Settings → Secrets → Actions." >&2
-                exit 1
-              fi
-              IDS="${{ github.event.inputs.ids }}"
-              TITLE="${{ github.event.inputs.report_title || 'roadmap_report' }}"
-              mkdir -p output
-              bash scripts/generate_report.sh "$IDS" "prompts/system_multi_id.md" "output/${TITLE}.md"
-
-                - name: Post-process to CSV/JSON (always runs)
-                  shell: bash
-                  run: |
-                    TITLE="${{ github.event.inputs.report_title || 'roadmap_report' }}"
-                    MONTHS="${{ github.event.inputs.months }}"
-                    SINCE="${{ github.event.inputs.since }}"
-                    UNTIL="${{ github.event.inputs.until }}"
-                    INCLUDE="${{ github.event.inputs.include_instances }}"
-                    EXCLUDE="${{ github.event.inputs.exclude_instances }}"
-                    bash scripts/post_process.sh "output/${TITLE}.md" "output/${TITLE}.csv" "output/${TITLE}.json" "$MONTHS" "$SINCE" "$UNTIL" "$INCLUDE" "$EXCLUDE"
-
-                - name: Upload report artifacts
-                  uses: actions/upload-artifact@v4
-                  with:
-                    name: roadmap-report
-                    path: output/
+      - name: Generate Markdown report via API (conditional)
+        if: ${{ github.event.inputs.skip_generate == 'false' }}
+        shell: bash
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+          OPENAI_MODEL: ${{ github.event.inputs.model || 'gpt-4o' }}
+          OPENAI_ORG_ID: ${{ secrets.OPENAI_ORG_ID }}
+        run: |
+          if [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo "❌ Missing OPENAI_API_KEY secret. Set it in Settings → Secrets → Actions." >&2
+            exit 1
+          fi
+          IDS="${{ github.event.inputs.ids }}"
+          TITLE="${{ github.event.inputs.report_title || 'roadmap_report' }}"
+          mkdir -p output
+          bash scripts/generate_report.sh "$IDS" "prompts/system_multi_id.md" "output/${TITLE}.md"
