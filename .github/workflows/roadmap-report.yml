@@ -8,13 +8,17 @@ on:
         required: true
         default: "true"
         type: choice
-        options:
-          - "true"
-          - "false"
+        options: ["true", "false"]
+      test_discovery:
+        description: "Discovery Test Mode: only fetch IDs and upload CSV (no report generation)"
+        required: true
+        default: "false"
+        type: choice
+        options: ["true", "false"]
       ids:
-        description: "Comma-separated Roadmap IDs (used only when skip_generate=false)"
+        description: "Comma-separated Roadmap IDs (leave blank to auto-discover by filters)"
         required: false
-        default: "498159"
+        default: ""
       report_title:
         description: "Title for output files (no spaces)"
         required: false
@@ -41,6 +45,10 @@ on:
         default: "GCC"
       exclude_instances:
         description: "Exclude Cloud Instances (comma-separated)"
+        required: false
+        default: ""
+      status:
+        description: "Optional status filter (e.g., In development,Rolling out,Launched)"
         required: false
         default: ""
 
@@ -72,24 +80,73 @@ jobs:
           sudo apt-get update && sudo apt-get install -y dos2unix
           dos2unix scripts/*.sh || true
           chmod +x scripts/*.sh
+          if [ -f scripts/fetch_ids.py ]; then dos2unix scripts/fetch_ids.py; chmod +x scripts/fetch_ids.py; fi
+          if [ -f scripts/write_sample.sh ]; then dos2unix scripts/write_sample.sh; chmod +x scripts/write_sample.sh; fi
 
       - name: Ensure sample report exists (first-run safety)
         shell: bash
         env:
           TITLE: ${{ github.event.inputs.report_title || 'roadmap_report' }}
         run: |
-          sudo apt-get update && sudo apt-get install -y dos2unix
-          dos2unix scripts/write_sample.sh || true
-          chmod +x scripts/write_sample.sh
           if [ ! -f "output/${TITLE}.md" ]; then
             bash scripts/write_sample.sh "output/${TITLE}.md"
           else
             echo "Sample already present at output/${TITLE}.md; skipping."
           fi
 
+      # --------- DISCOVERY (auto-IDs) ---------
+      - name: Auto-discover Roadmap IDs (when ids is blank)
+        if: ${{ github.event.inputs.skip_generate == 'false' && (github.event.inputs.ids == '' || github.event.inputs.ids == null) }}
+        id: discover
+        shell: bash
+        env:
+          MONTHS: ${{ github.event.inputs.months }}
+          SINCE: ${{ github.event.inputs.since }}
+          UNTIL: ${{ github.event.inputs.until }}
+          INCLUDE: ${{ github.event.inputs.include_instances }}
+          EXCLUDE: ${{ github.event.inputs.exclude_instances }}
+          STATUS: ${{ github.event.inputs.status }}
+          TITLE: ${{ github.event.inputs.report_title || 'roadmap_report' }}
+        run: |
+          mkdir -p output
+          echo "Auto-discovering IDs with filters..."
+          IDS=$(python scripts/fetch_ids.py \
+            --months "${MONTHS:-}" \
+            --since "${SINCE:-}" \
+            --until "${UNTIL:-}" \
+            --include "${INCLUDE:-}" \
+            --exclude "${EXCLUDE:-}" \
+            --status "${STATUS:-}" \
+            --max-pages 20 \
+            --emit list)
+          echo "Discovered IDs: $IDS"
+          if [ -z "$IDS" ]; then
+            echo "❌ No IDs discovered with the given filters." >&2
+            exit 1
+          fi
+          # Also emit a CSV for inspection
+          python scripts/fetch_ids.py \
+            --months "${MONTHS:-}" \
+            --since "${SINCE:-}" \
+            --until "${UNTIL:-}" \
+            --include "${INCLUDE:-}" \
+            --exclude "${EXCLUDE:-}" \
+            --status "${STATUS:-}" \
+            --max-pages 20 \
+            --emit csv > "output/${TITLE}_discovered_ids.csv"
+          echo "ids=$IDS" >> $GITHUB_OUTPUT
 
+      - name: Upload discovery CSV (when in test mode)
+        if: ${{ github.event.inputs.skip_generate == 'false' && github.event.inputs.test_discovery == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: roadmap-discovery
+          path: output/${{ github.event.inputs.report_title || 'roadmap_report' }}_discovered_ids.csv
+          if-no-files-found: warn
+
+      # --------- GENERATE (skips if test_discovery=true) ---------
       - name: Generate Markdown report via API (conditional)
-        if: ${{ github.event.inputs.skip_generate == 'false' }}
+        if: ${{ github.event.inputs.skip_generate == 'false' && github.event.inputs.test_discovery != 'true' }}
         shell: bash
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -101,10 +158,37 @@ jobs:
             echo "❌ Missing OPENAI_API_KEY secret. Set it in Settings → Secrets → Actions." >&2
             exit 1
           fi
-          IDS="${{ github.event.inputs.ids }}"
+          # Prefer user-provided IDs; else use discovered
+          RAW_IDS="${{ github.event.inputs.ids }}"
+          if [ -z "$RAW_IDS" ]; then
+            RAW_IDS="${{ steps.discover.outputs.ids }}"
+          fi
           TITLE="${{ github.event.inputs.report_title || 'roadmap_report' }}"
           mkdir -p output
-          bash scripts/generate_report.sh "$IDS" "prompts/system_multi_id.md" "output/${TITLE}.md"
+          echo "Using IDs: $RAW_IDS"
+          bash scripts/generate_report.sh "$RAW_IDS" "prompts/system_multi_id.md" "output/${TITLE}.md"
+
+      - name: Post-process to CSV/JSON (always runs)
+        shell: bash
+        env:
+          TITLE: ${{ github.event.inputs.report_title || 'roadmap_report' }}
+          MONTHS: ${{ github.event.inputs.months }}
+          SINCE: ${{ github.event.inputs.since }}
+          UNTIL: ${{ github.event.inputs.until }}
+          INCLUDE: ${{ github.event.inputs.include_instances }}
+          EXCLUDE: ${{ github.event.inputs.exclude_instances }}
+        run: |
+          bash scripts/post_process.sh \
+            "output/${TITLE}.md" \
+            "output/${TITLE}.csv" \
+            "output/${TITLE}.json" \
+            "${MONTHS}" "${SINCE}" "${UNTIL}" "${INCLUDE}" "${EXCLUDE}"
+
+      - name: Show output directory (debug)
+        shell: bash
+        run: |
+          echo "Listing output/"
+          ls -la output || true
 
       - name: Upload report artifacts
         uses: actions/upload-artifact@v4
@@ -114,11 +198,5 @@ jobs:
             output/${{ github.event.inputs.report_title || 'roadmap_report' }}.md
             output/${{ github.event.inputs.report_title || 'roadmap_report' }}.csv
             output/${{ github.event.inputs.report_title || 'roadmap_report' }}.json
-            output/*   # fallback: grab whatever got produced
+            output/*
           if-no-files-found: warn
-
-      - name: Show output directory (debug)
-        shell: bash
-        run: |
-          echo "Listing output/"
-          ls -la output || true
