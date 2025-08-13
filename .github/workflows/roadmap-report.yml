@@ -1,0 +1,106 @@
+name: Build Microsoft 365 Roadmap Report
+
+on:
+  workflow_dispatch:
+    inputs:
+      ids:
+        description: 'Comma-separated Microsoft 365 Roadmap IDs (e.g., 498159,123456,987654)'
+        required: true
+      months:
+        description: 'Filter to last N months (1..6). Leave blank to skip date filtering.'
+        required: false
+        default: ''
+      since:
+        description: 'Start date (YYYY-MM-DD). If provided without "until", defaults to +6 months.'
+        required: false
+        default: ''
+      until:
+        description: 'End date (YYYY-MM-DD). Optional; only valid when "since" is set.'
+        required: false
+        default: ''
+      include_instances:
+        description: 'Include Cloud Instances (comma-separated): DoD,GCC,GCC High,Worldwide (Standard Multi-Tenant)'
+        required: false
+        default: ''
+      exclude_instances:
+        description: 'Exclude Cloud Instances (comma-separated)'
+        required: false
+        default: ''
+      model:
+        description: 'LLM model name (e.g., gpt-5)'
+        required: false
+        default: 'gpt-5'
+      report_title:
+        description: 'Title slug for the report files'
+        required: false
+        default: 'roadmap_report'
+  schedule:
+    # Every weekday at 12:30 UTC – adjust to your preference
+    - cron: "30 12 * * 1-5"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Ensure scripts are executable
+        run: |
+          chmod +x scripts/generate_report.sh
+          chmod +x scripts/post_process.sh
+
+      - name: Install Python deps (none needed; stdlib only)
+        run: python --version
+
+      - name: Generate Markdown report via API
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+          OPENAI_MODEL: ${{ github.event.inputs.model || 'gpt-5' }}
+        run: |
+          # Fail fast if no key
+          if [ -z "${OPENAI_API_KEY}" ]; then
+            echo "Missing OPENAI_API_KEY secret." >&2
+            exit 1
+          fi
+          # Inputs
+          IDS="${{ github.event.inputs.ids }}"
+          TITLE="${{ github.event.inputs.report_title || 'roadmap_report' }}"
+          mkdir -p output
+          scripts/generate_report.sh "$IDS" "prompts/system_multi_id.md" "output/${TITLE}.md"
+
+      - name: Post-process (CSV/JSON) with filters
+        run: |
+          TITLE="${{ github.event.inputs.report_title || 'roadmap_report' }}"
+          MONTHS="${{ github.event.inputs.months }}"
+          SINCE="${{ github.event.inputs.since }}"
+          UNTIL="${{ github.event.inputs.until }}"
+          INCLUDE="${{ github.event.inputs.include_instances }}"
+          EXCLUDE="${{ github.event.inputs.exclude_instances }}"
+
+          scripts/post_process.sh "output/${TITLE}.md" "output/${TITLE}.csv" "output/${TITLE}.json" "$MONTHS" "$SINCE" "$UNTIL" "$INCLUDE" "$EXCLUDE"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: roadmap-report
+          path: output/*
+
+      - name: Commit results back to repo (optional)
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          TITLE="${{ github.event.inputs.report_title || 'roadmap_report' }}"
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add output/${TITLE}.md output/${TITLE}.csv output/${TITLE}.json || true
+          git commit -m "CI: update ${TITLE} report" || echo "No changes to commit"
+          git push || echo "No push"
