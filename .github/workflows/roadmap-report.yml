@@ -65,7 +65,7 @@ jobs:
           else
             echo "No requirements.txt found. Skipping pip install."
           fi
-          
+
       - name: Make scripts executable & normalize line endings
         shell: bash
         run: |
@@ -102,3 +102,14 @@ jobs:
           TITLE="${{ github.event.inputs.report_title || 'roadmap_report' }}"
           mkdir -p output
           bash scripts/generate_report.sh "$IDS" "prompts/system_multi_id.md" "output/${TITLE}.md"
+
+
+      - name: Upload report artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: roadmap-report
+          path: |
+            output/${{ github.event.inputs.report_title || 'roadmap_report' }}.md
+            output/${{ github.event.inputs.report_title || 'roadmap_report' }}.csv
+            output/${{ github.event.inputs.report_title || 'roadmap_report' }}.json
+          if-no-files-found: warn
