@@ -75,15 +75,18 @@ jobs:
 
       - name: Ensure sample report exists (first-run safety)
         shell: bash
+        env:
+          TITLE: ${{ github.event.inputs.report_title || 'roadmap_report' }}
         run: |
           sudo apt-get update && sudo apt-get install -y dos2unix
           dos2unix scripts/write_sample.sh || true
           chmod +x scripts/write_sample.sh
-          if [ ! -f output/roadmap_report.md ]; then
-            bash scripts/write_sample.sh
+          if [ ! -f "output/${TITLE}.md" ]; then
+            bash scripts/write_sample.sh "output/${TITLE}.md"
           else
-            echo "Sample already present; skipping."
+            echo "Sample already present at output/${TITLE}.md; skipping."
           fi
+
 
       - name: Generate Markdown report via API (conditional)
         if: ${{ github.event.inputs.skip_generate == 'false' }}
@@ -103,7 +106,6 @@ jobs:
           mkdir -p output
           bash scripts/generate_report.sh "$IDS" "prompts/system_multi_id.md" "output/${TITLE}.md"
 
-
       - name: Upload report artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -112,4 +114,11 @@ jobs:
             output/${{ github.event.inputs.report_title || 'roadmap_report' }}.md
             output/${{ github.event.inputs.report_title || 'roadmap_report' }}.csv
             output/${{ github.event.inputs.report_title || 'roadmap_report' }}.json
+            output/*   # fallback: grab whatever got produced
           if-no-files-found: warn
+
+      - name: Show output directory (debug)
+        shell: bash
+        run: |
+          echo "Listing output/"
+          ls -la output || true

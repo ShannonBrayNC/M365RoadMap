@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-mkdir -p output
+OUTFILE="${1:-output/roadmap_report.md}"
+mkdir -p "$(dirname "$OUTFILE")"
 
-cat > output/roadmap_report.md <<'EOF'
+cat > "$OUTFILE" <<'EOF'
 # Example Report
 
 ## Master Summary Table (all IDs)
@@ -15,4 +16,4 @@ cat > output/roadmap_report.md <<'EOF'
 | 700003 | Example Feature C | Teams | In development | Targeted | H2 CY2025 | DoD | Example description C | https://www.microsoft.com/en-us/microsoft-365/roadmap?featureid=700003 |
 EOF
 
-echo "Wrote output/roadmap_report.md"
+echo "Wrote $OUTFILE"
