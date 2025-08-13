@@ -42,7 +42,7 @@ on:
       include_instances:
         description: "Include Cloud Instances (e.g., DoD,GCC,GCC High,Worldwide (Standard Multi-Tenant))"
         required: false
-        default: "GCC"
+        default: ""
       exclude_instances:
         description: "Exclude Cloud Instances (comma-separated)"
         required: false
