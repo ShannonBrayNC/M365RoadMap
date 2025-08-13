@@ -33,7 +33,7 @@ on:
 
 jobs:
   generate-roadmap-report:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
