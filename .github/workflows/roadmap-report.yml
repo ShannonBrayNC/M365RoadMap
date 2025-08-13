@@ -1,108 +1,77 @@
-name: Build Microsoft 365 Roadmap Report
+name: Generate Microsoft 365 Roadmap Report
 
 on:
   workflow_dispatch:
     inputs:
       ids:
-        description: 'Comma-separated Microsoft 365 Roadmap IDs (e.g., 498159,123456,987654)'
+        description: "Comma-separated list of Roadmap IDs"
         required: true
-      months:
-        description: 'Filter to last N months (1..6). Leave blank to skip date filtering.'
-        required: false
-        default: ''
-      since:
-        description: 'Start date (YYYY-MM-DD). If provided without "until", defaults to +6 months.'
-        required: false
-        default: ''
-      until:
-        description: 'End date (YYYY-MM-DD). Optional; only valid when "since" is set.'
-        required: false
-        default: ''
-      include_instances:
-        description: 'Include Cloud Instances (comma-separated): DoD,GCC,GCC High,Worldwide (Standard Multi-Tenant)'
-        required: false
-        default: ''
-      exclude_instances:
-        description: 'Exclude Cloud Instances (comma-separated)'
-        required: false
-        default: ''
-      model:
-        description: 'LLM model name (e.g., gpt-5)'
-        required: false
-        default: 'gpt-5'
       report_title:
-        description: 'Title slug for the report files'
+        description: "Title for the output files (no spaces)"
+        default: "roadmap_report"
         required: false
-        default: 'roadmap_report'
-
-permissions:
-  contents: write
+      model:
+        description: "OpenAI model to use (defaults to gpt-4o)"
+        default: "gpt-4o"
+        required: false
+      months:
+        description: "Number of months forward from now to include"
+        default: "3"
+        required: false
+      since:
+        description: "Start date in YYYY-MM-DD format"
+        required: false
+      until:
+        description: "End date in YYYY-MM-DD format"
+        required: false
+      include_instances:
+        description: "Comma-separated list of instances to include (e.g. GCC,GCC High,DoD)"
+        required: false
+      exclude_instances:
+        description: "Comma-separated list of instances to exclude"
+        required: false
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  generate-roadmap-report:
+    runs-on: windows-latest
+
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      - name: Install jq (for JSON handling)
+      - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y jq
-
-      - name: Ensure scripts are executable
-        run: |
-          chmod +x scripts/generate_report.sh || true
-          chmod +x scripts/post_process.sh || true
-
-      - name: Show repo tree (debug)
-        run: |
-          pwd
-          ls -la
-          echo "----"
-          ls -la scripts || true
-          echo "----"
-          ls -la .github/workflows || true
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Generate Markdown report via API
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
-          OPENAI_MODEL: ${{ github.event.inputs.model || 'gpt-5' }}
+          OPENAI_MODEL: ${{ github.event.inputs.model || 'gpt-4o' }}
+          OPENAI_ORG_ID: org-xHwYhKYWevRwhrASZm7eCgXd
         run: |
           if [ -z "${OPENAI_API_KEY}" ]; then
             echo "Missing OPENAI_API_KEY secret." >&2
             exit 1
           fi
+
           IDS="${{ github.event.inputs.ids }}"
           TITLE="${{ github.event.inputs.report_title || 'roadmap_report' }}"
+
           mkdir -p output
-          scripts/generate_report.sh "$IDS" "prompts/system_multi_id.md" "output/${TITLE}.md"
 
-      # NEW: Ensure parser is present (copies from common locations to repo root)
-      - name: Ensure parser is present
-        run: |
-          set -e
-          if [ -f "parse_roadmap_markdown.py" ]; then
-            echo "Parser already in repo root."
-          elif [ -f "scripts/parse_roadmap_markdown.py" ]; then
-            cp scripts/parse_roadmap_markdown.py .
-            echo "Copied parser from scripts/ to repo root."
-          elif [ -f "roadmap_ci/parse_roadmap_markdown.py" ]; then
-            cp roadmap_ci/parse_roadmap_markdown.py .
-            echo "Copied parser from roadmap_ci/ to repo root."
-          else
-            echo "ERROR: Could not find parse_roadmap_markdown.py in repo." >&2
-            exit 1
-          fi
-          ls -la parse_roadmap_markdown.py
+          bash scripts/generate_report.sh \
+            "$IDS" \
+            "prompts/system_multi_id.md" \
+            "output/${TITLE}.md"
 
-      - name: Post-process (CSV/JSON) with filters
+      - name: Post-process to CSV/JSON
         run: |
           TITLE="${{ github.event.inputs.report_title || 'roadmap_report' }}"
           MONTHS="${{ github.event.inputs.months }}"
@@ -111,20 +80,14 @@ jobs:
           INCLUDE="${{ github.event.inputs.include_instances }}"
           EXCLUDE="${{ github.event.inputs.exclude_instances }}"
 
-          scripts/post_process.sh "output/${TITLE}.md" "output/${TITLE}.csv" "output/${TITLE}.json" "$MONTHS" "$SINCE" "$UNTIL" "$INCLUDE" "$EXCLUDE"
+          bash scripts/post_process.sh \
+            "output/${TITLE}.md" \
+            "output/${TITLE}.csv" \
+            "output/${TITLE}.json" \
+            "$MONTHS" "$SINCE" "$UNTIL" "$INCLUDE" "$EXCLUDE"
 
-      - name: Upload artifacts
+      - name: Upload report artifacts
         uses: actions/upload-artifact@v4
         with:
           name: roadmap-report
-          path: output/*
-
-      - name: Commit results back to repo (optional)
-        if: ${{ github.event_name == 'workflow_dispatch' }}
-        run: |
-          TITLE="${{ github.event.inputs.report_title || 'roadmap_report' }}"
-          git config user.name "github-actions"
-          git config user.email "github-actions@users.noreply.github.com"
-          git add output/${TITLE}.md output/${TITLE}.csv output/${TITLE}.json || true
-          git commit -m "CI: update ${TITLE} report" || echo "No changes to commit"
-          git push || echo "No push"
+          path: output/

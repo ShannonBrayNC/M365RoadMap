@@ -1,102 +1,78 @@
+#!/usr/bin/env python3
 import argparse
 import csv
 import json
 import re
 from datetime import datetime, timedelta
 
-def parse_table(md_lines):
-    """Parse a Markdown table into a list of dicts."""
-    table_lines = []
-    for line in md_lines:
-        if line.strip().startswith("|"):
-            table_lines.append(line.strip())
-        elif table_lines:
-            # break if we already started capturing table and hit a non-table line
-            break
-
-    if not table_lines:
-        return []
-
-    headers = [h.strip() for h in table_lines[0].strip("|").split("|")]
+def parse_table(markdown_text):
+    """Extracts table rows from Markdown."""
+    lines = markdown_text.splitlines()
+    table_started = False
+    headers = []
     rows = []
-    for row_line in table_lines[2:]:  # skip header + separator
-        cols = [c.strip() for c in row_line.strip("|").split("|")]
-        # pad columns if needed
-        while len(cols) < len(headers):
-            cols.append("")
-        rows.append(dict(zip(headers, cols)))
 
-    return rows
+    for line in lines:
+        if "|" in line:
+            parts = [cell.strip() for cell in line.strip().split("|") if cell.strip()]
+            if not table_started:
+                headers = parts
+                table_started = True
+            elif set(parts) != set(headers) and "---" not in line:
+                rows.append(parts)
 
-def filter_by_dates(rows, months=None, since=None, until=None):
-    """Filter rows based on date window."""
-    if not months and not since and not until:
+    return headers, rows
+
+def filter_by_date(rows, headers, months, since, until):
+    """Filter rows based on months, since, until criteria."""
+    if not any([months, since, until]):
         return rows
 
-    def parse_date(date_str):
-        try:
-            return datetime.strptime(date_str.strip(), "%B %Y")
-        except ValueError:
-            try:
-                return datetime.strptime(date_str.strip(), "%B %d, %Y")
-            except ValueError:
-                return None
-
-    now = datetime.utcnow()
-    if months:
-        since_date = now
-        until_date = now + timedelta(days=int(months) * 30)
-    else:
-        since_date = datetime.strptime(since, "%Y-%m-%d") if since else None
-        until_date = datetime.strptime(until, "%Y-%m-%d") if until else None
-        if since_date and not until_date:
-            until_date = since_date + timedelta(days=180)
-
+    date_idx = headers.index("Targeted Release")
     filtered = []
+
+    today = datetime.today()
+    since_dt = datetime.strptime(since, "%Y-%m-%d") if since else None
+    until_dt = datetime.strptime(until, "%Y-%m-%d") if until else None
+
+    if months:
+        until_dt = today + timedelta(days=int(months) * 30)
+        since_dt = today
+
     for row in rows:
-        date_field = None
-        for key in row:
-            if "date" in key.lower():
-                date_field = row[key]
-                break
-        if not date_field:
-            filtered.append(row)
+        try:
+            date_str = row[date_idx]
+            if not date_str or date_str.lower() == "tbd":
+                continue
+            date_obj = datetime.strptime(date_str, "%B %Y")  # e.g. "September 2025"
+        except Exception:
             continue
 
-        parsed = parse_date(date_field)
-        if not parsed:
-            filtered.append(row)
+        if since_dt and date_obj < since_dt:
             continue
-
-        if since_date and parsed < since_date:
-            continue
-        if until_date and parsed > until_date:
+        if until_dt and date_obj > until_dt:
             continue
 
         filtered.append(row)
 
     return filtered
 
-def filter_by_instances(rows, include=None, exclude=None):
-    """Filter rows based on Cloud Instance column."""
+def filter_by_instance(rows, headers, include, exclude):
+    """Filter by cloud instance include/exclude lists."""
     if not include and not exclude:
         return rows
 
-    include_set = {i.strip().lower() for i in include.split(",")} if include else set()
-    exclude_set = {i.strip().lower() for i in exclude.split(",")} if exclude else set()
+    instance_idx = headers.index("Cloud Instance")
+    include_set = set([x.strip().lower() for x in include.split(",")]) if include else set()
+    exclude_set = set([x.strip().lower() for x in exclude.split(",")]) if exclude else set()
 
     filtered = []
     for row in rows:
-        instance_val = ""
-        for key in row:
-            if "instance" in key.lower():
-                instance_val = row[key]
-                break
-        normalized = instance_val.strip().lower()
+        instance_val = row[instance_idx].lower()
 
-        if include_set and normalized not in include_set:
+        if include_set and not any(inc in instance_val for inc in include_set):
             continue
-        if exclude_set and normalized in exclude_set:
+        if exclude_set and any(exc in instance_val for exc in exclude_set):
             continue
 
         filtered.append(row)
@@ -104,54 +80,38 @@ def filter_by_instances(rows, include=None, exclude=None):
     return filtered
 
 def main():
-    parser = argparse.ArgumentParser(description="Parse Roadmap Master Summary Table from Markdown and export CSV/JSON.")
-    parser.add_argument("--in", dest="infile", required=True, help="Input Markdown file")
-    parser.add_argument("--csv", help="Output CSV file")
-    parser.add_argument("--json", help="Output JSON file")
-    parser.add_argument("--months", type=int, help="Number of months forward from now to include")
-    parser.add_argument("--since", help="Start date in YYYY-MM-DD format")
-    parser.add_argument("--until", help="End date in YYYY-MM-DD format")
-    parser.add_argument("--include-instances", help="Comma-separated list of instances to include")
-    parser.add_argument("--exclude-instances", help="Comma-separated list of instances to exclude")
+    parser = argparse.ArgumentParser(description="Parse Microsoft 365 Roadmap Markdown to CSV/JSON")
+    parser.add_argument("--input", required=True, help="Path to input Markdown file")
+    parser.add_argument("--csv", required=True, help="Path to output CSV file")
+    parser.add_argument("--json", required=True, help="Path to output JSON file")
+    parser.add_argument("--months", required=False, help="Number of months forward to include")
+    parser.add_argument("--since", required=False, help="Start date YYYY-MM-DD")
+    parser.add_argument("--until", required=False, help="End date YYYY-MM-DD")
+    parser.add_argument("--include", required=False, help="Comma-separated cloud instances to include")
+    parser.add_argument("--exclude", required=False, help="Comma-separated cloud instances to exclude")
     args = parser.parse_args()
 
-    with open(args.infile, encoding="utf-8") as f:
-        lines = f.readlines()
+    with open(args.input, "r", encoding="utf-8") as f:
+        md_content = f.read()
 
-    # find the "Master Summary Table"
-    start_idx = None
-    for i, line in enumerate(lines):
-        if "master summary table" in line.lower():
-            start_idx = i
-            break
+    headers, rows = parse_table(md_content)
+    rows = filter_by_date(rows, headers, args.months, args.since, args.until)
+    rows = filter_by_instance(rows, headers, args.include, args.exclude)
 
-    if start_idx is None:
-        print("No Master Summary Table heading found.")
-        return
+    # Write CSV
+    with open(args.csv, "w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(headers)
+        writer.writerows(rows)
 
-    rows = parse_table(lines[start_idx+1:])
-    if not rows:
-        print("No table found under Master Summary Table heading.")
-        return
+    # Write JSON
+    json_data = [dict(zip(headers, row)) for row in rows]
+    with open(args.json, "w", encoding="utf-8") as jsonfile:
+        json.dump(json_data, jsonfile, indent=2, ensure_ascii=False)
 
-    # filter
-    rows = filter_by_dates(rows, args.months, args.since, args.until)
-    rows = filter_by_instances(rows, args.include_instances, args.exclude_instances)
-
-    # output CSV
-    if args.csv:
-        with open(args.csv, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=rows[0].keys())
-            writer.writeheader()
-            for r in rows:
-                writer.writerow(r)
-
-    # output JSON
-    if args.json:
-        with open(args.json, "w", encoding="utf-8") as f:
-            json.dump(rows, f, indent=2, ensure_ascii=False)
-
-    print(f"Parsed {len(rows)} rows.")
+    print(f"✅ Parsed {len(rows)} items from {args.input}")
+    print(f"📄 CSV saved to {args.csv}")
+    print(f"📄 JSON saved to {args.json}")
 
 if __name__ == "__main__":
     main()

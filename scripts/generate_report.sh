@@ -1,44 +1,59 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -e
 
-IDS_CSV="${1:-}"
-SYSTEM_PROMPT_FILE="${2:-prompts/system_multi_id.md}"
-OUT_MD="${3:-output/roadmap_report.md}"
+IDS="$1"
+PROMPT_FILE="$2"
+OUTPUT_FILE="$3"
 
-if [ -z "${IDS_CSV}" ]; then
-  echo "Usage: $0 \"498159,123456\" [system_prompt_file] [out.md]" >&2
-  exit 1
+# Default model
+if [ -z "$OPENAI_MODEL" ]; then
+  OPENAI_MODEL="gpt-4o"
 fi
 
-mkdir -p "$(dirname "$OUT_MD")"
+# Default base URL if not set
+if [ -z "$OPENAI_BASE_URL" ]; then
+  OPENAI_BASE_URL="https://api.openai.com/v1"
+fi
 
-SYSTEM_PROMPT=$(cat "$SYSTEM_PROMPT_FILE")
-USER_PAYLOAD=$(jq -n --arg ids "$IDS_CSV" '{ids: ($ids | split(",")), product_context: "Enterprise tenant; heavy Teams usage; retention policies enforced; cross-tenant B2B enabled"}')
+echo "Using model: $OPENAI_MODEL"
+echo "Generating report for Roadmap IDs: $IDS"
 
-# Allow custom base URL (Azure OpenAI or self-hosted proxy) via OPENAI_BASE_URL
-BASE_URL="${OPENAI_BASE_URL:-https://api.openai.com/v1}"
+# Function to call OpenAI API
+call_openai_api() {
+  MODEL_TO_USE="$1"
 
-curl -sS "${BASE_URL}/chat/completions" \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer ${OPENAI_API_KEY}" \
-  -d @- > /tmp/resp.json <<EOF
-{
-  "model": "${OPENAI_MODEL:-gpt-5}",
-  "temperature": 0,
-  "messages": [
-    { "role": "system", "content": $(jq -Rs . <<< "$SYSTEM_PROMPT") },
-    { "role": "user",   "content": $(jq -Rs . <<< "$USER_PAYLOAD") }
-  ]
+  curl -sS -X POST \
+    -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+    -H "OpenAI-Organization: ${OPENAI_ORG_ID}" \
+    -H "Content-Type: application/json" \
+    "${OPENAI_BASE_URL}/chat/completions" \
+    -d "{
+      \"model\": \"${MODEL_TO_USE}\",
+      \"messages\": [
+        {\"role\": \"system\", \"content\": \"$(cat "$PROMPT_FILE")\"},
+        {\"role\": \"user\", \"content\": \"Roadmap IDs: $IDS\"}
+      ]
+    }"
 }
-EOF
 
-# Extract Markdown to file (compatible with both old & new response shapes)
-CONTENT=$(jq -r '.choices[0].message.content // .choices[0].messages[0].content' /tmp/resp.json)
-if [ -z "$CONTENT" ] || [ "$CONTENT" = "null" ]; then
-  echo "No content returned from API. Full response:" >&2
-  cat /tmp/resp.json >&2
-  exit 1
+FALLBACK_USED="false"
+
+# First attempt with the requested/default model
+RESPONSE=$(call_openai_api "$OPENAI_MODEL")
+
+# Check for "organization must be verified" or "model_not_found" error
+if echo "$RESPONSE" | grep -q "organization must be verified\|model_not_found"; then
+  echo "⚠️ $OPENAI_MODEL is not available for your org. Falling back to gpt-4o..."
+  RESPONSE=$(call_openai_api "gpt-4o")
+  FALLBACK_USED="true"
 fi
 
-echo "$CONTENT" > "$OUT_MD"
-echo "Report written to $OUT_MD"
+# Save output
+echo "$RESPONSE" > "$OUTPUT_FILE"
+
+# Append fallback note to Markdown file if needed
+if [ "$FALLBACK_USED" = "true" ]; then
+  echo -e "\n---\n**Note:** This report was generated using *gpt-4o* due to lack of access to *$OPENAI_MODEL* in your organization." >> "$OUTPUT_FILE"
+fi
+
+echo "✅ Report saved to $OUTPUT_FILE"
