@@ -34,9 +34,6 @@ on:
         description: 'Title slug for the report files'
         required: false
         default: 'roadmap_report'
-  schedule:
-    # Every weekday at 12:30 UTC – adjust to your preference
-    - cron: "30 12 * * 1-5"
 
 permissions:
   contents: write
@@ -53,13 +50,24 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Install jq (for JSON handling)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
       - name: Ensure scripts are executable
         run: |
-          chmod +x scripts/generate_report.sh
-          chmod +x scripts/post_process.sh
+          chmod +x scripts/generate_report.sh || true
+          chmod +x scripts/post_process.sh || true
 
-      - name: Install Python deps (none needed; stdlib only)
-        run: python --version
+      - name: Show repo tree (debug)
+        run: |
+          pwd
+          ls -la
+          echo "----"
+          ls -la scripts || true
+          echo "----"
+          ls -la .github/workflows || true
 
       - name: Generate Markdown report via API
         env:
@@ -67,16 +75,32 @@ jobs:
           OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
           OPENAI_MODEL: ${{ github.event.inputs.model || 'gpt-5' }}
         run: |
-          # Fail fast if no key
           if [ -z "${OPENAI_API_KEY}" ]; then
             echo "Missing OPENAI_API_KEY secret." >&2
             exit 1
           fi
-          # Inputs
           IDS="${{ github.event.inputs.ids }}"
           TITLE="${{ github.event.inputs.report_title || 'roadmap_report' }}"
           mkdir -p output
           scripts/generate_report.sh "$IDS" "prompts/system_multi_id.md" "output/${TITLE}.md"
+
+      # NEW: Ensure parser is present (copies from common locations to repo root)
+      - name: Ensure parser is present
+        run: |
+          set -e
+          if [ -f "parse_roadmap_markdown.py" ]; then
+            echo "Parser already in repo root."
+          elif [ -f "scripts/parse_roadmap_markdown.py" ]; then
+            cp scripts/parse_roadmap_markdown.py .
+            echo "Copied parser from scripts/ to repo root."
+          elif [ -f "roadmap_ci/parse_roadmap_markdown.py" ]; then
+            cp roadmap_ci/parse_roadmap_markdown.py .
+            echo "Copied parser from roadmap_ci/ to repo root."
+          else
+            echo "ERROR: Could not find parse_roadmap_markdown.py in repo." >&2
+            exit 1
+          fi
+          ls -la parse_roadmap_markdown.py
 
       - name: Post-process (CSV/JSON) with filters
         run: |

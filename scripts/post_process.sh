@@ -10,8 +10,7 @@ UNTIL="${6:-}"
 INCLUDE="${7:-}"
 EXCLUDE="${8:-}"
 
-# Fetch parser from repo or fallback to raw (assumes it exists in repo root under scripts/ or tools/)
-# Here we expect parse_roadmap_markdown.py to be present in the repo root or scripts/
+# Locate parser
 PARSER="parse_roadmap_markdown.py"
 if [ ! -f "$PARSER" ]; then
   if [ -f "scripts/parse_roadmap_markdown.py" ]; then
