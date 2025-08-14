@@ -83,12 +83,10 @@ jobs:
       - name: Validate PFX and prepare graph_config.json
         shell: bash
         env:
-          # Prefer repo secrets; if you already have pfx_base64 in graph_config.json,
-          # you can omit M365_PFX_BASE64 and this step will fall back to the file.
           TENANT: ${{ secrets.GRAPH_TENANT_ID }}
           CLIENT: ${{ secrets.GRAPH_CLIENT_ID }}
           PFX_B64: ${{ secrets.M365_PFX_BASE64 }}
-          PFX_PASSWORD_ENV: M365_PFX_PASSWORD   # your runner/secret should set this password at runtime
+          PFX_PASSWORD_ENV: M365_PFX_PASSWORD
         run: |
           set -euo pipefail
 
@@ -100,9 +98,9 @@ jobs:
             echo "Reading pfx_base64 from ${CFG_PATH}"
             PFX="$(python - "$CFG_PATH" <<'PY'
             import sys, json
-            with open(sys.argv[1], "rb") as f:
+            with open(sys.argv[1], "r", encoding="utf-8") as f:
                 d = json.load(f)
-            print(d.get("pfx_base64",""))
+            print(d.get("pfx_base64", ""))
             PY
             )"
                 fi
@@ -112,7 +110,7 @@ jobs:
                   exit 1
                 fi
 
-                # 2) Simple sanity check: length should be in the thousands for a typical PFX
+                # 2) Length sanity check
                 echo "PFX_B64 length: ${#PFX}"
                 if (( ${#PFX} < 1000 )); then
                   echo "❌ PFX_B64 looks too short or truncated." >&2
@@ -123,7 +121,7 @@ jobs:
                 export PFX
                 BYTES="$(python - <<'PY'
             import os, base64, sys
-            b = os.environ.get("PFX","")
+            b = os.environ.get("PFX", "")
             try:
                 raw = base64.b64decode(b, validate=True)
             except Exception as e:
@@ -153,7 +151,6 @@ jobs:
                 else
                   echo "TENANT/CLIENT secrets not set; leaving existing ${CFG_PATH} as-is."
                 fi
-
 
 
 
