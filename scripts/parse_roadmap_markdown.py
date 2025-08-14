@@ -75,11 +75,20 @@ def write_json(rows: List[Dict[str, str]], path: str) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Parse M365 Roadmap Markdown to CSV/JSON (with optional RSS/JSON fallback)")
+    ap = argparse.ArgumentParser(
+        description="Parse M365 Roadmap Markdown to CSV/JSON (with optional RSS/JSON fallback)"
+    )
     ap.add_argument("--input", required=True, help="Input Markdown file path")
     ap.add_argument("--csv", help="Output CSV path")
     ap.add_argument("--json", help="Output JSON path")
     ap.add_argument("--months", type=int, default=None, help="Filter to last N months (1..24)")
+
+    # Accept (but ignore) these for compatibility with the workflow/post_process.sh
+    ap.add_argument("--since", default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--until", default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--include", default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--exclude", default=None, help=argparse.SUPPRESS)
+
     args = ap.parse_args()
 
     if not os.path.exists(args.input):
@@ -96,6 +105,7 @@ def main() -> None:
     if args.json:
         write_json(rows, args.json)
         print(f"JSON written to {args.json}")
+
 
 
 if __name__ == "__main__":
