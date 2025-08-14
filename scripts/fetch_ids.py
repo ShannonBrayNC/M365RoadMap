@@ -1,56 +1,46 @@
 #!/usr/bin/env python3
 """
-Auto-discovers Microsoft 365 Roadmap feature IDs by scraping the public roadmap pages.
+fetch_ids.py v1.5 — Microsoft 365 Roadmap ID discovery (JSON API)
 
-Key improvements vs prior version:
-- Loose instance filtering: when include_set is present but the card's instance is missing,
-  we KEEP the card (so we don't drop items whose instance isn't printed on the list page).
-- Loose date filtering: when we can't parse the targeted date, we KEEP the card when any
-  date filter is requested (post-processing will handle precise filtering from the final table).
-- Debug logging and higher default pagination.
+- Backward-compatible flags:
+    * accepts --max-pages (ignored), to tolerate older workflows
+    * accepts --months "" (blank) and coerces safely
+    * supports --out PATH for CSV
+- Always writes UTF-8 (Windows friendly)
+- Filters loosely by dates and cloud instances
 
-CLI:
-  --months INT          Number of months back from today (1..6). Mutually exclusive with --since/--until
-  --since YYYY-MM-DD    Start date
-  --until YYYY-MM-DD    End date
-  --include TEXT        Comma-separated cloud instances to include
-  --exclude TEXT        Comma-separated instances to exclude
-  --max-pages INT       Pagination cap (default 30)
-  --emit TEXT           Output format: "csv" or "list" (default "list")
-  --debug               Print discovery diagnostics
-
-Output:
-  Prints comma-separated IDs (list) OR CSV with columns:
-    id,title,status,phase,targeted_dates,cloud_instance,link
+Endpoint:
+  https://www.microsoft.com/releasecommunications/api/v1/m365
 """
 
 import argparse
 import csv
 import sys
-import time
-import re
 from datetime import datetime, timedelta
-from urllib.parse import urljoin
 
 import requests
-from bs4 import BeautifulSoup
 
-BASE = "https://www.microsoft.com/en-us/microsoft-365/roadmap"
+API = "https://www.microsoft.com/releasecommunications/api/v1/m365"
 
-def parse_args():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--months", type=int, default=None)
-    ap.add_argument("--since", type=str, default="")
-    ap.add_argument("--until", type=str, default="")
-    ap.add_argument("--include", type=str, default="")
-    ap.add_argument("--exclude", type=str, default="")
-    ap.add_argument("--max-pages", type=int, default=30)
-    ap.add_argument("--emit", type=str, default="list", choices=["list", "csv"])
-    ap.add_argument("--debug", action="store_true")
-    return ap.parse_args()
+# Force UTF-8 stdout (Windows-safe)
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+def coerce_months(s: str | None):
+    s = (s or "").strip()
+    if not s:
+        return None
+    try:
+        n = int(s)
+        return n if 1 <= n <= 6 else None
+    except Exception:
+        return None
 
 def norm_instance(s: str) -> str:
-    if not s: return ""
+    if not s:
+        return ""
     t = s.strip().lower()
     if t in ("worldwide", "standard multi-tenant", "worldwide (standard multi-tenant)"):
         return "worldwide (standard multi-tenant)"
@@ -60,191 +50,141 @@ def norm_instance(s: str) -> str:
         return "dod"
     if t in ("us gcc", "gcc"):
         return "gcc"
-    return s.strip()
+    return t
 
-def within_date_loose(target_text: str, since_dt, until_dt, months) -> bool:
-    """Loose date filter: if parsing fails or missing, KEEP the card when any date filter is requested."""
-    # If no date filter requested, accept all
-    if not (since_dt or until_dt or months):
-        return True
-
-    txt = (target_text or "").replace("CY", "").strip()
-    if not txt or txt.lower() in ("tbd", "unknown", "n/a"):
-        # Can't parse from list page -> keep it; post-processing will filter precisely later
-        return True
-
-    # Try standard formats
-    for fmt in ("%B %Y", "%Y-%m-%d"):
+def parse_isoish(dt_str: str | None):
+    if not dt_str:
+        return None
+    fmts = ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%SZ")
+    for fmt in fmts:
         try:
-            dt = datetime.strptime(txt, fmt)
-            return _dt_within(dt, since_dt, until_dt, months)
+            return datetime.strptime(dt_str[:len(fmt)], fmt)
         except Exception:
             pass
+    return None
 
-    # Quarter
-    m = re.match(r"^(Q[1-4])\s+(\d{4})$", txt, re.I)
-    if m:
-        q = m.group(1).upper()
-        y = int(m.group(2))
-        start_month = {"Q1":1,"Q2":4,"Q3":7,"Q4":10}[q]
-        dt = datetime(y, start_month, 1)
-        return _dt_within(dt, since_dt, until_dt, months)
-
-    # Half
-    m = re.match(r"^(H[12])\s+(\d{4})$", txt, re.I)
-    if m:
-        h = m.group(1).upper()
-        y = int(m.group(2))
-        start_month = {"H1":1,"H2":7}[h]
-        dt = datetime(y, start_month, 1)
-        return _dt_within(dt, since_dt, until_dt, months)
-
-    # Year only
-    m = re.match(r"^(\d{4})$", txt)
-    if m:
-        dt = datetime(int(m.group(1)), 1, 1)
-        return _dt_within(dt, since_dt, until_dt, months)
-
-    # Unparseable -> keep
-    return True
-
-def _dt_within(dt, since_dt, until_dt, months):
+def in_date_window(item, months, since_dt, until_dt):
+    if not (months or since_dt or until_dt):
+        return True
+    candidates = [
+        item.get("releaseDate"),
+        item.get("publicPreviewDate"),
+        item.get("rolloutStart"),
+        item.get("publicDisclosureAvailabilityDate"),
+        item.get("modified") or item.get("lastModified"),
+        item.get("created"),
+    ]
+    parsed = [parse_isoish(x) for x in candidates if isinstance(x, str) and len(x) >= 4]
+    parsed = [p for p in parsed if p is not None]
+    if not parsed:
+        return True
+    dt = min(parsed)
     now = datetime.utcnow()
     if months:
-        # last N months up to today
-        since_dt = now - timedelta(days=int(30.44*months))
-        until_dt = now
-    if since_dt and dt < since_dt: return False
-    if until_dt and dt > until_dt: return False
+        since_calc = now - timedelta(days=int(30.44 * months))
+        until_calc = now
+        return since_calc <= dt <= until_calc
+    if since_dt and dt < since_dt:
+        return False
+    if until_dt and dt > until_dt:
+        return False
     return True
 
-def instance_allowed_loose(instance_text: str, include_set, exclude_set) -> bool:
-    """Loose instance filter: if include_set is provided but instance is missing, KEEP item."""
-    norm = norm_instance(instance_text).lower()
-    if exclude_set and norm in exclude_set:
+def instances_for(item):
+    tc = item.get("tagsContainer") or item.get("TagsContainer") or {}
+    vals = tc.get("cloudInstances") or tc.get("CloudInstances") or []
+    if not vals:
+        tags = item.get("tags") or item.get("Tags") or []
+        vals = [t for t in tags if isinstance(t, str) and any(k in t.lower() for k in ("gcc", "dod", "worldwide"))]
+    return [norm_instance(v) for v in vals if isinstance(v, str)]
+
+def instance_allowed(item, include_set, exclude_set):
+    vals = instances_for(item)
+    if exclude_set and any(v in exclude_set for v in vals):
         return False
     if include_set:
-        if not norm:
-            return True  # keep unknowns; final filter will occur in post-processing
-        return norm in include_set
+        if not vals:  # keep unknowns; final report can filter later
+            return True
+        return any(v in include_set for v in vals)
     return True
 
-def fetch_page(session, page: int):
-    url = f"{BASE}?page={page}"
-    resp = session.get(url, timeout=30)
-    resp.raise_for_status()
-    return resp.text
-
-def parse_cards(html):
-    """
-    Parse feature cards out of a page.
-    Returns list of dicts:
-      id,title,status,phase,targeted_dates,cloud_instance,link
-    """
-    soup = BeautifulSoup(html, "html.parser")
-    cards = []
-    for a in soup.select("a[href*='featureid=']"):
-        href = a.get("href", "")
-        m = re.search(r"featureid=(\d+)", href)
-        if not m:
-            continue
-        fid = m.group(1)
-        link = href if href.startswith("http") else urljoin(BASE, href)
-
-        card = a.find_parent(["div","li","article"]) or a
-        text = card.get_text(" ", strip=True)
-        title = a.get_text(strip=True) or f"Feature {fid}"
-
-        # Best-effort label extraction
-        status = _extract_labeled(text, ["Status:", "status:"])
-        phase = _extract_labeled(text, ["Release phase:", "Phase:", "release phase:"])
-        targeted = _extract_labeled(text, ["Targeted:", "Targeted Release:", "Dates:", "Targeted dates:"])
-        instance = _extract_labeled(text, ["Cloud instance:", "Instances:", "Cloud:", "Cloud Instance:"])
-
-        cards.append({
-            "id": fid,
-            "title": title,
-            "status": status,
-            "phase": phase,
-            "targeted_dates": targeted,
-            "cloud_instance": instance,
-            "link": link
-        })
-    return dedupe(cards, key="id")
-
-def _extract_labeled(text, labels):
-    for lab in labels:
-        idx = text.lower().find(lab.lower())
-        if idx != -1:
-            seg = text[idx + len(lab):].strip()
-            seg = seg.split("  ")[0].split("|")[0].split("  •  ")[0].strip()
-            return seg
-    return ""
-
-def dedupe(items, key="id"):
-    seen = set()
-    out = []
-    for it in items:
-        k = it.get(key)
-        if k in seen:
-            continue
-        seen.add(k)
-        out.append(it)
-    return out
-
 def main():
-    args = parse_args()
+    ap = argparse.ArgumentParser()
+    # note: months is str to allow "", then we coerce
+    ap.add_argument("--months", default="")
+    ap.add_argument("--since", default="")
+    ap.add_argument("--until", default="")
+    ap.add_argument("--include", default="")
+    ap.add_argument("--exclude", default="")
+    ap.add_argument("--emit", default="list", choices=["list", "csv"])
+    ap.add_argument("--out", default="")
+    ap.add_argument("--max-items", type=int, default=0)
+    # backward compat: accept --max-pages but ignore it
+    ap.add_argument("--max-pages", type=int, default=None)
+    ap.add_argument("--debug", action="store_true")
+    args = ap.parse_args()
 
-    include_set = set(x.strip().lower() for x in args.include.split(",")) if args.include else set()
-    exclude_set = set(x.strip().lower() for x in args.exclude.split(",")) if args.exclude else set()
+    months = coerce_months(args.months)
     since_dt = datetime.strptime(args.since, "%Y-%m-%d") if args.since else None
     until_dt = datetime.strptime(args.until, "%Y-%m-%d") if args.until else None
 
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (compatible; RoadmapScraper/1.1; +https://example.local)"
-    })
+    include_set = set(x.strip().lower() for x in args.include.split(",") if x.strip())
+    exclude_set = set(x.strip().lower() for x in args.exclude.split(",") if x.strip())
 
-    all_cards = []
-    for page in range(1, args.max_pages + 1):
-        html = fetch_page(session, page)
-        cards = parse_cards(html)
-        if args.debug:
-            print(f"[debug] page={page} cards_found={len(cards)}", file=sys.stderr)
-        if not cards:
-            break
-        all_cards.extend(cards)
-        time.sleep(0.6)  # be polite
-
-    all_cards = dedupe(all_cards, key="id")
-
-    # Apply loose filters
-    filtered = []
-    for c in all_cards:
-        if not instance_allowed_loose(c.get("cloud_instance",""), include_set, exclude_set):
-            continue
-        if not within_date_loose(c.get("targeted_dates",""), since_dt, until_dt, args.months):
-            continue
-        filtered.append(c)
+    sess = requests.Session()
+    sess.headers.update({"User-Agent": "RoadmapFetcher/1.5 (+https://github.com/your-org/your-repo)"})
+    resp = sess.get(API, timeout=60)
+    resp.raise_for_status()
+    data = resp.json()
 
     if args.debug:
-        print(f"[debug] total_cards={len(all_cards)} kept_after_filters={len(filtered)}", file=sys.stderr)
+        print(f"[debug] total items from API: {len(data)}", file=sys.stderr)
+        if data:
+            print(f"[debug] sample keys: {sorted(data[0].keys())}", file=sys.stderr)
+
+    out_items = []
+    for item in data:
+        if not instance_allowed(item, include_set, exclude_set):
+            continue
+        if not in_date_window(item, months, since_dt, until_dt):
+            continue
+        out_items.append(item)
+        if args.max_items and len(out_items) >= args.max_items:
+            break
+
+    if args.debug:
+        print(f"[debug] kept after filters: {len(out_items)}", file=sys.stderr)
 
     if args.emit == "csv":
-        w = csv.writer(sys.stdout)
-        w.writerow(["id","title","status","phase","targeted_dates","cloud_instance","link"])
-        for c in filtered:
-            w.writerow([
-                c.get("id",""),
-                c.get("title",""),
-                c.get("status",""),
-                c.get("phase",""),
-                c.get("targeted_dates",""),
-                c.get("cloud_instance",""),
-                c.get("link",""),
-            ])
+        def write_csv(fh):
+            w = csv.writer(fh)
+            w.writerow(["id","title","status","phase","targeted_dates","cloud_instances","link"])
+            for it in out_items:
+                iid = it.get("id") or it.get("Id") or it.get("featureId") or ""
+                title = it.get("title") or it.get("Title") or ""
+                status = it.get("status") or it.get("Status") or it.get("publicRoadmapStatus") or ""
+                phase = ""
+                tc = it.get("tagsContainer") or it.get("TagsContainer") or {}
+                phases = tc.get("releasePhase") or tc.get("ReleasePhase") or []
+                if isinstance(phases, list) and phases:
+                    phase = phases[0]
+                targeted = it.get("releaseDate") or it.get("publicPreviewDate") or it.get("rolloutStart") or ""
+                clouds = instances_for(it)
+                link = f"https://www.microsoft.com/microsoft-365/roadmap?featureid={iid}" if iid else ""
+                w.writerow([iid, title, status, phase, targeted, ";".join(clouds), link])
+
+        if args.out:
+            with open(args.out, "w", encoding="utf-8", newline="") as fh:
+                write_csv(fh)
+        else:
+            write_csv(sys.stdout)
     else:
-        print(",".join(c["id"] for c in filtered))
+        ids = []
+        for it in out_items:
+            iid = it.get("id") or it.get("Id") or it.get("featureId")
+            if iid:
+                ids.append(str(iid))
+        print(",".join(ids))
 
 if __name__ == "__main__":
     main()

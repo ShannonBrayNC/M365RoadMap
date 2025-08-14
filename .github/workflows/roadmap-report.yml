@@ -93,7 +93,8 @@ jobs:
             echo "Sample already present at output/${TITLE}.md; skipping."
           fi
 
-      - name: Auto-discover Roadmap IDs (multi-pass, never hard-fails)
+          
+      - name: Auto-discover Roadmap IDs (multi-pass, writes CSV via --out)
         if: ${{ github.event.inputs.skip_generate == 'false' && (github.event.inputs.ids == '' || github.event.inputs.ids == null) }}
         id: discover
         shell: bash
@@ -108,54 +109,84 @@ jobs:
           set -euo pipefail
           mkdir -p output
 
-          run_discovery () {
-            local months="$1" since="$2" until="$3" include="$4" exclude="$5" outfmt="$6"
-            python scripts/fetch_ids.py \
-              --months "${months}" \
-              --since "${since}" \
-              --until "${until}" \
-              --include "${include}" \
-              --exclude "${exclude}" \
-              --max-pages 30 \
-              --emit "${outfmt}"
+          # Helpers that OMIT empty flags
+          run_discovery_list () {
+            local months="$1" since="$2" until="$3" include="$4" exclude="$5"
+            cmd=(python scripts/fetch_ids.py --emit list --max-items 0 --debug)
+            [[ -n "$months" ]] && cmd+=(--months "$months")
+            [[ -n "$since"  ]] && cmd+=(--since "$since")
+            [[ -n "$until"  ]] && cmd+=(--until "$until")
+            [[ -n "$include" ]] && cmd+=(--include "$include")
+            [[ -n "$exclude" ]] && cmd+=(--exclude "$exclude")
+            "${cmd[@]}"
           }
 
-          echo "Pass A: Using provided filters (months='${MONTHS}', since='${SINCE}', until='${UNTIL}', include='${INCLUDE}', exclude='${EXCLUDE}')"
-          IDS="$(run_discovery "${MONTHS:-}" "${SINCE:-}" "${UNTIL:-}" "${INCLUDE:-}" "${EXCLUDE:-}" list || true)"
-          echo "Pass A discovered IDs: ${IDS}"
+          run_discovery_csv () {
+            local months="$1" since="$2" until="$3" include="$4" exclude="$5" outpath="$6"
+            cmd=(python scripts/fetch_ids.py --emit csv --out "$outpath" --max-items 0 --debug)
+            [[ -n "$months" ]] && cmd+=(--months "$months")
+            [[ -n "$since"  ]] && cmd+=(--since "$since")
+            [[ -n "$until"  ]] && cmd+=(--until "$until")
+            [[ -n "$include" ]] && cmd+=(--include "$include")
+            [[ -n "$exclude" ]] && cmd+=(--exclude "$exclude")
+            "${cmd[@]}"
+          }
 
+          # Pass A: your filters
+          M_USED="${MONTHS:-}"; S_USED="${SINCE:-}"; U_USED="${UNTIL:-}"; I_USED="${INCLUDE:-}"; E_USED="${EXCLUDE:-}"
+          echo "Pass A months='${M_USED}' since='${S_USED}' until='${U_USED}' include='${I_USED}' exclude='${E_USED}'"
+          IDS="$(run_discovery_list "${M_USED}" "${S_USED}" "${U_USED}" "${I_USED}" "${E_USED}" || true)"
+          echo "Pass A IDs: ${IDS}"
+
+          # Pass B: drop instance
           if [[ -z "${IDS}" ]]; then
-            echo "Pass B: Dropping instance filter (include='')"
-            IDS="$(run_discovery "${MONTHS:-}" "${SINCE:-}" "${UNTIL:-}" "" "${EXCLUDE:-}" list || true)"
-            echo "Pass B discovered IDs: ${IDS}"
+            I_USED=""
+            echo "Pass B (drop instance) months='${M_USED}' since='${S_USED}' until='${U_USED}'"
+            IDS="$(run_discovery_list "${M_USED}" "${S_USED}" "${U_USED}" "${I_USED}" "${E_USED}" || true)"
+            echo "Pass B IDs: ${IDS}"
           fi
 
+          # Pass C: drop dates as well
           if [[ -z "${IDS}" ]]; then
-            echo "Pass C: Dropping date filters too (months='', since='', until='')"
-            IDS="$(run_discovery "" "" "" "" "${EXCLUDE:-}" list || true)"
-            echo "Pass C discovered IDs: ${IDS}"
+            M_USED=""; S_USED=""; U_USED=""
+            echo "Pass C (drop dates) include='${I_USED:-}' exclude='${E_USED:-}'"
+            IDS="$(run_discovery_list "${M_USED}" "${S_USED}" "${U_USED}" "${I_USED}" "${E_USED}" || true)"
+            echo "Pass C IDs: ${IDS}"
           fi
 
-          # Always emit a CSV of what we found in the last pass
-          echo "Writing discovery CSV..."
-          run_discovery "" "" "" "" "${EXCLUDE:-}" csv > "output/${TITLE}_discovered_ids.csv" || true
+          # Always write a CSV for whatever pass we ended on
+          CSV_OUT="output/${TITLE}_discovered_ids.csv"
+          echo "Writing discovery CSV to ${CSV_OUT}"
+          run_discovery_csv "${M_USED}" "${S_USED}" "${U_USED}" "${I_USED}" "${E_USED}" "${CSV_OUT}" || true
 
+          # Export ids for downstream (may be empty)
+          echo "ids=${IDS}" >> "$GITHUB_OUTPUT"
           if [[ -n "${IDS}" ]]; then
-            echo "ids=${IDS}" >> "$GITHUB_OUTPUT"
-            echo "✅ Discovery succeeded with one of the passes."
+            echo "✅ Discovery succeeded."
           else
-            echo "⚠️ Discovery could not find IDs. You can still download the discovery CSV artifact to inspect."
-            # Set an explicit empty output so downstream can skip generation.
-            echo "ids=" >> "$GITHUB_OUTPUT"
+            echo "⚠️ Discovery found no IDs with any pass."
           fi
 
-      - name: Upload discovery CSV (when in test mode)
-        if: ${{ github.event.inputs.skip_generate == 'false' && github.event.inputs.test_discovery == 'true' }}
+
+      - name: Upload discovery CSV (always)
         uses: actions/upload-artifact@v4
         with:
           name: roadmap-discovery
           path: output/${{ github.event.inputs.report_title || 'roadmap_report' }}_discovered_ids.csv
           if-no-files-found: warn
+
+
+      - name: Upload report artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: roadmap-report
+          path: |
+            output/${{ github.event.inputs.report_title || 'roadmap_report' }}.md
+            output/${{ github.event.inputs.report_title || 'roadmap_report' }}.csv
+            output/${{ github.event.inputs.report_title || 'roadmap_report' }}.json
+            output/*
+          if-no-files-found: warn
+
 
       - name: Generate Markdown report via API (only if we have IDs)
         if: ${{ github.event.inputs.skip_generate == 'false' && github.event.inputs.test_discovery != 'true' }}
@@ -171,21 +202,21 @@ jobs:
             echo "Missing OPENAI_API_KEY secret. Set it in Settings → Secrets → Actions." >&2
             exit 1
           fi
-
           RAW_IDS="${{ github.event.inputs.ids }}"
           if [[ -z "$RAW_IDS" ]]; then
             RAW_IDS="${{ steps.discover.outputs.ids }}"
           fi
-
           if [[ -z "$RAW_IDS" ]]; then
-            echo "ℹ️ No IDs to generate a report from (discovery found none and no ids were provided). Skipping generation."
+            echo "ℹ️ No IDs available; skipping report generation."
             exit 0
           fi
-
           TITLE="${{ github.event.inputs.report_title || 'roadmap_report' }}"
           mkdir -p output
           echo "Using IDs: $RAW_IDS"
           bash scripts/generate_report.sh "$RAW_IDS" "prompts/system_multi_id.md" "output/${TITLE}.md"
+
+
+
       - name: Post-process to CSV/JSON (always runs)
         shell: bash
         env:
