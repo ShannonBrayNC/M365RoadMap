@@ -1,9 +1,9 @@
 {
-  "tenant_id": "38ac7b7f-65e1-4a2a-8e3a-7bbe18659ebe",
-  "client_id": "5adca85e-5309-4f49-8c8d-044fccc637f0",
-  "CertificateThumbprint": "AA11BB22CC33DD44EE55FF66778899AABBCCDDEE",
-  "authority": "https://login.microsoftonline.com/38ac7b7f-65e1-4a2a-8e3a-7bbe18659ebe",
+  "ClientId" : "5adca85e-5309-4f49-8c8d-044fccc637f0",
+  "TenantId" : "38ac7b7f-65e1-4a2a-8e3a-7bbe18659ebe",
+  "CertificateThumbprint" : "5C5F3A443D8232901E0E587E0E95762418C31670",
+  "authority": "https://login.microsoftonline.com/YOUR-TENANT-GUID",
   "graph_base": "https://graph.microsoft.com/v1.0",
-  "pfx_path": "C:/EchoMediaAi/PnPPowerShellCert.pfx",
+  "pfx_path": ".secrets/EchoMediaAi_PnPPowerShellCert.pfx",
   "pfx_password_env": "EdenEcho!"
 }

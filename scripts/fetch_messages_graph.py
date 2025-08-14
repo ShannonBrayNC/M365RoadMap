@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 fetch_messages_graph.py — primary: Microsoft Graph Message Center
-fallbacks: public Roadmap by ID (Playwright) -> RSS/JSON API by ID
+fallbacks: (optional) public Roadmap by ID (Playwright) -> RSS/JSON API by ID
 
 Emits your master table CSV/JSON headers:
 | ID | Title | Product/Workload | Status | Release phase | Targeted dates | Cloud instance | Short description | Official Roadmap link |
@@ -12,8 +12,15 @@ from typing import List, Set
 import requests
 
 from graph_client import acquire_token
-from fallback_public_roadmap import fetch_ids_public
 from fallback_rss_api import fetch_ids_rss
+
+# Try to import the Playwright-based fallback only if installed.
+# If playwright isn't in requirements, this import will fail and we'll skip that path.
+PLAYWRIGHT_OK = True
+try:
+    from fallback_public_roadmap import fetch_ids_public  # this module imports playwright
+except Exception:
+    PLAYWRIGHT_OK = False
 
 TABLE_HEADERS = [
     "ID","Title","Product/Workload","Status","Release phase",
@@ -115,7 +122,7 @@ def main():
     used_graph = False
     graph_error = None
 
-    # NEW: per-method counters
+    # per-method counters
     graph_cnt = 0
     public_cnt = 0
     rss_cnt = 0
@@ -137,10 +144,10 @@ def main():
             if args.debug:
                 print(f"[fetch] Graph failed: {e}", file=sys.stderr)
 
-    # 2) Public IDs (Playwright) if provided
+    # 2) Public IDs (Playwright) if provided AND playwright is available
     id_list = [s.strip() for s in args.ids.split(",") if s.strip()]
     fetched_ids: Set[str] = set()
-    if id_list:
+    if id_list and PLAYWRIGHT_OK:
         try:
             pub_rows = fetch_ids_public(id_list)
             for r in pub_rows:
@@ -149,10 +156,12 @@ def main():
             rows.extend(pub_rows)
             public_cnt += len(pub_rows)
             if args.debug:
-                print(f"[fetch] Public fallback fetched {len(pub_rows)} rows", file=sys.stderr)
+                print(f"[fetch] Public fallback (Playwright) fetched {len(pub_rows)} rows", file=sys.stderr)
         except Exception as e:
             if args.debug:
-                print(f"[fetch] Public fallback failed: {e}", file=sys.stderr)
+                print(f"[fetch] Public fallback (Playwright) failed: {e}", file=sys.stderr)
+    elif id_list and not PLAYWRIGHT_OK and args.debug:
+        print("[fetch] Playwright not installed; skipping public-page fallback and going straight to RSS/JSON.", file=sys.stderr)
 
     # 3) RSS/JSON API fallback for any remaining IDs
     remaining = [i for i in id_list if i not in fetched_ids]

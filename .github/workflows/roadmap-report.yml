@@ -61,10 +61,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Install Playwright browsers (only if needed)
+      - name: Install Playwright browsers (only if playwright in requirements.txt)
         if: ${{ inputs.public_ids != '' || inputs.use_graph == false }}
         run: |
-          python -m playwright install --with-deps chromium
+          if grep -q 'playwright' requirements.txt; then
+            echo "playwright found in requirements.txt — installing browsers..."
+            python -m playwright install --with-deps chromium
+          else
+            echo "playwright not listed in requirements.txt — skipping browser install."
+          fi
+
 
       - name: Ensure scripts are executable (if present)
         run: |
@@ -82,6 +88,88 @@ jobs:
             echo "graph_config.json NOT found (Graph fetch will fail if use_graph=true)."
           fi
 
+
+      # Add this BEFORE "Fetch rows (Graph primary, public fallback)"
+      - name: Discover IDs via RSS when none provided
+        id: discover_rss
+        if: ${{ inputs.public_ids == '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY' > output/rss_ids.txt
+          import json, sys, requests, os
+          months = os.getenv("MONTHS", "")   # passed from inputs env later in job
+          since  = os.getenv("SINCE", "")
+          # Pull the official JSON surface behind RSS
+          data = requests.get("https://www.microsoft.com/releasecommunications/api/v2/m365/rss", timeout=60).json()
+          items = None
+          for k in ("value","items","Items","results","Results","data","Data"):
+              if isinstance(data.get(k), list):
+                  items = data[k]; break
+          if items is None and isinstance(data, list):
+              items = data
+          from datetime import datetime, timedelta
+          cut = None
+          if months:
+              try:
+                  m = int(months)
+                  cut = datetime.utcnow() - timedelta(days=int(30.44*m))
+              except: pass
+          if since and not cut:
+              try:
+                  sdt = datetime.strptime(since, "%Y-%m-%d")
+                  cut = sdt
+              except: pass
+          def fid(it):
+              for k in ("featureId","FeatureId","id","ID","Id"):
+                  if k in it and it[k]:
+                      return str(it[k]).strip()
+              return ""
+          def lastmod(it):
+              for k in ("modified","lastModified","LastModified","lastModifiedDateTime"):
+                  if k in it and it[k]:
+                      try:
+                          return datetime.fromisoformat(str(it[k]).replace("Z","+00:00"))
+                      except: pass
+              return None
+          ids = []
+          for it in (items or []):
+              f = fid(it)
+              if not f: continue
+              if cut:
+                  lm = lastmod(it)
+                  if lm and lm < cut:
+                      continue
+              ids.append(f)
+          print(",".join(sorted(set(ids))[:150]))  # cap for safety
+          PY
+              DISCOVERED=$(cat output/rss_ids.txt | tr -d '\n\r')
+              echo "public_ids=${DISCOVERED}" >> "$GITHUB_OUTPUT"
+
+
+      - name: Write PFX from secret (Linux)
+        if: ${{ inputs.use_graph == true }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .secrets
+          echo "${M365_PFX_B64}" | base64 -d > .secrets/m365cert.pfx
+          # small sanity check
+          test -s .secrets/m365cert.pfx || (echo "PFX write failed" && exit 1)
+        env:
+          M365_PFX_B64: ${{ secrets.M365_PFX_B64 }}
+
+      - name: Export PFX password to env
+        if: ${{ inputs.use_graph == true }}
+        shell: bash
+        run: echo "M365_PFX_PASSWORD=${M365_PFX_PASSWORD}" >> $GITHUB_ENV
+        env:
+          M365_PFX_PASSWORD: ${{ secrets.M365_PFX_PASSWORD }}
+
+
+
+
+
       # Fetch rows -> master CSV/JSON using Graph + public (Playwright) + RSS/JSON fallbacks
       - name: Fetch rows (Graph primary, public + RSS fallbacks)
         id: fetch_rows
@@ -89,10 +177,11 @@ jobs:
         env:
           TITLE: ${{ inputs.title }}
           USE_GRAPH: ${{ inputs.use_graph }}
-          PUBLIC_IDS: ${{ inputs.public_ids }}
+          PUBLIC_IDS: ${{ inputs.public_ids != '' && inputs.public_ids || steps.discover_rss.outputs.public_ids }}
           MONTHS: ${{ inputs.months }}
           SINCE: ${{ inputs.since }}
           TENANT_CLOUD: ${{ inputs.tenant_cloud }}
+
         run: |
           set -euo pipefail
 
