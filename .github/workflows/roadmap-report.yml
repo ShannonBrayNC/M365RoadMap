@@ -276,7 +276,7 @@ jobs:
           if [[ ! -f prompts/system_multi_id.md ]]; then
             echo "prompts/system_multi_id.md missing; creating a minimal fallback."
             mkdir -p prompts
-            cat > prompts/system_multi_id.md <<'EOF'
+            cat <<'EOF' > prompts/system_multi_id.md
             You are a technical editor. Produce a standards-compliant Markdown report.
             - Start with an Overview.
             - Include a master pipe table with columns:
