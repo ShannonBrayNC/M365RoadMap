@@ -52,6 +52,15 @@ def norm_instance(s: str) -> str:
         return "gcc"
     return t
 
+def clean_text(s):
+    """Remove zero-width spaces and normalize whitespace; keep UTF-8 characters."""
+    if not isinstance(s, str):
+        return s
+    s = s.replace("\u200b", "")  # zero-width space
+    return " ".join(s.split())
+
+
+
 def parse_isoish(dt_str: str | None):
     if not dt_str:
         return None
@@ -91,12 +100,31 @@ def in_date_window(item, months, since_dt, until_dt):
     return True
 
 def instances_for(item):
+    # Common location
     tc = item.get("tagsContainer") or item.get("TagsContainer") or {}
     vals = tc.get("cloudInstances") or tc.get("CloudInstances") or []
-    if not vals:
+
+    # Normalize any dicts like {"tagName": "GCC High"}
+    norm_vals = []
+    for v in vals:
+        if isinstance(v, dict):
+            v = v.get("tagName") or v.get("name") or v.get("value") or ""
+        if isinstance(v, str) and v.strip():
+            norm_vals.append(norm_instance(v))
+
+    # Fallback: flat tags sometimes contain instance names
+    if not norm_vals:
         tags = item.get("tags") or item.get("Tags") or []
-        vals = [t for t in tags if isinstance(t, str) and any(k in t.lower() for k in ("gcc", "dod", "worldwide"))]
-    return [norm_instance(v) for v in vals if isinstance(v, str)]
+        for t in tags:
+            if not isinstance(t, (str, dict)):
+                continue
+            if isinstance(t, dict):
+                t = t.get("tagName") or t.get("name") or t.get("value") or ""
+            if isinstance(t, str) and any(k in t.lower() for k in ("gcc", "dod", "worldwide")):
+                norm_vals.append(norm_instance(t))
+
+    return [v for v in norm_vals if v]
+
 
 def instance_allowed(item, include_set, exclude_set):
     vals = instances_for(item)
@@ -157,6 +185,46 @@ def main():
 
     if args.emit == "csv":
         def write_csv(fh):
+            w = csv.writer(fh)
+            w.writerow(["id","title","status","phase","targeted_dates","cloud_instances","link"])
+            for it in out_items:
+                iid = it.get("id") or it.get("Id") or it.get("featureId") or ""
+                title = it.get("title") or it.get("Title") or ""
+                status = it.get("status") or it.get("Status") or it.get("publicRoadmapStatus") or ""
+
+                # Phase: may be list of strings OR list of dicts {tagName: "..."}
+                phase = ""
+                tc = it.get("tagsContainer") or it.get("TagsContainer") or {}
+                phases = tc.get("releasePhase") or tc.get("ReleasePhase") or []
+                if isinstance(phases, list) and phases:
+                    first = phases[0]
+                    if isinstance(first, dict):
+                        phase = first.get("tagName") or first.get("name") or first.get("value") or ""
+                    else:
+                        phase = str(first)
+
+                targeted = (
+                    it.get("releaseDate")
+                    or it.get("publicPreviewDate")
+                    or it.get("rolloutStart")
+                    or ""
+                )
+
+                clouds = instances_for(it)  # already normalized
+                link = f"https://www.microsoft.com/microsoft-365/roadmap?featureid={iid}" if iid else ""
+
+                # Clean common oddities without losing Unicode
+                row = [
+                    str(iid),
+                    clean_text(title),
+                    clean_text(status),
+                    clean_text(phase),
+                    clean_text(targeted),
+                    ";".join(clouds),
+                    link,
+                ]
+                w.writerow(row)
+
             w = csv.writer(fh)
             w.writerow(["id","title","status","phase","targeted_dates","cloud_instances","link"])
             for it in out_items:
