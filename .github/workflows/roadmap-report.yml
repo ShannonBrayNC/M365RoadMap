@@ -171,21 +171,10 @@ jobs:
       - name: Upload discovery CSV (always)
         uses: actions/upload-artifact@v4
         with:
-          name: roadmap-discovery
+          name: roadmap-discovery-${{ github.run_attempt }}
           path: output/${{ github.event.inputs.report_title || 'roadmap_report' }}_discovered_ids.csv
           if-no-files-found: warn
-
-
-      - name: Upload report artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: roadmap-report
-          path: |
-            output/${{ github.event.inputs.report_title || 'roadmap_report' }}.md
-            output/${{ github.event.inputs.report_title || 'roadmap_report' }}.csv
-            output/${{ github.event.inputs.report_title || 'roadmap_report' }}.json
-            output/*
-          if-no-files-found: warn
+          overwrite: true
 
 
       - name: Generate Markdown report via API (only if we have IDs)
@@ -244,10 +233,11 @@ jobs:
       - name: Upload report artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: roadmap-report
+          name: roadmap-report-${{ github.run_attempt }}
           path: |
             output/${{ github.event.inputs.report_title || 'roadmap_report' }}.md
             output/${{ github.event.inputs.report_title || 'roadmap_report' }}.csv
             output/${{ github.event.inputs.report_title || 'roadmap_report' }}.json
             output/*
           if-no-files-found: warn
+          overwrite: true
