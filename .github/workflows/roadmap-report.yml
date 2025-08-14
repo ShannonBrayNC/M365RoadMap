@@ -78,6 +78,90 @@ jobs:
       - name: Ensure output dir
         run: mkdir -p output
 
+
+
+      - name: Validate PFX and prepare graph_config.json
+        shell: bash
+        env:
+          # Prefer repo secrets; if you already have pfx_base64 in graph_config.json,
+          # you can omit M365_PFX_BASE64 and this step will fall back to the file.
+          TENANT: ${{ secrets.GRAPH_TENANT_ID }}
+          CLIENT: ${{ secrets.GRAPH_CLIENT_ID }}
+          PFX_B64: ${{ secrets.M365_PFX_BASE64 }}
+          PFX_PASSWORD_ENV: M365_PFX_PASSWORD   # your runner/secret should set this password at runtime
+        run: |
+          set -euo pipefail
+
+          CFG_PATH="graph_config.json"
+
+          # 1) Source PFX (prefer secret; else read from graph_config.json if present)
+          PFX="${PFX_B64:-}"
+          if [[ -z "${PFX}" && -f "${CFG_PATH}" ]]; then
+            echo "Reading pfx_base64 from ${CFG_PATH}"
+            PFX="$(python - "$CFG_PATH" <<'PY'
+            import sys, json
+            with open(sys.argv[1], "rb") as f:
+                d = json.load(f)
+            print(d.get("pfx_base64",""))
+            PY
+            )"
+                fi
+
+                if [[ -z "${PFX:-}" ]]; then
+                  echo "❌ No PFX Base64 available. Provide secret M365_PFX_BASE64 or include pfx_base64 in ${CFG_PATH}." >&2
+                  exit 1
+                fi
+
+                # 2) Simple sanity check: length should be in the thousands for a typical PFX
+                echo "PFX_B64 length: ${#PFX}"
+                if (( ${#PFX} < 1000 )); then
+                  echo "❌ PFX_B64 looks too short or truncated." >&2
+                  exit 1
+                fi
+
+                # 3) Validate Base64 and measure decoded size
+                export PFX
+                BYTES="$(python - <<'PY'
+            import os, base64, sys
+            b = os.environ.get("PFX","")
+            try:
+                raw = base64.b64decode(b, validate=True)
+            except Exception as e:
+                print(f"Invalid Base64: {e}", file=sys.stderr)
+                sys.exit(2)
+            print(len(raw))
+            PY
+            )"
+                echo "Decoded PFX bytes: ${BYTES}"
+
+                # 4) (Re)write graph_config.json if we have tenant/client from secrets
+                if [[ -n "${TENANT:-}" && -n "${CLIENT:-}" ]]; then
+                  echo "Writing ${CFG_PATH} from secrets + PFX…"
+                  python - <<'PY'
+            import os, json
+            cfg = {
+              "tenant_id": os.environ.get("TENANT",""),
+              "client_id": os.environ.get("CLIENT",""),
+              "pfx_base64": os.environ["PFX"],
+              "pfx_password_env": os.environ.get("PFX_PASSWORD_ENV","M365_PFX_PASSWORD"),
+              "graph_base": "https://graph.microsoft.com/v1.0"
+            }
+            with open("graph_config.json","w",encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False)
+            print("graph_config.json written.")
+            PY
+                else
+                  echo "TENANT/CLIENT secrets not set; leaving existing ${CFG_PATH} as-is."
+                fi
+
+
+
+
+
+
+
+
+
       - name: Validate Graph inputs presence
         if: ${{ inputs.use_graph == true }}
         shell: bash
