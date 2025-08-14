@@ -93,6 +93,32 @@ jobs:
           fi
 
 
+      - name: Create graph_config.json from secrets
+        shell: bash
+        env:
+          TENANT: ${{ secrets.GRAPH_TENANT_ID }}
+          CLIENT: ${{ secrets.GRAPH_CLIENT_ID }}
+          PFX_B64: ${{ secrets.M365_PFX_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${TENANT:-}" || -z "${CLIENT:-}" || -z "${PFX_B64:-}" ]]; then
+            echo "Graph secrets missing. Ensure GRAPH_TENANT_ID, GRAPH_CLIENT_ID, M365_PFX_BASE64 are set." >&2
+            exit 1
+          fi
+          cat > graph_config.json <<'JSON'
+          {
+            "tenant_id": "__TENANT__",
+            "client_id": "__CLIENT__",
+            "pfx_base64": "__PFX_B64__",
+            "pfx_password_env": "M365_PFX_PASSWORD",
+            "graph_base": "https://graph.microsoft.com/v1.0"
+          }
+          JSON
+          sed -i "s/__TENANT__/${TENANT}/" graph_config.json
+          sed -i "s/__CLIENT__/${CLIENT}/" graph_config.json
+          PFX_ESCAPED=$(printf '%s' "${PFX_B64}" | sed 's/[\/&]/\\&/g')
+          sed -i "s/__PFX_B64__/${PFX_ESCAPED}/" graph_config.json
+
 
 
 
@@ -216,6 +242,41 @@ jobs:
           echo "csv=${CSV_OUT}"     >> "$GITHUB_OUTPUT"
           echo "json=${JSON_OUT}"   >> "$GITHUB_OUTPUT"
           echo "stats=${STATS_OUT}" >> "$GITHUB_OUTPUT"
+
+
+      - name: Fetch Graph messages (primary) + fallbacks
+        shell: bash
+        env:
+          M365_PFX_PASSWORD: ${{ secrets.M365_PFX_PASSWORD }}
+          USE_GRAPH: "true"
+          USE_PUBLIC_SCRAPE: "true"   # your existing toggle
+          MONTHS: "3"
+          SINCE: "2025-07-01"
+          TENANT_CLOUD: "Worldwide (Standard Multi-Tenant)"
+          TITLE: "roadmap_report"
+        run: |
+          set -euo pipefail
+          CSV_OUT="output/${TITLE}_master.csv"
+          JSON_OUT="output/${TITLE}_master.json"
+          STATS_OUT="output/${TITLE}_fetch_stats.json"
+
+          python scripts/fetch_messages_graph.py \
+            --config graph_config.json \
+            --months "${MONTHS}" --since "${SINCE}" \
+            --tenant-cloud "${TENANT_CLOUD}" \
+            --emit csv --out "${CSV_OUT}" \
+            --stats-out "${STATS_OUT}"
+
+          python scripts/fetch_messages_graph.py \
+            --config graph_config.json \
+            --months "${MONTHS}" --since "${SINCE}" \
+            --tenant-cloud "${TENANT_CLOUD}" \
+            --emit json --out "${JSON_OUT}"
+
+
+
+
+
 
       - name: One-line method summary
         if: ${{ success() }}
