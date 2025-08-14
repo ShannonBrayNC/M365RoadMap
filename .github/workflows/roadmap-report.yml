@@ -1,58 +1,54 @@
-name: Generate Microsoft 365 Roadmap Report
+name: Build Microsoft 365 Roadmap Report
 
 on:
   workflow_dispatch:
     inputs:
-      skip_generate:
-        description: "Skip API generation and use sample file (first-run safe)"
+      title:
+        description: "Report title (used in filenames)"
         required: true
-        default: "true"
-        type: choice
-        options: ["true", "false"]
-      test_discovery:
-        description: "Discovery Test Mode: only fetch IDs and upload CSV (no report generation)"
+        default: "roadmap_report"
+      use_graph:
+        description: "Use Graph Message Center (needs graph_config.json + cert)"
         required: true
-        default: "false"
-        type: choice
-        options: ["true", "false"]
-      ids:
-        description: "Comma-separated Roadmap IDs (leave blank to auto-discover by filters)"
+        type: boolean
+        default: false
+      public_ids:
+        description: "Comma-separated Roadmap IDs for public fallback (e.g., 498159,499430)"
         required: false
         default: ""
-      report_title:
-        description: "Title for output files (no spaces)"
-        required: false
-        default: "roadmap_report"
-      model:
-        description: "OpenAI model (default: gpt-4o; you can override to gpt-5)"
-        required: false
-        default: "gpt-4o"
       months:
-        description: "Months back from today to include (1..6) OR leave blank to use since/until"
+        description: "Months back (1..6) for Graph (ignored if 'since' is set)"
         required: false
         default: "3"
       since:
-        description: "Start date (YYYY-MM-DD). If set and 'until' blank, defaults to +6 months."
+        description: "Since date (YYYY-MM-DD) for Graph (overrides 'months' if set)"
         required: false
         default: ""
       until:
-        description: "End date (YYYY-MM-DD)"
+        description: "Until date (kept for compatibility; not used by Graph)"
         required: false
         default: ""
-      include_instances:
-        description: "Include Cloud Instances (e.g., DoD,GCC,GCC High,Worldwide (Standard Multi-Tenant))"
+      tenant_cloud:
+        description: "Cloud instance label for Graph rows (e.g., Worldwide, GCC, GCC High, DoD)"
         required: false
-        default: ""
-      exclude_instances:
-        description: "Exclude Cloud Instances (comma-separated)"
-        required: false
-        default: ""
+        default: "Worldwide (Standard Multi-Tenant)"
+      skip_generate:
+        description: "Skip markdown generation (fetch only)"
+        required: true
+        type: boolean
+        default: false
+
+env:
+  PYTHONUNBUFFERED: "1"
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -60,220 +56,184 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install requirements (if requirements.txt exists)
-        shell: bash
+      - name: Install Python deps (requirements.txt)
         run: |
-          set -euxo pipefail
-          if [[ -f requirements.txt ]]; then
-            python -m pip install --upgrade pip wheel
-            pip install -r requirements.txt
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Playwright browsers (only if needed)
+        if: ${{ inputs.public_ids != '' || inputs.use_graph == false }}
+        run: |
+          python -m playwright install --with-deps chromium
+
+      - name: Ensure scripts are executable (if present)
+        run: |
+          chmod +x scripts/generate_report.sh || true
+          chmod +x scripts/post_process.sh || true
+
+      - name: Ensure output dir
+        run: mkdir -p output
+
+      - name: Show Graph config presence
+        run: |
+          if [ -f graph_config.json ]; then
+            echo "graph_config.json found."
           else
-            echo "No requirements.txt found. Skipping pip install."
+            echo "graph_config.json NOT found (Graph fetch will fail if use_graph=true)."
           fi
 
-      - name: Make scripts executable & normalize line endings
-        shell: bash
-        run: |
-          set -euxo pipefail
-          sudo apt-get update && sudo apt-get install -y dos2unix
-          if compgen -G "scripts/*.sh" > /dev/null; then dos2unix scripts/*.sh || true; chmod +x scripts/*.sh; fi
-          if [[ -f scripts/fetch_ids.py ]]; then dos2unix scripts/fetch_ids.py || true; chmod +x scripts/fetch_ids.py; fi
-          if [[ -f scripts/write_sample.sh ]]; then dos2unix scripts/write_sample.sh || true; chmod +x scripts/write_sample.sh; fi
-
-      - name: Ensure sample report exists (first-run safety)
-        if: ${{ github.event.inputs.skip_generate == 'true' }}
+      # Fetch rows -> master CSV/JSON using Graph + public (Playwright) + RSS/JSON fallbacks
+      - name: Fetch rows (Graph primary, public + RSS fallbacks)
+        id: fetch_rows
         shell: bash
         env:
-          TITLE: ${{ github.event.inputs.report_title || 'roadmap_report' }}
-        run: |
-          set -euxo pipefail
-          mkdir -p output
-          if [[ ! -f "output/${TITLE}.md" ]]; then
-            bash scripts/write_sample.sh "output/${TITLE}.md"
-          else
-            echo "Sample already present at output/${TITLE}.md; skipping."
-          fi
-
-          
-      - name: Auto-discover Roadmap IDs (multi-pass, writes CSV via --out)
-        if: ${{ github.event.inputs.skip_generate == 'false' && (github.event.inputs.ids == '' || github.event.inputs.ids == null) }}
-        id: discover
-        shell: bash
-        env:
-          MONTHS: ${{ github.event.inputs.months }}
-          SINCE: ${{ github.event.inputs.since }}
-          UNTIL: ${{ github.event.inputs.until }}
-          INCLUDE: ${{ github.event.inputs.include_instances }}
-          EXCLUDE: ${{ github.event.inputs.exclude_instances }}
-          TITLE: ${{ github.event.inputs.report_title || 'roadmap_report' }}
+          TITLE: ${{ inputs.title }}
+          USE_GRAPH: ${{ inputs.use_graph }}
+          PUBLIC_IDS: ${{ inputs.public_ids }}
+          MONTHS: ${{ inputs.months }}
+          SINCE: ${{ inputs.since }}
+          TENANT_CLOUD: ${{ inputs.tenant_cloud }}
         run: |
           set -euo pipefail
-          mkdir -p output
 
-          # Helpers that OMIT empty flags
-          run_discovery_list () {
-            local months="$1" since="$2" until="$3" include="$4" exclude="$5"
-            cmd=(python scripts/fetch_ids.py --emit list --max-items 0 --debug)
-            [[ -n "$months" ]] && cmd+=(--months "$months")
-            [[ -n "$since"  ]] && cmd+=(--since "$since")
-            [[ -n "$until"  ]] && cmd+=(--until "$until")
-            [[ -n "$include" ]] && cmd+=(--include "$include")
-            [[ -n "$exclude" ]] && cmd+=(--exclude "$exclude")
-            "${cmd[@]}"
-          }
+          CSV_OUT="output/${TITLE}_master.csv"
+          JSON_OUT="output/${TITLE}_master.json"
+          STATS_OUT="output/${TITLE}_fetch_stats.json"
 
-          run_discovery_csv () {
-            local months="$1" since="$2" until="$3" include="$4" exclude="$5" outpath="$6"
-            cmd=(python scripts/fetch_ids.py --emit csv --out "$outpath" --max-items 0 --debug)
-            [[ -n "$months" ]] && cmd+=(--months "$months")
-            [[ -n "$since"  ]] && cmd+=(--since "$since")
-            [[ -n "$until"  ]] && cmd+=(--until "$until")
-            [[ -n "$include" ]] && cmd+=(--include "$include")
-            [[ -n "$exclude" ]] && cmd+=(--exclude "$exclude")
-            "${cmd[@]}"
-          }
-
-          # Pass A: your filters
-          M_USED="${MONTHS:-}"; S_USED="${SINCE:-}"; U_USED="${UNTIL:-}"; I_USED="${INCLUDE:-}"; E_USED="${EXCLUDE:-}"
-          echo "Pass A months='${M_USED}' since='${S_USED}' until='${U_USED}' include='${I_USED}' exclude='${E_USED}'"
-          IDS="$(run_discovery_list "${M_USED}" "${S_USED}" "${U_USED}" "${I_USED}" "${E_USED}" || true)"
-          echo "Pass A IDs: ${IDS}"
-
-          # Pass B: drop instance
-          if [[ -z "${IDS}" ]]; then
-            I_USED=""
-            echo "Pass B (drop instance) months='${M_USED}' since='${S_USED}' until='${U_USED}'"
-            IDS="$(run_discovery_list "${M_USED}" "${S_USED}" "${U_USED}" "${I_USED}" "${E_USED}" || true)"
-            echo "Pass B IDs: ${IDS}"
-          fi
-
-          # Pass C: drop dates as well
-          if [[ -z "${IDS}" ]]; then
-            M_USED=""; S_USED=""; U_USED=""
-            echo "Pass C (drop dates) include='${I_USED:-}' exclude='${E_USED:-}'"
-            IDS="$(run_discovery_list "${M_USED}" "${S_USED}" "${U_USED}" "${I_USED}" "${E_USED}" || true)"
-            echo "Pass C IDs: ${IDS}"
-          fi
-
-          # Always write a CSV for whatever pass we ended on
-          CSV_OUT="output/${TITLE}_discovered_ids.csv"
-          echo "Writing discovery CSV to ${CSV_OUT}"
-          run_discovery_csv "${M_USED}" "${S_USED}" "${U_USED}" "${I_USED}" "${E_USED}" "${CSV_OUT}" || true
-
-          # Export ids for downstream (may be empty)
-          echo "ids=${IDS}" >> "$GITHUB_OUTPUT"
-          if [[ -n "${IDS}" ]]; then
-            echo "✅ Discovery succeeded."
+          # Flags
+          if [[ "${USE_GRAPH}" == "true" ]]; then
+            GRAPH_FLAG=""
           else
-            echo "⚠️ Discovery found no IDs with any pass."
+            GRAPH_FLAG="--no-graph"
           fi
 
+          IDS_FLAG=""
+          if [[ -n "${PUBLIC_IDS}" ]]; then
+            IDS_FLAG="--ids ${PUBLIC_IDS}"
+          fi
 
-      - name: Upload discovery CSV (always)
-        uses: actions/upload-artifact@v4
-        with:
-          name: roadmap-discovery-${{ github.run_attempt }}
-          path: output/${{ github.event.inputs.report_title || 'roadmap_report' }}_discovered_ids.csv
-          if-no-files-found: warn
-          overwrite: true
+          DATE_FLAGS=""
+          if [[ -n "${SINCE}" ]]; then
+            DATE_FLAGS="--since ${SINCE}"
+          elif [[ -n "${MONTHS}" ]]; then
+            DATE_FLAGS="--months ${MONTHS}"
+          fi
 
+          echo "Running fetch_messages_graph.py ${GRAPH_FLAG} ${IDS_FLAG} ${DATE_FLAGS}"
+          python scripts/fetch_messages_graph.py \
+            --config graph_config.json \
+            ${GRAPH_FLAG} ${IDS_FLAG} ${DATE_FLAGS} \
+            --tenant-cloud "${TENANT_CLOUD}" \
+            --emit csv --out "${CSV_OUT}" \
+            --stats-out "${STATS_OUT}" --debug
 
-      - name: Generate Markdown report via API (only if we have IDs)
-        if: ${{ github.event.inputs.skip_generate == 'false' && github.event.inputs.test_discovery != 'true' }}
+          python scripts/fetch_messages_graph.py \
+            --config graph_config.json \
+            ${GRAPH_FLAG} ${IDS_FLAG} ${DATE_FLAGS} \
+            --tenant-cloud "${TENANT_CLOUD}" \
+            --emit json --out "${JSON_OUT}" --debug
+
+          echo "csv=${CSV_OUT}"   >> "$GITHUB_OUTPUT"
+          echo "json=${JSON_OUT}" >> "$GITHUB_OUTPUT"
+          echo "stats=${STATS_OUT}" >> "$GITHUB_OUTPUT"
+
+      - name: One-line method summary
+        if: ${{ success() }}
+        id: method_summary
         shell: bash
         env:
+          STATS_PATH: ${{ steps.fetch_rows.outputs.stats }}
+        run: |
+          set -euo pipefail
+          if [[ -f "${STATS_PATH}" ]]; then
+            LINE=$(python - <<'PY'
+          import json, os
+          p=os.environ["STATS_PATH"]
+          with open(p, encoding="utf-8") as f:
+              s=json.load(f)
+          print(f"[rows] Graph={s.get('graph',0)} Public={s.get('public',0)} RSS={s.get('rss',0)} Total={s.get('total',0)}")
+          PY
+          )
+                      echo "${LINE}"
+                      echo "${LINE}" >> "$GITHUB_STEP_SUMMARY"
+                      echo "summary_line=${LINE}" >> "$GITHUB_OUTPUT"
+                    else
+                      echo "No stats file found at ${STATS_PATH}"
+                    fi
+
+      # Extract Roadmap IDs from the master CSV (if any official roadmap links are present)
+      - name: Derive Roadmap IDs from CSV
+        id: ids_from_csv
+        if: ${{ success() }}
+        shell: bash
+        env:
+          CSV_PATH: ${{ steps.fetch_rows.outputs.csv }}
+        run: |
+          set -euo pipefail
+          IDS=""
+          if [[ -f "${CSV_PATH}" ]]; then
+            IDS=$(awk -F, 'NR>1 {print $NF}' "${CSV_PATH}" | \
+              grep -oE 'featureid=[0-9]+' | grep -oE '[0-9]+' | sort -u | paste -sd, - || true)
+          fi
+          echo "Derived IDs: ${IDS}"
+          echo "ids=${IDS}" >> "$GITHUB_OUTPUT"
+
+      # Generate Markdown only if not skipped AND we have IDs (derived or user-provided)
+      - name: Generate Markdown (Deep Dive)
+        if: ${{ inputs.skip_generate == false && (steps.ids_from_csv.outputs.ids != '' || inputs.public_ids != '') }}
+        shell: bash
+        env:
+          TITLE: ${{ inputs.title }}
+          USER_IDS: ${{ inputs.public_ids }}
+          DERIVED_IDS: ${{ steps.ids_from_csv.outputs.ids }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
-          OPENAI_MODEL: ${{ github.event.inputs.model || 'gpt-4o' }}
           OPENAI_ORG_ID: ${{ secrets.OPENAI_ORG_ID }}
         run: |
-          set -euxo pipefail
-
-          # Get IDs: manual input wins; otherwise use discovery output
-          RAW_IDS="${{ github.event.inputs.ids }}"
-          if [[ -z "$RAW_IDS" ]]; then
-            RAW_IDS="${{ steps.discover.outputs.ids }}"
+          set -euo pipefail
+          IDS="${DERIVED_IDS}"
+          if [[ -z "${IDS}" && -n "${USER_IDS}" ]]; then
+            IDS="${USER_IDS}"
           fi
-          if [[ -z "$RAW_IDS" ]]; then
-            echo "ℹ️ No IDs; skipping generation." >&2
+
+          echo "Using IDs for Deep Dive: ${IDS}"
+
+          if [[ -z "${OPENAI_API_KEY:-}" ]]; then
+            echo "OPENAI_API_KEY not set; skipping generation." >&2
             exit 0
           fi
 
-          TITLE="${{ github.event.inputs.report_title || 'roadmap_report' }}"
-          mkdir -p output
-          rm -f "output/${TITLE}.md"
+          bash scripts/generate_report.sh "${IDS}" "prompts/system_multi_id.md" "output/${TITLE}.md"
 
-          echo "Using IDs: $RAW_IDS"
-          bash scripts/generate_report.sh "$RAW_IDS" "prompts/system_multi_id.md" "output/${TITLE}.md"
-
-          # quick sanity peek
-          echo "----- HEAD output/${TITLE}.md -----"
-          head -n 40 "output/${TITLE}.md" || true
-          echo "-----------------------------------"
-
-      - name: Validate generated report (strict)
-        if: ${{ github.event.inputs.skip_generate == 'false' && github.event.inputs.test_discovery != 'true' }}
+      - name: Post-process (MD -> CSV/JSON)
+        if: ${{ inputs.skip_generate == false }}
         shell: bash
         env:
-          TITLE: ${{ github.event.inputs.report_title || 'roadmap_report' }}
+          TITLE: ${{ inputs.title }}
+          MONTHS: ${{ inputs.months }}
+          SINCE: ${{ inputs.since }}
+          UNTIL: ${{ inputs.until }}
+          INCLUDE: ""
+          EXCLUDE: ""
         run: |
           set -euo pipefail
-          python scripts/validate_report.py --input "output/${TITLE}.md" --check-deep-dive
-
-
-
-
-      - name: Show first lines of markdown (debug)
-        if: ${{ always() }}
-        shell: bash
-        env:
-          TITLE: ${{ github.event.inputs.report_title || 'roadmap_report' }}
-        run: |
-          set -euo pipefail
-          if [[ -f "output/${TITLE}.md" ]]; then
-            head -n 80 "output/${TITLE}.md"
+          MD="output/${TITLE}.md"
+          if [[ -f "${MD}" ]]; then
+            echo "Converting ${MD} -> CSV/JSON"
+            bash scripts/post_process.sh \
+              "output/${TITLE}.md" \
+              "output/${TITLE}_from_md.csv" \
+              "output/${TITLE}_from_md.json" \
+              "${MONTHS}" "${SINCE}" "${UNTIL}" "${INCLUDE}" "${EXCLUDE}"
           else
-            echo "File not found: output/${TITLE}.md"
+            echo "No markdown produced; skipping post-process."
           fi
 
-
-
-      - name: Post-process to CSV/JSON (always runs)
-        shell: bash
-        env:
-          TITLE: ${{ github.event.inputs.report_title || 'roadmap_report' }}
-          MONTHS: ${{ github.event.inputs.months }}
-          SINCE: ${{ github.event.inputs.since }}
-          UNTIL: ${{ github.event.inputs.until }}
-          INCLUDE: ${{ github.event.inputs.include_instances }}
-          EXCLUDE: ${{ github.event.inputs.exclude_instances }}
-        run: |
-          set -euxo pipefail
-          bash scripts/post_process.sh \
-            "output/${TITLE}.md" \
-            "output/${TITLE}.csv" \
-            "output/${TITLE}.json" \
-            "${{ github.event.inputs.months }}" \
-            "${{ github.event.inputs.since }}" \
-            "${{ github.event.inputs.until }}" \
-            "${{ github.event.inputs.include_instances }}" \
-            "${{ github.event.inputs.exclude_instances }}"
-
-      - name: Show output directory (debug)
-        shell: bash
-        run: |
-          set -euxo pipefail
-          echo "Listing output/"
-          ls -la output || true
-
-      - name: Upload report artifacts
+      - name: Upload artifacts (unique name)
         uses: actions/upload-artifact@v4
         with:
-          name: roadmap-report-${{ github.run_attempt }}
-          path: |
-            output/${{ github.event.inputs.report_title || 'roadmap_report' }}.md
-            output/${{ github.event.inputs.report_title || 'roadmap_report' }}.csv
-            output/${{ github.event.inputs.report_title || 'roadmap_report' }}.json
-            output/*
+          name: roadmap-report-${{ github.run_id }}
           if-no-files-found: warn
-          overwrite: true
+          path: |
+            output/*.md
+            output/*.csv
+            output/*.json
