@@ -140,11 +140,11 @@ jobs:
 
             if [[ -n "${TENANT:-}" && -n "${CLIENT:-}" ]]; then
               python -c 'import os,json; cfg={"tenant_id":os.environ.get("TENANT",""),
-                                             "client_id":os.environ.get("CLIENT",""),
-                                             "pfx_base64":os.environ.get("PFX",""),
-                                             "pfx_password_env":os.environ.get("PFX_PASSWORD_ENV","M365_PFX_PASSWORD"),
-                                             "graph_base":"https://graph.microsoft.com/v1.0"};
-                         open("graph_config.json","w",encoding="utf-8").write(json.dumps(cfg, ensure_ascii=False))'
+                "client_id":os.environ.get("CLIENT",""),
+                "pfx_base64":os.environ.get("PFX",""),
+                "pfx_password_env":os.environ.get("PFX_PASSWORD_ENV","M365_PFX_PASSWORD"),
+                "graph_base":"https://graph.microsoft.com/v1.0"};
+                open("graph_config.json","w",encoding="utf-8").write(json.dumps(cfg, ensure_ascii=False))'
               echo "graph_config.json written."
             else
               echo "TENANT/CLIENT secrets not set; leaving existing ${CFG_PATH} as-is (Graph may be skipped)."
