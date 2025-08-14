@@ -3,87 +3,66 @@ name: Roadmap Report
 on:
   workflow_dispatch:
     inputs:
-      title:
-        description: "Base name for output files (no extension)"
-        type: string
-        default: "roadmap_report"
-        required: true
-      months:
-        description: "Relative lookback in months (leave blank to use SINCE)"
-        type: string
+      TITLE:
+        description: Base name for output files (no extension)
+        required: false
+        default: roadmap_report
+      PUBLIC_IDS:
+        description: Comma-separated Roadmap IDs to force (optional; else discovery/fetch)
+        required: false
+        default: ""
+      MONTHS:
+        description: Lookback window in months (for filters/fetch)
+        required: false
         default: "3"
+      SINCE:
+        description: ISO date (YYYY-MM-DD) to start from (overrides MONTHS if set)
         required: false
-      since:
-        description: "Absolute start date (YYYY-MM-DD). Overrides months if set."
-        type: string
         default: ""
+      TENANT_CLOUD:
+        description: Cloud/Instance filter (Worldwide (Standard Multi-Tenant), GCC, GCC High, DoD)
         required: false
-      until:
-        description: "Absolute end date (YYYY-MM-DD). Optional."
-        type: string
-        default: ""
-        required: false
-      tenant_cloud:
-        description: "Cloud filter: Worldwide (Standard Multi-Tenant) | GCC | GCC High | DoD"
-        type: choice
-        options:
-          - "Worldwide (Standard Multi-Tenant)"
-          - "GCC"
-          - "GCC High"
-          - "DoD"
         default: "Worldwide (Standard Multi-Tenant)"
-        required: true
-      include:
-        description: "Instance include filter (comma-separated). Optional."
-        type: string
-        default: ""
+      USE_GRAPH:
+        description: Use Microsoft Graph (true/false)
         required: false
-      exclude:
-        description: "Instance exclude filter (comma-separated). Optional."
-        type: string
-        default: ""
-        required: false
-      public_ids:
-        description: "Explicit Roadmap IDs (comma-separated) to force include (optional)"
-        type: string
-        default: ""
-        required: false
-      use_graph:
-        description: "Use Graph API primary source"
-        type: choice
-        options: ["true", "false"]
         default: "true"
-        required: true
-      use_public_scrape:
-        description: "Allow Public/RSS fallback if Graph has gaps"
-        type: choice
-        options: ["true", "false"]
+      USE_PUBLIC_SCRAPE:
+        description: Use public HTML/JSON fallbacks (true/false)
+        required: false
         default: "true"
-        required: true
-
-concurrency:
-  group: roadmap-report-${{ github.ref }}
-  cancel-in-progress: false
-
-permissions:
-  contents: read
-
-env:
-  PYTHONUNBUFFERED: "1"
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      # Map secrets → environment for convenience
+      TENANT: ${{ secrets.GRAPH_TENANT_ID }}
+      CLIENT: ${{ secrets.GRAPH_CLIENT_ID }}
+      PFX_B64: ${{ secrets.M365_PFX_BASE64 }}
+      PFX_PASSWORD_ENV: M365_PFX_PASSWORD
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      OPENAI_ORG_ID: ${{ secrets.OPENAI_ORG_ID }}
+
+      # Map inputs → environment
+      TITLE: ${{ github.event.inputs.TITLE }}
+      PUBLIC_IDS: ${{ github.event.inputs.PUBLIC_IDS }}
+      MONTHS: ${{ github.event.inputs.MONTHS }}
+      SINCE: ${{ github.event.inputs.SINCE }}
+      TENANT_CLOUD: ${{ github.event.inputs.TENANT_CLOUD }}
+      USE_GRAPH: ${{ github.event.inputs.USE_GRAPH }}
+      USE_PUBLIC_SCRAPE: ${{ github.event.inputs.USE_PUBLIC_SCRAPE }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python 3.11
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies (if requirements.txt present)
+      - name: Install Python deps (if present)
         shell: bash
         run: |
           set -euo pipefail
@@ -91,255 +70,187 @@ jobs:
             python -m pip install --upgrade pip
             pip install -r requirements.txt
           else
-            # minimal set required by scripts
+            # Minimal deps to run fetch and parsing
             python -m pip install --upgrade pip
-            pip install requests msal cryptography pandas beautifulsoup4 lxml playwright
-            python -m playwright install --with-deps chromium
+            pip install requests beautifulsoup4 lxml msal cryptography pandas
           fi
 
-      - name: Make scripts executable (bash helpers)
+      # ----- Build graph_config.json safely from secrets (no heredocs) -----
+      - name: Prepare Graph config (optional)
+        id: graphcfg
         shell: bash
-        run: |
-          set -euo pipefail
-          if compgen -G "scripts/*.sh" > /dev/null; then
-            chmod +x scripts/*.sh
-          fi
-
-      # -- Prepare graph_config.json (robust PFX handling; no heredocs) --
-      - name: Validate PFX and prepare graph_config.json
-        shell: bash
-        env:
-          TENANT: ${{ secrets.GRAPH_TENANT_ID }}
-          CLIENT: ${{ secrets.GRAPH_CLIENT_ID }}
-          PFX_B64: ${{ secrets.M365_PFX_BASE64 }}
-          PFX_PASSWORD_ENV: M365_PFX_PASSWORD
         run: |
           set -euo pipefail
 
           CFG_PATH="graph_config.json"
-
-          # 1) Source PFX (prefer secret; else read from graph_config.json if present)
           PFX="${PFX_B64:-}"
+
+          # If repo already has a config, we can pull pfx_base64 from there if secret is empty
           if [[ -z "${PFX}" && -f "${CFG_PATH}" ]]; then
             echo "Reading pfx_base64 from ${CFG_PATH}"
-            PFX="$(python scripts/get_pfx_base64.py "${CFG_PATH}")"
+            PFX="$(python -c 'import json,sys;print(json.load(open(sys.argv[1],\"r\",encoding=\"utf-8\")).get(\"pfx_base64\",\"\"))' "${CFG_PATH}")"
           fi
 
-          if [[ -z "${PFX:-}" ]]; then
-            echo "No PFX Base64 available. Provide secret M365_PFX_BASE64 or include pfx_base64 in ${CFG_PATH}." >&2
-            # Not fatal if user wants to run with Public/RSS only; leave a tiny stub config
-            echo '{"tenant_id":"","client_id":"","graph_base":"https://graph.microsoft.com/v1.0"}' > "${CFG_PATH}"
+          # If we still don't have a PFX string, skip (Graph usage may be false)
+          if [[ -z "${PFX}" ]]; then
+            echo "No PFX provided via secrets or file. Graph steps will still run if USE_GRAPH=false."
           else
-            export PFX
+            # Quick sanity: many real PFX base64 strings are 1000+ chars
             echo "PFX_B64 length: ${#PFX}"
             if (( ${#PFX} < 1000 )); then
-              echo "PFX_B64 looks too short or truncated; Graph auth may fail." >&2
+              echo "Warning: PFX_B64 seems short (<1000 chars)."
             fi
-            BYTES="$(python scripts/decode_pfx_length.py)"
-            echo "Decoded PFX bytes: ${BYTES}"
 
-            if [[ -n "${TENANT:-}" && -n "${CLIENT:-}" ]]; then
-              python scripts/write_graph_config.py
-            else
-              echo "TENANT/CLIENT secrets not set; leaving existing ${CFG_PATH} as-is (Graph may be skipped)."
-              if [[ ! -f "${CFG_PATH}" ]]; then
-                echo '{"tenant_id":"","client_id":"","graph_base":"https://graph.microsoft.com/v1.0"}' > "${CFG_PATH}"
-              fi
-            fi
+            # Validate base64, measure decoded bytes
+            BYTES="$(python -c 'import os,base64; b=os.environ.get(\"PFX\",\"\" ); print(len(base64.b64decode(b)))' )"
+            echo "Decoded PFX bytes: ${BYTES}"
           fi
 
-      # -- Fetch data (Graph + Public + RSS) and produce: master CSV/JSON, stats JSON, IDs CSV --
-      - name: Fetch data & build master outputs
+          # If tenant/client are present, write/refresh graph_config.json
+          if [[ -n "${TENANT:-}" && -n "${CLIENT:-}" && -n "${PFX:-}" ]]; then
+            python -c 'import os,json; cfg={"tenant_id":os.environ.get("TENANT",""),
+              "client_id":os.environ.get("CLIENT",""),
+              "pfx_base64":os.environ.get("PFX",""),
+              "pfx_password_env":os.environ.get("PFX_PASSWORD_ENV","M365_PFX_PASSWORD"),
+              "graph_base":"https://graph.microsoft.com/v1.0"}; open("graph_config.json","w",encoding="utf-8").write(json.dumps(cfg, ensure_ascii=False))'
+            echo "graph_config.json written."
+            echo "graph_cfg=graph_config.json" >> "$GITHUB_OUTPUT"
+          elif [[ -f "${CFG_PATH}" ]]; then
+            echo "Existing ${CFG_PATH} will be used."
+            echo "graph_cfg=${CFG_PATH}" >> "$GITHUB_OUTPUT"
+          else
+            echo "No Graph config available (TENANT/CLIENT/PFX missing)."
+            echo "graph_cfg=" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ----- Fetch master data (Graph + Public + RSS) → CSV/JSON + Stats -----
+      - name: Fetch master data (Graph/Public/RSS)
         id: fetch
         shell: bash
-        env:
-          TITLE: ${{ github.event.inputs.title }}
-          MONTHS: ${{ github.event.inputs.months }}
-          SINCE: ${{ github.event.inputs.since }}
-          UNTIL: ${{ github.event.inputs.until }}
-          TENANT_CLOUD: ${{ github.event.inputs.tenant_cloud }}
-          INCLUDE: ${{ github.event.inputs.include }}
-          EXCLUDE: ${{ github.event.inputs.exclude }}
-          PUBLIC_IDS: ${{ github.event.inputs.public_ids }}
-          USE_GRAPH: ${{ github.event.inputs.use_graph }}
-          USE_PUBLIC_SCRAPE: ${{ github.event.inputs.use_public_scrape }}
         run: |
           set -euo pipefail
+
           mkdir -p output
 
           CSV_OUT="output/${TITLE}_master.csv"
           JSON_OUT="output/${TITLE}_master.json"
           STATS_OUT="output/${TITLE}_fetch_stats.json"
-          IDS_OUT="output/${TITLE}_discovered_ids.csv"
 
-          # Build flags
           GRAPH_FLAG=""
-          if [[ "${USE_GRAPH}" != "true" ]]; then
-            GRAPH_FLAG="--no-graph"
-          fi
+          [[ "${USE_GRAPH}" == "true" ]] || GRAPH_FLAG="--no-graph"
 
           PUBLIC_FLAG=""
-          if [[ "${USE_PUBLIC_SCRAPE}" != "true" ]]; then
-            PUBLIC_FLAG="--no-public-scrape"
-          fi
+          [[ "${USE_PUBLIC_SCRAPE}" == "true" ]] || PUBLIC_FLAG="--no-public-scrape"
 
           IDS_FLAG=""
-          if [[ -n "${PUBLIC_IDS}" ]]; then
-            IDS_FLAG="--ids ${PUBLIC_IDS}"
-          fi
+          [[ -n "${PUBLIC_IDS}" ]] && IDS_FLAG="--ids ${PUBLIC_IDS}"
 
           DATE_FLAGS=()
           if [[ -n "${SINCE}" ]]; then
-            DATE_FLAGS+=(--since "${SINCE}")
+            DATE_FLAGS+=( --since "${SINCE}" )
           elif [[ -n "${MONTHS}" ]]; then
-            DATE_FLAGS+=(--months "${MONTHS}")
-          fi
-          if [[ -n "${UNTIL}" ]]; then
-            DATE_FLAGS+=(--until "${UNTIL}")
+            DATE_FLAGS+=( --months "${MONTHS}" )
           fi
 
-          echo "Running fetch_messages_graph.py with:"
-          echo "  ${GRAPH_FLAG} ${PUBLIC_FLAG} ${IDS_FLAG} ${DATE_FLAGS[*]} --tenant-cloud '${TENANT_CLOUD}'"
-          echo "Outputs: ${CSV_OUT}, ${JSON_OUT}, ${STATS_OUT}, ${IDS_OUT}"
+          CFG_ARG=()
+          if [[ -n "${{ steps.graphcfg.outputs.graph_cfg }}" ]]; then
+            CFG_ARG=( --config "${{ steps.graphcfg.outputs.graph_cfg }}" )
+          fi
 
-          # Full consolidated run (writes CSV, JSON, Stats, IDs)
+          echo "Running unified fetch: scripts/fetch_messages_graph.py"
+          echo "  Flags: ${GRAPH_FLAG} ${PUBLIC_FLAG} ${IDS_FLAG} ${DATE_FLAGS[*]}"
+          echo "  Tenant cloud: ${TENANT_CLOUD}"
           python scripts/fetch_messages_graph.py \
-            --config graph_config.json \
-            ${GRAPH_FLAG} ${PUBLIC_FLAG} ${IDS_FLAG} \
-            "${DATE_FLAGS[@]}" \
+            "${CFG_ARG[@]}" \
+            ${GRAPH_FLAG} ${PUBLIC_FLAG} ${IDS_FLAG} "${DATE_FLAGS[@]}" \
             --tenant-cloud "${TENANT_CLOUD}" \
             --emit csv --out "${CSV_OUT}" \
-            --emit-json "${JSON_OUT}" \
-            --stats-out "${STATS_OUT}" \
-            --ids-csv "${IDS_OUT}" \
-            --debug
+            --stats-out "${STATS_OUT}"
 
-          # Expose for later steps
+          python scripts/fetch_messages_graph.py \
+            "${CFG_ARG[@]}" \
+            ${GRAPH_FLAG} ${PUBLIC_FLAG} ${IDS_FLAG} "${DATE_FLAGS[@]}" \
+            --tenant-cloud "${TENANT_CLOUD}" \
+            --emit json --out "${JSON_OUT}"
+
           echo "csv=${CSV_OUT}"     >> "$GITHUB_OUTPUT"
           echo "json=${JSON_OUT}"   >> "$GITHUB_OUTPUT"
           echo "stats=${STATS_OUT}" >> "$GITHUB_OUTPUT"
-          echo "ids_csv=${IDS_OUT}" >> "$GITHUB_OUTPUT"
 
-      # -- Generate Markdown report using the discovered IDs (and/or provided PUBLIC_IDS) --
-      - name: Generate Markdown report via API (conditional)
-        if: always()
-        id: gen
+      # ----- OPTIONAL: Generate Markdown report (skip if you don't have this script) -----
+      # - name: Generate Markdown report
+      #   id: gen
+      #   if: ${{ always() }}
+      #   shell: bash
+      #   run: |
+      #     set -euo pipefail
+      #     mkdir -p output
+      #     # Example: if you have a generator that consumes discovered IDs
+      #     # bash scripts/generate_report.sh "498159,..." prompts/system_multi_id.md "output/${TITLE}.md"
+      #     echo "# Placeholder report" > "output/${TITLE}.md"
+      #     echo "md=output/${TITLE}.md" >> "$GITHUB_OUTPUT"
+
+      # ----- Post-process Markdown to CSV/JSON (runs only if MD exists) -----
+      - name: Post-process Markdown to CSV/JSON (if report exists)
+        if: ${{ always() }}
         shell: bash
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_ORG_ID: ${{ secrets.OPENAI_ORG_ID }}
-          OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL || 'https://api.openai.com/v1/' }}
-          TITLE: ${{ github.event.inputs.title }}
+          IN_MD: output/${{ github.event.inputs.TITLE }}.md
+          OUT_CSV: output/${{ github.event.inputs.TITLE }}.csv
+          OUT_JSON: output/${{ github.event.inputs.TITLE }}.json
         run: |
           set -euo pipefail
-
-          OUT_MD="output/${TITLE}.md"
-          IDS_CSV="${{ steps.fetch.outputs.ids_csv }}"
-
-          if [[ -z "${OPENAI_API_KEY:-}" ]]; then
-            echo "No OPENAI_API_KEY present; skipping markdown generation."
-            echo "md=${OUT_MD}" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # Derive a comma-separated ID list from the IDs CSV (skip header). If empty, fall back to 'public_ids' input.
-          IDS="$(tail -n +2 "${IDS_CSV}" 2>/dev/null | cut -d',' -f1 | tr '\n' ',' | sed 's/,$//')"
-          if [[ -z "${IDS}" && -n "${{ github.event.inputs.public_ids }}" ]]; then
-            IDS="${{ github.event.inputs.public_ids }}"
-          fi
-
-          if [[ -z "${IDS}" ]]; then
-            echo "No IDs discovered or provided; writing a small placeholder MD."
-            echo "# Roadmap Report" > "${OUT_MD}"
-            echo "" >> "${OUT_MD}"
-            echo "_No IDs matched your filters. Adjust inputs and re-run._" >> "${OUT_MD}"
-            echo "md=${OUT_MD}" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          echo "Using IDs: ${IDS}"
-          # Choose model (prefer 4o if 5 unavailable)
-          MODEL="gpt-4o"
-          if [[ -n "${OPENAI_ORG_ID:-}" ]]; then
-            export OPENAI_ORG_ID
-          fi
-          export OPENAI_API_KEY OPENAI_BASE_URL
-
-          # scripts/generate_report.sh <comma_ids> <prompt_file> <out_md>
-          # The prompt file should be your multi-ID system prompt (pipe-safe)
-          if [[ ! -f prompts/system_multi_id.md ]]; then
-            echo "prompts/system_multi_id.md missing; creating a minimal fallback."
-            mkdir -p prompts
-            cat <<'EOF' > prompts/system_multi_id.md
-            You are a technical editor. Produce a standards-compliant Markdown report.
-            - Start with an Overview.
-            - Include a master pipe table with columns:
-              | ID | Title | Product/Workload | Status | Release phase | Targeted dates | Cloud instance | Short description | Official link |
-            - For each ID, include a deep-dive section following the structured “AI Deep Dive” format we discussed.
-            - Ensure GitHub-flavored Markdown tables are valid (header + separator + aligned cells).
-            EOF
-          fi
-
-          bash scripts/generate_report.sh "${IDS}" "prompts/system_multi_id.md" "${OUT_MD}" "${MODEL}"
-
-          echo "md=${OUT_MD}" >> "$GITHUB_OUTPUT"
-
-      # -- Post-process the Markdown into CSV/JSON (best-effort; skip if MD missing) --
-      - name: Post-process to CSV/JSON
-        if: always()
-        shell: bash
-        env:
-          TITLE: ${{ github.event.inputs.title }}
-          MONTHS: ${{ github.event.inputs.months }}
-          SINCE: ${{ github.event.inputs.since }}
-          UNTIL: ${{ github.event.inputs.until }}
-          INCLUDE: ${{ github.event.inputs.include }}
-          EXCLUDE: ${{ github.event.inputs.exclude }}
-        run: |
-          set -euo pipefail
-          IN_MD="output/${TITLE}.md"
-          OUT_CSV="output/${TITLE}.csv"
-          OUT_JSON="output/${TITLE}.json"
           if [[ ! -f "${IN_MD}" ]]; then
             echo "No markdown found; skipping post-process."
             exit 0
           fi
-          bash scripts/post_process.sh \
-            "${IN_MD}" \
-            "${OUT_CSV}" \
-            "${OUT_JSON}" \
-            "${MONTHS}" "${SINCE}" "${UNTIL}" "${INCLUDE}" "${EXCLUDE}"
+          echo "Converting ${IN_MD} → ${OUT_CSV}, ${OUT_JSON}"
+          python scripts/parse_roadmap_markdown.py \
+            --input "${IN_MD}" \
+            --csv   "${OUT_CSV}" \
+            --json  "${OUT_JSON}" \
+            --months "${MONTHS}" \
+            --since  "${SINCE}"
 
-      # -- Job summary: show counts from stats file (Graph vs Public vs RSS) --
-      - name: Summarize fetch stats
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ -f "${{ steps.fetch.outputs.stats }}" ]]; then
-            echo "## Fetch Stats" >> "$GITHUB_STEP_SUMMARY"
-            python - "$(< ${{ steps.fetch.outputs.stats }})" <<'PY'
-            import sys, json
-            data = json.loads(sys.stdin.read())
-            graph = data.get("graph_rows", 0)
-            public = data.get("public_rows", 0)
-            rss = data.get("rss_rows", 0)
-            print(f"- Graph rows: **{graph}**")
-            print(f"- Public rows: **{public}**")
-            print(f"- RSS rows: **{rss}**")
-            PY
-          else:
-            echo "## Fetch Stats" >> "$GITHUB_STEP_SUMMARY"
-            echo "_No stats file produced._" >> "$GITHUB_STEP_SUMMARY"
-
-      # -- Upload everything in /output with a unique artifact name (avoid 409 conflicts) --
+      # ----- Upload artifacts -----
       - name: Upload artifacts
-        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: roadmap-report-${{ github.run_number }}
-          path: |
-            output/*
+          name: ${{ github.event.inputs.TITLE }}
           if-no-files-found: warn
-          overwrite: false
-          compression-level: 6
+          path: |
+            output/${{ github.event.inputs.TITLE }}.md
+            output/${{ github.event.inputs.TITLE }}.csv
+            output/${{ github.event.inputs.TITLE }}.json
+            output/${{ github.event.inputs.TITLE }}_master.csv
+            output/${{ github.event.inputs.TITLE }}_master.json
+            output/${{ github.event.inputs.TITLE }}_fetch_stats.json
+            output/*
+
+      # ----- Friendly job summary for row counts (Graph/Public/RSS) -----
+      - name: Write fetch stats to job summary
+        if: always()
+        shell: bash
+        env:
+          STATS: ${{ steps.fetch.outputs.stats }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Fetch Stats"
+            if [[ -n "${STATS:-}" && -f "$STATS" ]]; then
+              python - "$STATS" <<'PY'
+              import sys, json
+              p = sys.argv[1]
+              with open(p, "r", encoding="utf-8") as f:
+                  data = json.load(f)
+              graph  = data.get("graph_rows", 0)
+              public = data.get("public_rows", 0)
+              rss    = data.get("rss_rows", 0)
+              print(f"- Graph rows: **{graph}**")
+              print(f"- Public rows: **{public}**")
+              print(f"- RSS rows: **{rss}**")
+              PY
+            else
+              echo "_No stats file produced._"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
