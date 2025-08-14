@@ -78,6 +78,24 @@ jobs:
       - name: Ensure output dir
         run: mkdir -p output
 
+      - name: Validate Graph inputs presence
+        if: ${{ inputs.use_graph == true }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "TENANT='${{ secrets.GRAPH_TENANT_ID || vars.GRAPH_TENANT_ID || '' }}'"
+          echo "CLIENT='${{ secrets.GRAPH_CLIENT_ID  || vars.GRAPH_CLIENT_ID  || '' }}'"
+          LEN=${#${{ secrets.M365_PFX_BASE64 || vars.M365_PFX_BASE64 || '' }}}
+          echo "PFX_B64 length: $LEN"
+          if [ $LEN -lt 1000 ]; then
+            echo "PFX_B64 looks too short or missing." >&2
+            exit 1
+          fi
+
+
+
+
+
       # Write graph_config.json using inline Base64 (no PFX file on disk)
       - name: Write graph_config.json (inline pfx_base64)
         if: ${{ inputs.use_graph == true }}
