@@ -122,7 +122,7 @@ jobs:
           PFX="${PFX_B64:-}"
           if [[ -z "${PFX}" && -f "${CFG_PATH}" ]]; then
             echo "Reading pfx_base64 from ${CFG_PATH}"
-            PFX="$(python -c 'import json,sys; print(json.load(open(sys.argv[1], "r", encoding="utf-8")).get("pfx_base64",""))' "${CFG_PATH}")"
+            PFX="$(python scripts/get_pfx_base64.py "${CFG_PATH}")"
           fi
 
           if [[ -z "${PFX:-}" ]]; then
@@ -135,17 +135,11 @@ jobs:
             if (( ${#PFX} < 1000 )); then
               echo "PFX_B64 looks too short or truncated; Graph auth may fail." >&2
             fi
-            BYTES="$(python -c 'import os,base64; b=os.environ.get("PFX",""); print(len(base64.b64decode(b)))')"
+            BYTES="$(python scripts/decode_pfx_length.py)"
             echo "Decoded PFX bytes: ${BYTES}"
 
             if [[ -n "${TENANT:-}" && -n "${CLIENT:-}" ]]; then
-              python -c 'import os,json; cfg={"tenant_id":os.environ.get("TENANT",""),
-                "client_id":os.environ.get("CLIENT",""),
-                "pfx_base64":os.environ.get("PFX",""),
-                "pfx_password_env":os.environ.get("PFX_PASSWORD_ENV","M365_PFX_PASSWORD"),
-                "graph_base":"https://graph.microsoft.com/v1.0"};
-                open("graph_config.json","w",encoding="utf-8").write(json.dumps(cfg, ensure_ascii=False))'
-              echo "graph_config.json written."
+              python scripts/write_graph_config.py
             else
               echo "TENANT/CLIENT secrets not set; leaving existing ${CFG_PATH} as-is (Graph may be skipped)."
               if [[ ! -f "${CFG_PATH}" ]]; then
