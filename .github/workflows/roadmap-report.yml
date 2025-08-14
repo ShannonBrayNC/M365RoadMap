@@ -102,7 +102,8 @@ jobs:
             fi
 
             # Validate base64, measure decoded bytes
-            BYTES="$(python -c 'import os,base64; b=os.environ.get(\"PFX\",\"\" ); print(len(base64.b64decode(b)))' )"
+            # Validate base64, measure decoded bytes
+            BYTES="$(python -c 'import os,base64; b=os.environ.get("PFX",""); print(len(base64.b64decode(b)))')"
             echo "Decoded PFX bytes: ${BYTES}"
           fi
 
