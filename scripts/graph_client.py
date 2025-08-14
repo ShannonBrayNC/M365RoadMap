@@ -29,43 +29,56 @@ from typing import Tuple, Optional
 
 import msal
 from cryptography.hazmat.primitives.serialization.pkcs12 import load_key_and_certificates
-from cryptography.hazmat.primitives import serialization, hashes
 
 
-def _load_pfx_bytes(pfx_bytes: bytes, password: Optional[str]) -> Tuple[str, str, str]:
-    """Return (private_key_pem, public_cert_pem, thumbprint_hex) from a PFX blob."""
-    key, cert, _chain = load_key_and_certificates(
-        pfx_bytes, password.encode() if password else None
-    )
-    if key is None or cert is None:
-        raise ValueError("PFX did not contain both a private key and a certificate.")
+# --- replace this whole block in graph_client.py ---
 
-    key_pem = key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption(),
-    ).decode("utf-8")
+from cryptography.hazmat.primitives.serialization.pkcs12 import load_key_and_certificates
 
-    cert_pem = cert.public_bytes(serialization.Encoding.PEM).decode("utf-8")
-    thumb_hex = cert.fingerprint(hashes.SHA1()).hex()  # AAD expects SHA-1 thumbprint
+def _load_pfx_bytes(pfx_bytes: bytes, password: str | None):
+    tried = []
+    # 1) password from env (if supplied)
+    if password:
+      tried.append("env")
+      try:
+          key, cert, _chain = load_key_and_certificates(pfx_bytes, password.encode())
+          return key, cert, _chain
+      except Exception as e:
+          last_env_err = e
+    # 2) try empty password (some exports are unprotected)
+    tried.append("empty")
+    try:
+        key, cert, _chain = load_key_and_certificates(pfx_bytes, None)
+        return key, cert, _chain
+    except Exception as e:
+        last_empty_err = e
 
-    return key_pem, cert_pem, thumb_hex
+    # 3) try a raw empty string (rare format quirk)
+    tried.append("blank")
+    try:
+        key, cert, _chain = load_key_and_certificates(pfx_bytes, b"")
+        return key, cert, _chain
+    except Exception as e:
+        last_blank_err = e
 
+    raise ValueError(f"PKCS12 load failed (tried {tried}). "
+                     f"env_err={type(last_env_err).__name__ if password else 'n/a'}, "
+                     f"empty_err={type(last_empty_err).__name__}, "
+                     f"blank_err={type(last_blank_err).__name__}")
 
-def _load_from_pfx_path(path: str, pwd_env_name: str) -> Tuple[str, str, str]:
-    if not os.path.isfile(path):
-        raise FileNotFoundError(f"PFX not found at {path}")
-    pwd = os.environ.get(pwd_env_name, "")
+def _load_from_pfx_path(path: str, password_env: str | None):
+    import os
     with open(path, "rb") as f:
         blob = f.read()
+    pwd = os.environ.get(password_env) if password_env else None
+    print(f"[graph_client] PFX bytes={len(blob)} password_set={bool(pwd)} (env={password_env})")
     return _load_pfx_bytes(blob, pwd)
 
-
-def _load_from_pfx_b64(pfx_b64: str, pwd_env_name: str) -> Tuple[str, str, str]:
-    if not pfx_b64 or not isinstance(pfx_b64, str):
-        raise ValueError("pfx_base64 is empty or invalid.")
-    pwd = os.environ.get(pwd_env_name, "")
-    blob = base64.b64decode(pfx_b64)
+def _load_from_pfx_b64(b64: str, password_env: str | None):
+    import base64, os
+    blob = base64.b64decode(b64)
+    pwd = os.environ.get(password_env) if password_env else None
+    print(f"[graph_client] PFX(b64) bytes={len(blob)} password_set={bool(pwd)} (env={password_env})")
     return _load_pfx_bytes(blob, pwd)
 
 
