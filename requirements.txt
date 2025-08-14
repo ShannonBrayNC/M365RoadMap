@@ -1,26 +1,16 @@
-# Microsoft Graph auth & cert handling
-msal==1.31.0
+# Microsoft Graph API
+msal==1.30.0
 cryptography==42.0.8
-pyopenssl==24.2.1
 
-# HTTP requests & parsing
-requests==2.32.3
+# HTML parsing / scraping
 beautifulsoup4==4.12.3
-lxml==5.2.2
+lxml==5.3.0
+html5lib==1.1
+playwright==1.54.0
 
-# Data wrangling
+# HTTP requests
+requests==2.32.3
+
+# Data processing
 pandas==2.2.2
 python-dateutil==2.9.0.post0
-
-# Playwright for public roadmap scraping
-playwright==1.45.0
-
-# CSV/JSON/Markdown processing
-markdown-it-py==3.0.0
-mdit-py-plugins==0.4.0
-
-# AI generation
-openai==1.41.0
-
-# Optional: for Windows certificate store access if needed
-pywin32==306; sys_platform == "win32"

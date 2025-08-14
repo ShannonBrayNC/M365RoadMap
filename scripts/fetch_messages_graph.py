@@ -3,8 +3,9 @@
 fetch_messages_graph.py — primary: Microsoft Graph Message Center
 fallbacks: (optional) public Roadmap by ID (Playwright) -> RSS/JSON API by ID
 
-Emits your master table CSV/JSON headers:
-| ID | Title | Product/Workload | Status | Release phase | Targeted dates | Cloud instance | Short description | Official Roadmap link |
+Emits master headers:
+ID, Title, Product/Workload, Status, Release phase, Targeted dates,
+Cloud instance, Short description, Official Roadmap link
 """
 import argparse, csv, json, os, sys
 from datetime import datetime, timedelta, timezone
@@ -59,8 +60,8 @@ def map_mc_to_row(msg: dict, tenant_cloud_hint: str = ""):
     mcid = clean_text(msg.get("id",""))
     title = clean_text(msg.get("title",""))
     services = clean_text(", ".join(to_list(msg.get("services"))))
-    status = ""  # MC schema doesn't map to Roadmap Status
-    phase  = ""  # MC schema doesn't map to Roadmap Release phase
+    status = ""  # Message Center doesn’t map 1:1 to Roadmap Status
+    phase  = ""  # Message Center doesn’t map 1:1 to Roadmap Release phase
     targeted = ""
     for k in ("startDateTime","actionRequiredByDateTime","lastModifiedDateTime","endDateTime"):
         if msg.get(k):

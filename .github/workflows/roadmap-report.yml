@@ -8,17 +8,17 @@ on:
         required: true
         default: "roadmap_report"
       use_graph:
-        description: "Use Graph Message Center (needs graph_config.json + cert)"
+        description: "Use Graph Message Center (needs secrets + inline PFX b64)"
         required: true
         type: boolean
         default: false
       use_public_scrape:
-        description: "Use Playwright public scraping fallback (in addition to RSS fallback)"
+        description: "Use Playwright public scraping fallback (alongside RSS)"
         required: true
         type: boolean
         default: true
       public_ids:
-        description: "Comma-separated Roadmap IDs for public fallbacks (e.g., 498159,499430)"
+        description: "Comma-separated Roadmap IDs (e.g., 498159,499430)"
         required: false
         default: ""
       months:
@@ -26,15 +26,11 @@ on:
         required: false
         default: "3"
       since:
-        description: "Since date (YYYY-MM-DD) for Graph (overrides 'months' if set)"
-        required: false
-        default: ""
-      until:
-        description: "Until date (kept for compatibility; not used by Graph)"
+        description: "Since date (YYYY-MM-DD) for Graph (overrides 'months')"
         required: false
         default: ""
       tenant_cloud:
-        description: "Cloud instance label for Graph rows (e.g., Worldwide, GCC, GCC High, DoD)"
+        description: "Cloud label for Graph rows (Worldwide, GCC, GCC High, DoD)"
         required: false
         default: "Worldwide (Standard Multi-Tenant)"
       skip_generate:
@@ -42,6 +38,11 @@ on:
         required: true
         type: boolean
         default: false
+      run_selftest:
+        description: "Run self-test before fetch (fails fast)"
+        required: true
+        type: boolean
+        default: true
 
 env:
   PYTHONUNBUFFERED: "1"
@@ -61,48 +62,96 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Python deps (requirements.txt)
+      - name: Install Python deps (pinned)
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Install Playwright browsers (only if playwright in requirements.txt AND use_public_scrape)
+      # Only install Playwright browsers when they're needed:
+      #  - we will use public scraping (inputs.use_public_scrape)
+      #  - AND either public_ids are provided OR use_graph is false (i.e., we might rely on scraping)
+      - name: Install Playwright browsers (conditional)
         if: ${{ (inputs.public_ids != '' || inputs.use_graph == false) && inputs.use_public_scrape == true }}
         run: |
-          if grep -q 'playwright' requirements.txt; then
-            echo "playwright found in requirements.txt — installing browsers..."
-            python -m playwright install --with-deps chromium
-          else
-            echo "playwright not listed in requirements.txt — skipping browser install."
-          fi
-
-      - name: Ensure scripts are executable (if present)
-        run: |
-          chmod +x scripts/generate_report.sh || true
-          chmod +x scripts/post_process.sh || true
+          python -m playwright install --with-deps chromium
 
       - name: Ensure output dir
         run: mkdir -p output
 
-      - name: Show Graph config presence
+      # Write graph_config.json using inline Base64 (no PFX file on disk)
+      - name: Write graph_config.json (inline pfx_base64)
+        if: ${{ inputs.use_graph == true }}
+        shell: bash
+        env:
+          TENANT:  ${{ secrets.GRAPH_TENANT_ID }}
+          CLIENT:  ${{ secrets.GRAPH_CLIENT_ID }}
+          PFX_B64: ${{ secrets.M365_PFX_BASE64 }}
         run: |
-          if [ -f graph_config.json ]; then
-            echo "graph_config.json found."
-          else
-            echo "graph_config.json NOT found (Graph fetch will fail if use_graph=true)."
+          set -euo pipefail
+          if [[ -z "${TENANT:-}" || -z "${CLIENT:-}" || -z "${PFX_B64:-}" ]]; then
+            echo "Graph secrets missing. Ensure GRAPH_TENANT_ID, GRAPH_CLIENT_ID, M365_PFX_BASE64 are set." >&2
+            exit 1
           fi
+          cat > graph_config.json <<'JSON'
+          {
+            "tenant_id": "__TENANT__",
+            "client_id": "__CLIENT__",
+            "pfx_base64": "__PFX_B64__",
+            "pfx_password_env": "M365_PFX_PASSWORD",
+            "graph_base": "https://graph.microsoft.com/v1.0"
+          }
+          JSON
+          sed -i "s/__TENANT__/${TENANT}/" graph_config.json
+          sed -i "s/__CLIENT__/${CLIENT}/" graph_config.json
+          PFX_ESCAPED=$(printf '%s' "${PFX_B64}" | sed 's/[\/&]/\\&/g')
+          sed -i "s/__PFX_B64__/${PFX_ESCAPED}/" graph_config.json
+
+      # Self-check Graph auth if enabled
+      - name: Graph auth self-check
+        if: ${{ inputs.use_graph == true }}
+        shell: bash
+        env:
+          M365_PFX_PASSWORD: ${{ secrets.M365_PFX_PASSWORD }}
+        run: |
+          set -euo pipefail
+          echo "Testing Graph authentication..."
+          python scripts/graph_client.py graph_config.json > output/graph_auth_check.txt
+          echo "Graph auth OK."
+          head -n 3 output/graph_auth_check.txt || true
+
+      # End-to-end self-test (Graph/Public/RSS) to fail fast with a clear diagnostic
+      - name: Self-test (Graph/Public/RSS)
+        if: ${{ inputs.run_selftest == true }}
+        shell: bash
+        env:
+          M365_PFX_PASSWORD: ${{ secrets.M365_PFX_PASSWORD }}
+          USE_GRAPH:         ${{ inputs.use_graph }}
+          USE_PUBLIC_SCRAPE: ${{ inputs.use_public_scrape }}
+          PUBLIC_IDS:        ${{ inputs.public_ids }}
+          MONTHS:            ${{ inputs.months }}
+          SINCE:             ${{ inputs.since }}
+        run: |
+          set -euo pipefail
+          FLAGS=""
+          if [[ "${USE_GRAPH}" != "true" ]]; then FLAGS="${FLAGS} --no-graph"; fi
+          if [[ "${USE_PUBLIC_SCRAPE}" != "true" ]]; then FLAGS="${FLAGS} --no-public-scrape"; fi
+          if [[ -n "${PUBLIC_IDS}" ]]; then FLAGS="${FLAGS} --ids ${PUBLIC_IDS}"; fi
+          if [[ -n "${SINCE}" ]]; then FLAGS="${FLAGS} --since ${SINCE}"; elif [[ -n "${MONTHS}" ]]; then FLAGS="${FLAGS} --months ${MONTHS}"; fi
+          echo "python scripts/selftest.py ${FLAGS}"
+          python scripts/selftest.py ${FLAGS}
 
       - name: Fetch rows (Graph primary, public + RSS fallbacks)
         id: fetch_rows
         shell: bash
         env:
-          TITLE: ${{ inputs.title }}
-          USE_GRAPH: ${{ inputs.use_graph }}
+          TITLE:             ${{ inputs.title }}
+          USE_GRAPH:         ${{ inputs.use_graph }}
           USE_PUBLIC_SCRAPE: ${{ inputs.use_public_scrape }}
-          PUBLIC_IDS: ${{ inputs.public_ids }}
-          MONTHS: ${{ inputs.months }}
-          SINCE: ${{ inputs.since }}
-          TENANT_CLOUD: ${{ inputs.tenant_cloud }}
+          PUBLIC_IDS:        ${{ inputs.public_ids }}
+          MONTHS:            ${{ inputs.months }}
+          SINCE:             ${{ inputs.since }}
+          TENANT_CLOUD:      ${{ inputs.tenant_cloud }}
+          M365_PFX_PASSWORD: ${{ secrets.M365_PFX_PASSWORD }}
         run: |
           set -euo pipefail
 
@@ -170,7 +219,7 @@ jobs:
             echo "${LINE}"
             echo "${LINE}" >> "$GITHUB_STEP_SUMMARY"
             echo "summary_line=${LINE}" >> "$GITHUB_OUTPUT"
-          else
+          else:
             echo "No stats file found at ${STATS_PATH}"
           fi
 
@@ -194,11 +243,11 @@ jobs:
         if: ${{ inputs.skip_generate == false && (steps.ids_from_csv.outputs.ids != '' || inputs.public_ids != '') }}
         shell: bash
         env:
-          TITLE: ${{ inputs.title }}
-          USER_IDS: ${{ inputs.public_ids }}
+          TITLE:     ${{ inputs.title }}
+          USER_IDS:  ${{ inputs.public_ids }}
           DERIVED_IDS: ${{ steps.ids_from_csv.outputs.ids }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_ORG_ID: ${{ secrets.OPENAI_ORG_ID }}
+          OPENAI_ORG_ID:  ${{ secrets.OPENAI_ORG_ID }}
         run: |
           set -euo pipefail
           IDS="${DERIVED_IDS}"
@@ -218,12 +267,9 @@ jobs:
         if: ${{ inputs.skip_generate == false }}
         shell: bash
         env:
-          TITLE: ${{ inputs.title }}
+          TITLE:  ${{ inputs.title }}
           MONTHS: ${{ inputs.months }}
-          SINCE: ${{ inputs.since }}
-          UNTIL: ${{ inputs.until }}
-          INCLUDE: ""
-          EXCLUDE: ""
+          SINCE:  ${{ inputs.since }}
         run: |
           set -euo pipefail
           MD="output/${TITLE}.md"
@@ -233,7 +279,7 @@ jobs:
               "output/${TITLE}.md" \
               "output/${TITLE}_from_md.csv" \
               "output/${TITLE}_from_md.json" \
-              "${MONTHS}" "${SINCE}" "${UNTIL}" "${INCLUDE}" "${EXCLUDE}"
+              "${MONTHS}" "${SINCE}" "" "" ""
           else
             echo "No markdown produced; skipping post-process."
           fi
@@ -244,6 +290,7 @@ jobs:
           name: roadmap-report-${{ github.run_id }}
           if-no-files-found: warn
           path: |
+            output/*.txt
             output/*.md
             output/*.csv
             output/*.json
