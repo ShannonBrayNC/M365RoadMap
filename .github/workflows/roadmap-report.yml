@@ -12,8 +12,13 @@ on:
         required: true
         type: boolean
         default: false
+      use_public_scrape:
+        description: "Use Playwright public scraping fallback (in addition to RSS fallback)"
+        required: true
+        type: boolean
+        default: true
       public_ids:
-        description: "Comma-separated Roadmap IDs for public fallback (e.g., 498159,499430)"
+        description: "Comma-separated Roadmap IDs for public fallbacks (e.g., 498159,499430)"
         required: false
         default: ""
       months:
@@ -61,8 +66,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Install Playwright browsers (only if playwright in requirements.txt)
-        if: ${{ inputs.public_ids != '' || inputs.use_graph == false }}
+      - name: Install Playwright browsers (only if playwright in requirements.txt AND use_public_scrape)
+        if: ${{ (inputs.public_ids != '' || inputs.use_graph == false) && inputs.use_public_scrape == true }}
         run: |
           if grep -q 'playwright' requirements.txt; then
             echo "playwright found in requirements.txt — installing browsers..."
@@ -70,7 +75,6 @@ jobs:
           else
             echo "playwright not listed in requirements.txt — skipping browser install."
           fi
-
 
       - name: Ensure scripts are executable (if present)
         run: |
@@ -88,100 +92,17 @@ jobs:
             echo "graph_config.json NOT found (Graph fetch will fail if use_graph=true)."
           fi
 
-
-      # Add this BEFORE "Fetch rows (Graph primary, public fallback)"
-      - name: Discover IDs via RSS when none provided
-        id: discover_rss
-        if: ${{ inputs.public_ids == '' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          python - <<'PY' > output/rss_ids.txt
-          import json, sys, requests, os
-          months = os.getenv("MONTHS", "")   # passed from inputs env later in job
-          since  = os.getenv("SINCE", "")
-          # Pull the official JSON surface behind RSS
-          data = requests.get("https://www.microsoft.com/releasecommunications/api/v2/m365/rss", timeout=60).json()
-          items = None
-          for k in ("value","items","Items","results","Results","data","Data"):
-              if isinstance(data.get(k), list):
-                  items = data[k]; break
-          if items is None and isinstance(data, list):
-              items = data
-          from datetime import datetime, timedelta
-          cut = None
-          if months:
-              try:
-                  m = int(months)
-                  cut = datetime.utcnow() - timedelta(days=int(30.44*m))
-              except: pass
-          if since and not cut:
-              try:
-                  sdt = datetime.strptime(since, "%Y-%m-%d")
-                  cut = sdt
-              except: pass
-          def fid(it):
-              for k in ("featureId","FeatureId","id","ID","Id"):
-                  if k in it and it[k]:
-                      return str(it[k]).strip()
-              return ""
-          def lastmod(it):
-              for k in ("modified","lastModified","LastModified","lastModifiedDateTime"):
-                  if k in it and it[k]:
-                      try:
-                          return datetime.fromisoformat(str(it[k]).replace("Z","+00:00"))
-                      except: pass
-              return None
-          ids = []
-          for it in (items or []):
-              f = fid(it)
-              if not f: continue
-              if cut:
-                  lm = lastmod(it)
-                  if lm and lm < cut:
-                      continue
-              ids.append(f)
-          print(",".join(sorted(set(ids))[:150]))  # cap for safety
-          PY
-              DISCOVERED=$(cat output/rss_ids.txt | tr -d '\n\r')
-              echo "public_ids=${DISCOVERED}" >> "$GITHUB_OUTPUT"
-
-
-      - name: Write PFX from secret (Linux)
-        if: ${{ inputs.use_graph == true }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p .secrets
-          echo "${M365_PFX_B64}" | base64 -d > .secrets/m365cert.pfx
-          # small sanity check
-          test -s .secrets/m365cert.pfx || (echo "PFX write failed" && exit 1)
-        env:
-          M365_PFX_B64: ${{ secrets.M365_PFX_B64 }}
-
-      - name: Export PFX password to env
-        if: ${{ inputs.use_graph == true }}
-        shell: bash
-        run: echo "M365_PFX_PASSWORD=${M365_PFX_PASSWORD}" >> $GITHUB_ENV
-        env:
-          M365_PFX_PASSWORD: ${{ secrets.M365_PFX_PASSWORD }}
-
-
-
-
-
-      # Fetch rows -> master CSV/JSON using Graph + public (Playwright) + RSS/JSON fallbacks
       - name: Fetch rows (Graph primary, public + RSS fallbacks)
         id: fetch_rows
         shell: bash
         env:
           TITLE: ${{ inputs.title }}
           USE_GRAPH: ${{ inputs.use_graph }}
-          PUBLIC_IDS: ${{ inputs.public_ids != '' && inputs.public_ids || steps.discover_rss.outputs.public_ids }}
+          USE_PUBLIC_SCRAPE: ${{ inputs.use_public_scrape }}
+          PUBLIC_IDS: ${{ inputs.public_ids }}
           MONTHS: ${{ inputs.months }}
           SINCE: ${{ inputs.since }}
           TENANT_CLOUD: ${{ inputs.tenant_cloud }}
-
         run: |
           set -euo pipefail
 
@@ -189,16 +110,19 @@ jobs:
           JSON_OUT="output/${TITLE}_master.json"
           STATS_OUT="output/${TITLE}_fetch_stats.json"
 
-          # Flags
-          if [[ "${USE_GRAPH}" == "true" ]]; then
-            GRAPH_FLAG=""
-          else
+          GRAPH_FLAG=""
+          if [[ "${USE_GRAPH}" != "true" ]]; then
             GRAPH_FLAG="--no-graph"
           fi
 
           IDS_FLAG=""
           if [[ -n "${PUBLIC_IDS}" ]]; then
             IDS_FLAG="--ids ${PUBLIC_IDS}"
+          fi
+
+          PUBLIC_FLAG=""
+          if [[ "${USE_PUBLIC_SCRAPE}" != "true" ]]; then
+            PUBLIC_FLAG="--no-public-scrape"
           fi
 
           DATE_FLAGS=""
@@ -208,22 +132,22 @@ jobs:
             DATE_FLAGS="--months ${MONTHS}"
           fi
 
-          echo "Running fetch_messages_graph.py ${GRAPH_FLAG} ${IDS_FLAG} ${DATE_FLAGS}"
+          echo "Running fetch_messages_graph.py ${GRAPH_FLAG} ${PUBLIC_FLAG} ${IDS_FLAG} ${DATE_FLAGS}"
           python scripts/fetch_messages_graph.py \
             --config graph_config.json \
-            ${GRAPH_FLAG} ${IDS_FLAG} ${DATE_FLAGS} \
+            ${GRAPH_FLAG} ${PUBLIC_FLAG} ${IDS_FLAG} ${DATE_FLAGS} \
             --tenant-cloud "${TENANT_CLOUD}" \
             --emit csv --out "${CSV_OUT}" \
             --stats-out "${STATS_OUT}" --debug
 
           python scripts/fetch_messages_graph.py \
             --config graph_config.json \
-            ${GRAPH_FLAG} ${IDS_FLAG} ${DATE_FLAGS} \
+            ${GRAPH_FLAG} ${PUBLIC_FLAG} ${IDS_FLAG} ${DATE_FLAGS} \
             --tenant-cloud "${TENANT_CLOUD}" \
             --emit json --out "${JSON_OUT}" --debug
 
-          echo "csv=${CSV_OUT}"   >> "$GITHUB_OUTPUT"
-          echo "json=${JSON_OUT}" >> "$GITHUB_OUTPUT"
+          echo "csv=${CSV_OUT}"     >> "$GITHUB_OUTPUT"
+          echo "json=${JSON_OUT}"   >> "$GITHUB_OUTPUT"
           echo "stats=${STATS_OUT}" >> "$GITHUB_OUTPUT"
 
       - name: One-line method summary
@@ -236,21 +160,20 @@ jobs:
           set -euo pipefail
           if [[ -f "${STATS_PATH}" ]]; then
             LINE=$(python - <<'PY'
-          import json, os
-          p=os.environ["STATS_PATH"]
-          with open(p, encoding="utf-8") as f:
-              s=json.load(f)
-          print(f"[rows] Graph={s.get('graph',0)} Public={s.get('public',0)} RSS={s.get('rss',0)} Total={s.get('total',0)}")
-          PY
-          )
-                      echo "${LINE}"
-                      echo "${LINE}" >> "$GITHUB_STEP_SUMMARY"
-                      echo "summary_line=${LINE}" >> "$GITHUB_OUTPUT"
-                    else
-                      echo "No stats file found at ${STATS_PATH}"
-                    fi
+            import json, os
+            p=os.environ["STATS_PATH"]
+            with open(p, encoding="utf-8") as f:
+                s=json.load(f)
+            print(f"[rows] Graph={s.get('graph',0)} Public={s.get('public',0)} RSS={s.get('rss',0)} Total={s.get('total',0)}")
+            PY
+            )
+            echo "${LINE}"
+            echo "${LINE}" >> "$GITHUB_STEP_SUMMARY"
+            echo "summary_line=${LINE}" >> "$GITHUB_OUTPUT"
+          else
+            echo "No stats file found at ${STATS_PATH}"
+          fi
 
-      # Extract Roadmap IDs from the master CSV (if any official roadmap links are present)
       - name: Derive Roadmap IDs from CSV
         id: ids_from_csv
         if: ${{ success() }}
@@ -267,7 +190,6 @@ jobs:
           echo "Derived IDs: ${IDS}"
           echo "ids=${IDS}" >> "$GITHUB_OUTPUT"
 
-      # Generate Markdown only if not skipped AND we have IDs (derived or user-provided)
       - name: Generate Markdown (Deep Dive)
         if: ${{ inputs.skip_generate == false && (steps.ids_from_csv.outputs.ids != '' || inputs.public_ids != '') }}
         shell: bash
@@ -283,7 +205,6 @@ jobs:
           if [[ -z "${IDS}" && -n "${USER_IDS}" ]]; then
             IDS="${USER_IDS}"
           fi
-
           echo "Using IDs for Deep Dive: ${IDS}"
 
           if [[ -z "${OPENAI_API_KEY:-}" ]]; then

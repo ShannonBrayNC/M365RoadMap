@@ -14,11 +14,10 @@ import requests
 from graph_client import acquire_token
 from fallback_rss_api import fetch_ids_rss
 
-# Try to import the Playwright-based fallback only if installed.
-# If playwright isn't in requirements, this import will fail and we'll skip that path.
+# Optional Playwright-based fallback (only if installed AND not disabled)
 PLAYWRIGHT_OK = True
 try:
-    from fallback_public_roadmap import fetch_ids_public  # this module imports playwright
+    from fallback_public_roadmap import fetch_ids_public  # imports playwright
 except Exception:
     PLAYWRIGHT_OK = False
 
@@ -97,6 +96,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--ids", default="", help="Comma-separated public Roadmap feature IDs for fallback/merge")
     ap.add_argument("--no-graph", action="store_true", help="Skip Graph and use public fallbacks only (requires --ids)")
+    ap.add_argument("--no-public-scrape", action="store_true", help="Skip Playwright scraping even if installed")
     ap.add_argument("--stats-out", default="", help="Optional path to write a JSON summary of method counts")
     ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
@@ -119,7 +119,6 @@ def main():
             pass
 
     rows: List[List[str]] = []
-    used_graph = False
     graph_error = None
 
     # per-method counters
@@ -133,7 +132,6 @@ def main():
             with open(args.config, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
             token = acquire_token(cfg)
-            used_graph = True
             for msg in list_messages(cfg["graph_base"], token, since_iso=since_iso):
                 rows.append(map_mc_to_row(msg, tenant_cloud_hint=args.tenant_cloud))
                 graph_cnt += 1
@@ -144,10 +142,10 @@ def main():
             if args.debug:
                 print(f"[fetch] Graph failed: {e}", file=sys.stderr)
 
-    # 2) Public IDs (Playwright) if provided AND playwright is available
+    # 2) Public IDs (Playwright) if provided AND allowed AND playwright is available
     id_list = [s.strip() for s in args.ids.split(",") if s.strip()]
     fetched_ids: Set[str] = set()
-    if id_list and PLAYWRIGHT_OK:
+    if id_list and not args.no_public_scrape and PLAYWRIGHT_OK:
         try:
             pub_rows = fetch_ids_public(id_list)
             for r in pub_rows:
@@ -160,8 +158,9 @@ def main():
         except Exception as e:
             if args.debug:
                 print(f"[fetch] Public fallback (Playwright) failed: {e}", file=sys.stderr)
-    elif id_list and not PLAYWRIGHT_OK and args.debug:
-        print("[fetch] Playwright not installed; skipping public-page fallback and going straight to RSS/JSON.", file=sys.stderr)
+    elif id_list and (args.no_public_scrape or not PLAYWRIGHT_OK) and args.debug:
+        why = "disabled via --no-public-scrape" if args.no_public_scrape else "playwright not installed"
+        print(f"[fetch] Skipping Playwright fallback ({why}); trying RSS/JSON for IDs.", file=sys.stderr)
 
     # 3) RSS/JSON API fallback for any remaining IDs
     remaining = [i for i in id_list if i not in fetched_ids]
@@ -176,7 +175,6 @@ def main():
             if args.debug:
                 print(f"[fetch] RSS/JSON fallback failed: {e}", file=sys.stderr)
 
-    # Final checks
     if not rows:
         msg = "No rows produced. "
         if graph_error:
@@ -201,14 +199,8 @@ def main():
     summary_line = f"[rows] Graph={graph_cnt} Public={public_cnt} RSS={rss_cnt} Total={total}"
     print(summary_line)
 
-    # Optional stats JSON
     if args.stats_out:
-        stats = {
-            "graph": graph_cnt,
-            "public": public_cnt,
-            "rss": rss_cnt,
-            "total": total,
-        }
+        stats = {"graph": graph_cnt, "public": public_cnt, "rss": rss_cnt, "total": total}
         os.makedirs(os.path.dirname(args.stats_out) or ".", exist_ok=True)
         with open(args.stats_out, "w", encoding="utf-8") as f:
             json.dump(stats, f, ensure_ascii=False, indent=2)
