@@ -81,6 +81,7 @@ jobs:
           if [[ -f scripts/write_sample.sh ]]; then dos2unix scripts/write_sample.sh || true; chmod +x scripts/write_sample.sh; fi
 
       - name: Ensure sample report exists (first-run safety)
+        if: ${{ github.event.inputs.skip_generate == 'true' }}
         shell: bash
         env:
           TITLE: ${{ github.event.inputs.report_title || 'roadmap_report' }}
@@ -186,24 +187,34 @@ jobs:
           OPENAI_MODEL: ${{ github.event.inputs.model || 'gpt-4o' }}
           OPENAI_ORG_ID: ${{ secrets.OPENAI_ORG_ID }}
         run: |
-          set -euo pipefail
+          set -euxo pipefail
+
           if [[ -z "${OPENAI_API_KEY:-}" ]]; then
             echo "Missing OPENAI_API_KEY secret. Set it in Settings → Secrets → Actions." >&2
             exit 1
           fi
+
           RAW_IDS="${{ github.event.inputs.ids }}"
           if [[ -z "$RAW_IDS" ]]; then
             RAW_IDS="${{ steps.discover.outputs.ids }}"
           fi
+
           if [[ -z "$RAW_IDS" ]]; then
-            echo "ℹ️ No IDs available; skipping report generation."
+            echo "ℹ️ No IDs available; skipping report generation (this prevents using stale sample output)." >&2
             exit 0
           fi
+
           TITLE="${{ github.event.inputs.report_title || 'roadmap_report' }}"
           mkdir -p output
+          rm -f "output/${TITLE}.md"   # <- ensure no sample file remains
+
           echo "Using IDs: $RAW_IDS"
           bash scripts/generate_report.sh "$RAW_IDS" "prompts/system_multi_id.md" "output/${TITLE}.md"
 
+          # Sanity: show first lines so we know it's not the sample
+          echo "----- BEGIN HEAD output/${TITLE}.md -----"
+          head -n 20 "output/${TITLE}.md" || true
+          echo "----- END HEAD -----"
 
 
       - name: Post-process to CSV/JSON (always runs)
