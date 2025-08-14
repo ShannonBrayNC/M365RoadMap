@@ -211,6 +211,17 @@ jobs:
           head -n 40 "output/${TITLE}.md" || true
           echo "-----------------------------------"
 
+      - name: Validate generated report (strict)
+        if: ${{ github.event.inputs.skip_generate == 'false' && github.event.inputs.test_discovery != 'true' }}
+        shell: bash
+        env:
+          TITLE: ${{ github.event.inputs.report_title || 'roadmap_report' }}
+        run: |
+          set -euo pipefail
+          python scripts/validate_report.py --input "output/${TITLE}.md" --check-deep-dive
+
+
+
 
       - name: Show first lines of markdown (debug)
         if: ${{ always() }}
