@@ -248,16 +248,16 @@ jobs:
             echo "## Fetch Stats"
             if [[ -n "${STATS:-}" && -f "$STATS" ]]; then
               python - "$STATS" <<'PY'
-              import sys, json
-              p = sys.argv[1]
-              with open(p, "r", encoding="utf-8") as f:
-                  data = json.load(f)
-              graph  = data.get("graph_rows", 0)
-              public = data.get("public_rows", 0)
-              rss    = data.get("rss_rows", 0)
-              print(f"- Graph rows: **{graph}**")
-              print(f"- Public rows: **{public}**")
-              print(f"- RSS rows: **{rss}**")
+                import sys, json
+                p = sys.argv[1]
+                with open(p, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                graph  = data.get("graph_rows", 0)
+                public = data.get("public_rows", 0)
+                rss    = data.get("rss_rows", 0)
+                print(f"- Graph rows: **{graph}**")
+                print(f"- Public rows: **{public}**")
+                print(f"- RSS rows: **{rss}**")
               PY
             else
               echo "_No stats file produced._"
