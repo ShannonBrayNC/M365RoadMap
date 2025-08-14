@@ -1,59 +1,67 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-IDS="$1"
-PROMPT_FILE="$2"
-OUTPUT_FILE="$3"
+IDS_CSV="${1:?Usage: $0 <ids_comma_separated> <system_prompt_md> <out_md>}"
+SYSTEM_PROMPT_PATH="${2:?Usage: $0 <ids_comma_separated> <system_prompt_md> <out_md>}"
+OUT_MD="${3:-output/roadmap_report.md}"
 
-# Default model
-if [ -z "$OPENAI_MODEL" ]; then
-  OPENAI_MODEL="gpt-4o"
-fi
+: "${OPENAI_API_KEY:?OPENAI_API_KEY is required}"
+OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://api.openai.com/v1}"
+OPENAI_MODEL="${OPENAI_MODEL:-gpt-4o}"
+OPENAI_ORG_ID="${OPENAI_ORG_ID:-}"
 
-# Default base URL if not set
-if [ -z "$OPENAI_BASE_URL" ]; then
-  OPENAI_BASE_URL="https://api.openai.com/v1"
-fi
+mkdir -p "$(dirname "$OUT_MD")"
+# ensure we never reuse a stale file
+rm -f "$OUT_MD"
 
-echo "Using model: $OPENAI_MODEL"
-echo "Generating report for Roadmap IDs: $IDS"
+python - <<'PY' "$IDS_CSV" "$SYSTEM_PROMPT_PATH" "$OUT_MD" "$OPENAI_API_KEY" "$OPENAI_BASE_URL" "$OPENAI_MODEL" "$OPENAI_ORG_ID"
+import json, os, sys, textwrap, urllib.request
 
-# Function to call OpenAI API
-call_openai_api() {
-  MODEL_TO_USE="$1"
+ids_csv, sys_path, out_md, api_key, base_url, model, org_id = sys.argv[1:]
 
-  curl -sS -X POST \
-    -H "Authorization: Bearer ${OPENAI_API_KEY}" \
-    -H "OpenAI-Organization: ${OPENAI_ORG_ID}" \
-    -H "Content-Type: application/json" \
-    "${OPENAI_BASE_URL}/chat/completions" \
-    -d "{
-      \"model\": \"${MODEL_TO_USE}\",
-      \"messages\": [
-        {\"role\": \"system\", \"content\": \"$(cat "$PROMPT_FILE")\"},
-        {\"role\": \"user\", \"content\": \"Roadmap IDs: $IDS\"}
-      ]
-    }"
+with open(sys_path, "r", encoding="utf-8") as f:
+    system_prompt = f.read()
+
+# Minimal user prompt: just the IDs
+user_prompt = f"Feature IDs: {ids_csv.strip()}"
+
+payload = {
+    "model": model,
+    "messages": [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ],
+    "temperature": 0.2
 }
 
-FALLBACK_USED="false"
+req = urllib.request.Request(
+    url=f"{base_url.rstrip('/')}/chat/completions",
+    data=json.dumps(payload).encode("utf-8"),
+    headers={
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+        **({"OpenAI-Organization": org_id} if org_id else {})
+    },
+    method="POST"
+)
 
-# First attempt with the requested/default model
-RESPONSE=$(call_openai_api "$OPENAI_MODEL")
+try:
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        data = json.loads(resp.read().decode("utf-8", errors="replace"))
+except urllib.error.HTTPError as e:
+    msg = e.read().decode("utf-8", errors="replace")
+    print("API ERROR:", msg, file=sys.stderr)
+    raise
 
-# Check for "organization must be verified" or "model_not_found" error
-if echo "$RESPONSE" | grep -q "organization must be verified\|model_not_found"; then
-  echo "⚠️ $OPENAI_MODEL is not available for your org. Falling back to gpt-4o..."
-  RESPONSE=$(call_openai_api "gpt-4o")
-  FALLBACK_USED="true"
-fi
+content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+if not content:
+    print("No content returned from API. Full response:", json.dumps(data, indent=2), file=sys.stderr)
+    sys.exit(1)
 
-# Save output
-echo "$RESPONSE" > "$OUTPUT_FILE"
+with open(out_md, "w", encoding="utf-8", newline="\n") as f:
+    f.write(content)
 
-# Append fallback note to Markdown file if needed
-if [ "$FALLBACK_USED" = "true" ]; then
-  echo -e "\n---\n**Note:** This report was generated using *gpt-4o* due to lack of access to *$OPENAI_MODEL* in your organization." >> "$OUTPUT_FILE"
-fi
+print(f"✅ Report written to {out_md}")
+PY
 
-echo "✅ Report saved to $OUTPUT_FILE"
+echo "✅ Done."
