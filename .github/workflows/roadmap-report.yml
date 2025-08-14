@@ -188,33 +188,80 @@ jobs:
           OPENAI_ORG_ID: ${{ secrets.OPENAI_ORG_ID }}
         run: |
           set -euxo pipefail
-
           if [[ -z "${OPENAI_API_KEY:-}" ]]; then
-            echo "Missing OPENAI_API_KEY secret. Set it in Settings → Secrets → Actions." >&2
-            exit 1
+            echo "Missing OPENAI_API_KEY secret." >&2; exit 1
           fi
-
           RAW_IDS="${{ github.event.inputs.ids }}"
           if [[ -z "$RAW_IDS" ]]; then
             RAW_IDS="${{ steps.discover.outputs.ids }}"
           fi
-
           if [[ -z "$RAW_IDS" ]]; then
-            echo "ℹ️ No IDs available; skipping report generation (this prevents using stale sample output)." >&2
-            exit 0
+            echo "ℹ️ No IDs; skipping generation." >&2; exit 0
           fi
-
           TITLE="${{ github.event.inputs.report_title || 'roadmap_report' }}"
           mkdir -p output
-          rm -f "output/${TITLE}.md"   # <- ensure no sample file remains
-
+          rm -f "output/${TITLE}.md"
           echo "Using IDs: $RAW_IDS"
           bash scripts/generate_report.sh "$RAW_IDS" "prompts/system_multi_id.md" "output/${TITLE}.md"
 
-          # Sanity: show first lines so we know it's not the sample
-          echo "----- BEGIN HEAD output/${TITLE}.md -----"
-          head -n 20 "output/${TITLE}.md" || true
-          echo "----- END HEAD -----"
+              if: ${{ github.event.inputs.skip_generate == 'false' && github.event.inputs.test_discovery != 'true' }}
+              shell: bash
+              env:
+                OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+                OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+                OPENAI_MODEL: ${{ github.event.inputs.model || 'gpt-4o' }}
+                OPENAI_ORG_ID: ${{ secrets.OPENAI_ORG_ID }}
+              run: |
+                set -euxo pipefail
+
+                if [[ -z "${OPENAI_API_KEY:-}" ]]; then
+                  echo "Missing OPENAI_API_KEY secret. Set it in Settings → Secrets → Actions." >&2
+                  exit 1
+                fi
+
+                RAW_IDS="${{ github.event.inputs.ids }}"
+                if [[ -z "$RAW_IDS" ]]; then
+                  RAW_IDS="${{ steps.discover.outputs.ids }}"
+                fi
+
+                if [[ -z "$RAW_IDS" ]]; then
+                  echo "ℹ️ No IDs available; skipping report generation (this prevents using stale sample output)." >&2
+                  exit 0
+                fi
+
+                TITLE="${{ github.event.inputs.report_title || 'roadmap_report' }}"
+                mkdir -p output
+                rm -f "output/${TITLE}.md"   # <- ensure no sample file remains
+
+                echo "Using IDs: $RAW_IDS"
+                bash scripts/generate_report.sh "$RAW_IDS" "prompts/system_multi_id.md" "output/${TITLE}.md"
+
+                # Sanity: show first lines so we know it's not the sample
+                echo "----- BEGIN HEAD output/${TITLE}.md -----"
+                head -n 20 "output/${TITLE}.md" || true
+                echo "----- END HEAD -----"
+
+
+
+      - name: Show first 80 lines of markdown (debug)
+        if: ${{ always() }}
+        shell: bash
+        env:
+          TITLE: ${{ github.event.inputs.report_title || 'roadmap_report' }}
+        run: |
+          set -euo pipefail
+          echo "----- HEAD of output/${TITLE}.md -----"
+          if [[ -f "output/${TITLE}.md" ]]; then
+            head -n 80 "output/${TITLE}.md"
+          else
+            echo "File not found: output/${TITLE}.md"
+          fi
+          echo "--------------------------------------"
+
+
+
+
+
 
 
       - name: Post-process to CSV/JSON (always runs)
