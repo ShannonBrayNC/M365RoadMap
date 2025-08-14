@@ -47,7 +47,7 @@ import feedparser  # type: ignore
 
 # Local helper (your working version)
 # Provides: acquire_token(config) -> str  and  graph_get_json(url, token) -> dict
-from scripts.graph_client import acquire_token, graph_get_json  # type: ignore
+from graph_client import acquire_token, graph_get_json  # type: ignore
 
 
 PUBLIC_ROADMAP_JSON = "https://www.microsoft.com/releasecommunications/api/v2/m365/roadmap"
