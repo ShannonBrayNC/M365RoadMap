@@ -457,7 +457,7 @@ def write_json(rows: List[Dict[str, str]], path: str) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Parse M365 Roadmap Markdown to CSV/JSON (with optional RSS/JSON fallback)")
-    ap.add_argument("input", help="Input Markdown file path")
+    ap.add_argument("--input", help="Input Markdown file path")
     ap.add_argument("--csv", help="Output CSV path")
     ap.add_argument("--json", help="Output JSON path")
     ap.add_argument("--months", type=int, default=None, help="Filter to last N months (1..24)")
