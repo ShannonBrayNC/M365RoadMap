@@ -34,8 +34,7 @@ except ImportError:
 
 # Cloud helpers shared with generator/parser
 # --- import shim: allow running as "python scripts/foo.py" or "-m scripts.foo"
-import sys
-from pathlib import Path
+
 ROOT = Path(__file__).resolve().parents[1]  # repo root
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -46,30 +45,63 @@ except ImportError:
     from report_templates import CLOUD_LABELS, normalize_clouds, parse_date_soft  # noqa
 
 # ------------------------------- CLI ---------------------------------
-def _as_set(x):
+import argparse
+from typing import Iterable, Set
+
+def _as_set(x) -> Set[str]:
     """Normalize any value to a set of strings."""
     if x is None:
         return set()
     if isinstance(x, (set, list, tuple)):
-        return set(map(str, x))
+        return {str(v) for v in x}
     return {str(x)}
 
 def parse_args(argv=None):
-    p = argparse.ArgumentParser(...)
-    # allow multiple --cloud flags: --cloud "GCC" --cloud "DoD"
-    p.add_argument("--cloud", dest="clouds", action="append", default=[], help="Cloud filter; repeatable")
-    # ... your other args ...
+    p = argparse.ArgumentParser(
+        prog="fetch_messages_graph",
+        description="Fetch M365 roadmap/messages from Graph and RSS and emit CSV/JSON."
+    )
+
+    # Inputs / filters
+    p.add_argument("--config", dest="config", default=None,
+                   help="Path to graph_config.json (contains pfx_base64, tenant, client).")
+    p.add_argument("--since", dest="since", default=None,
+                   help="Only include items modified on/after this date (YYYY-MM-DD).")
+    p.add_argument("--months", dest="months", type=int, default=None,
+                   help="Relative time window in months from today.")
+    p.add_argument("--cloud", dest="clouds", action="append", default=[],
+                   help="Cloud filter; repeatable. e.g. --cloud 'Worldwide (Standard Multi-Tenant)'")
+
+    # Behavior flags
+    p.add_argument("--no-window", dest="no_window", action="store_true",
+                   help="Headless auth only (no device/browser window).")
+
+    # Outputs
+    p.add_argument("--emit", choices=["csv", "json"], required=True,
+                   help="Output format to emit.")
+    p.add_argument("--out", required=True,
+                   help="Output file path for --emit.")
+    p.add_argument("--stats-out", dest="stats_out", default=None,
+                   help="Optional: write fetch statistics JSON here.")
+
+    # Optional explicit include list
+    p.add_argument("--public-ids", dest="public_ids", default=None,
+                   help="Comma-separated explicit Roadmap IDs to include.")
+
     args = p.parse_args(argv)
 
-    # Normalize clouds into a set
-    selected: set[str] = set()
+    # Normalize clouds into a set of canonical labels
+    selected: Set[str] = set()
     for c in args.clouds:
-        normalized = normalize_clouds(c)  # may be "General" OR ["General"]
+        normalized = normalize_clouds(c)   # your existing helper; may return "General" or ["General", ...]
         selected |= _as_set(normalized)
+    args.clouds = selected  # downstream code can use a set[str]
 
-    args.clouds = selected  # downstream code can rely on a set[str]
+    # Normalize public_ids into a set if provided
+    if args.public_ids:
+        args.public_ids = {pid.strip() for pid in args.public_ids.split(",") if pid.strip()}
+
     return args
-
 
 # ----------------------------- Utilities ------------------------------
 
