@@ -17,6 +17,8 @@ import re
 import sys
 from pathlib import Path
 from typing import Optional
+import csv
+
 
 # --- import shim: allow both "python -m" and "python scripts/..." styles ---
 REPO_ROOT = Path(__file__).resolve().parents[1]  # repo root
