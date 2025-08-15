@@ -1,32 +1,13 @@
 {
-  "args": {
-    "config": "graph_config.json",
-    "since": null,
-    "months": null,
-    "no_window": true,
-    "ids": "",
-    "tenant_cloud": "",
-    "cloud": [
-      "General",
-      "GCC",
-      "GCC High",
-      "DoD"
-    ],
-    "no_graph": false,
-    "no_public_scrape": false,
-    "emit": "csv",
-    "out": "output/roadmap_report_master.csv",
-    "stats_out": "output/fetch_stats.json"
+  "rows": 148,
+  "sources": {
+    "graph-raw": 100,
+    "graph": 250
   },
-  "source_counts": {
-    "public-json-raw": 1844,
-    "rss-raw": 1844,
-    "graph": 0,
-    "public-json": 1844,
-    "rss": 1814,
-    "forced": 0
-  },
-  "errors": [
-    "graph-fetch: Invalid password or PKCS12 data"
-  ]
+  "errors": [],
+  "selected_clouds": [
+    "General"
+  ],
+  "window_since": "",
+  "pre_dedupe": 250
 }
