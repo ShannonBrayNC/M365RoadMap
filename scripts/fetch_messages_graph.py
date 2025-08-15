@@ -83,7 +83,7 @@ def _norm_cloud(s: str) -> str:
     if not s:
         return ""
     if s in {"general", "worldwide", "standard", "ww", "worldwide (standard multi-tenant)"}:
-        return "General"
+        return "worldwide (standard multi-tenant)"
     if s in {"gcc high", "gcch", "high"}:
         return "gcc high"
     if s in {"dod", "us dod", "department of defense"}:
