@@ -101,7 +101,7 @@ jobs:
             PFX="$(python -c 'import json,sys; print(json.load(open(sys.argv[1],\"r\",encoding=\"utf-8\")).get(\"pfx_base64\",\"\"))' "${CFG_PATH}")"
           fi
 
-          # Small debug (masked): show lengths only
+          # Tiny debug (masked): show lengths only
           python -c 'import os,base64; b=os.environ.get("PFX_B64",""); print(f"PFX_B64 length: {len(b)}"); print(f"Decoded PFX bytes: {len(base64.b64decode(b)) if b else 0}")'
 
           if [[ -n "${TENANT:-}" && -n "${CLIENT:-}" && -n "${PFX:-}" ]]; then
@@ -114,20 +114,6 @@ jobs:
             echo "graph_cfg=" >> "$GITHUB_OUTPUT"
             echo "::warning::No Graph config available; Graph calls will fail unless you set secrets."
           fi
-
-      - name: Build cloud args (checkboxes)
-        id: clouds
-        shell: bash
-        run: |
-          set -euo pipefail
-          args=()
-          tolow() { echo "${1:-}" | tr '[:upper:]' '[:lower:]'; }
-          if [[ "$(tolow "${CLOUD_GENERAL}")" == "true" ]]; then args+=( --cloud "Worldwide (Standard Multi-Tenant)" ); fi
-          if [[ "$(tolow "${CLOUD_GCC}")" == "true" ]]; then args+=( --cloud "GCC" ); fi
-          if [[ "$(tolow "${CLOUD_GCCH}")" == "true" ]]; then args+=( --cloud "GCC High" ); fi
-          if [[ "$(tolow "${CLOUD_DOD}")" == "true" ]]; then args+=( --cloud "DoD" ); fi
-          # shellcheck disable=SC2125
-          echo "clouds=${args[*]}" >> "$GITHUB_OUTPUT"
 
       - name: Debug inputs
         shell: bash
@@ -148,28 +134,35 @@ jobs:
           JSON_OUT="output/${TITLE}_master.json"
           STATS_OUT="output/${TITLE}_fetch_stats.json"
 
+          # Build date flags
           DATE_FLAGS=()
           if [[ "${NO_WINDOW}" == "true" ]]; then
-            DATE_FLAGS+=( --no-window )
+            DATE_FLAGS+=( "--no-window" )
           else
             if [[ -n "${SINCE}" ]]; then
-              DATE_FLAGS+=( --since "${SINCE}" )
+              DATE_FLAGS+=( "--since" "${SINCE}" )
             elif [[ -n "${MONTHS}" ]]; then
-              DATE_FLAGS+=( --months "${MONTHS}" )
+              DATE_FLAGS+=( "--months" "${MONTHS}" )
             fi
           fi
 
-          CLOUDS_EXPANDED="${{ steps.clouds.outputs.clouds }}"
-          # Split CLOUDS_EXPANDED by spaces into array safely
-          IFS=' ' read -r -a CLOUDS_ARR <<< "${CLOUDS_EXPANDED}"
+          # Build cloud flags as a proper array (each value is its own element)
+          CLOUDS_ARR=()
+          tolow() { echo "${1:-}" | tr '[:upper:]' '[:lower:]'; }
+          if [[ "$(tolow "${CLOUD_GENERAL}")" == "true" ]]; then CLOUDS_ARR+=( "--cloud" "Worldwide (Standard Multi-Tenant)" ); fi
+          if [[ "$(tolow "${CLOUD_GCC}")" == "true" ]]; then CLOUDS_ARR+=( "--cloud" "GCC" ); fi
+          if [[ "$(tolow "${CLOUD_GCCH}")" == "true" ]]; then CLOUDS_ARR+=( "--cloud" "GCC High" ); fi
+          if [[ "$(tolow "${CLOUD_DOD}")" == "true" ]]; then CLOUDS_ARR+=( "--cloud" "DoD" ); fi
 
+          # Config arg (optional)
           CFG_ARG=()
           if [[ -n "${{ steps.graphcfg.outputs.graph_cfg }}" ]]; then
-            CFG_ARG=( --config "${{ steps.graphcfg.outputs.graph_cfg }}" )
+            CFG_ARG=( "--config" "${{ steps.graphcfg.outputs.graph_cfg }}" )
           fi
 
           echo "Running fetch_messages_graph.py with: ${CFG_ARG[*]} ${DATE_FLAGS[*]} ${CLOUDS_ARR[*]}"
 
+          # Run CSV
           python scripts/fetch_messages_graph.py \
             "${CFG_ARG[@]}" \
             "${DATE_FLAGS[@]}" \
@@ -178,6 +171,7 @@ jobs:
             --emit csv --out "${CSV_OUT}" \
             --stats-out "${STATS_OUT}"
 
+          # Run JSON
           python scripts/fetch_messages_graph.py \
             "${CFG_ARG[@]}" \
             "${DATE_FLAGS[@]}" \
