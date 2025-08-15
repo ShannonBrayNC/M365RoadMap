@@ -2,12 +2,10 @@ import argparse
 import csv
 import json
 import os
-import re
 from datetime import datetime
-from typing import List, Dict, Optional
 
 
-def parse_markdown(md_text: str, months: Optional[int] = None) -> List[Dict[str, str]]:
+def parse_markdown(md_text: str, months: int | None = None) -> list[dict[str, str]]:
     rows = []
     current_row = {}
     lines = md_text.splitlines()
@@ -59,7 +57,7 @@ def parse_markdown(md_text: str, months: Optional[int] = None) -> List[Dict[str,
     return rows
 
 
-def write_csv(rows: List[Dict[str, str]], path: str) -> None:
+def write_csv(rows: list[dict[str, str]], path: str) -> None:
     if not rows:
         print("No data to write to CSV.")
         return
@@ -69,7 +67,7 @@ def write_csv(rows: List[Dict[str, str]], path: str) -> None:
         writer.writerows(rows)
 
 
-def write_json(rows: List[Dict[str, str]], path: str) -> None:
+def write_json(rows: list[dict[str, str]], path: str) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(rows, f, ensure_ascii=False, indent=2)
 
@@ -94,7 +92,7 @@ def main() -> None:
     if not os.path.exists(args.input):
         raise FileNotFoundError(f"Input file not found: {args.input}")
 
-    with open(args.input, "r", encoding="utf-8") as f:
+    with open(args.input, encoding="utf-8") as f:
         md_text = f.read()
 
     rows = parse_markdown(md_text, months=args.months)
@@ -105,7 +103,6 @@ def main() -> None:
     if args.json:
         write_json(rows, args.json)
         print(f"JSON written to {args.json}")
-
 
 
 if __name__ == "__main__":

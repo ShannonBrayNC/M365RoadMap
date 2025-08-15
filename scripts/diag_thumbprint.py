@@ -1,7 +1,11 @@
 # scripts/diag_thumbprint.py
-import os, json, base64, hashlib
-from cryptography.hazmat.primitives.serialization.pkcs12 import load_key_and_certificates
+import base64
+import hashlib
+import json
+import os
+
 from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.serialization.pkcs12 import load_key_and_certificates
 
 cfg = json.load(open("graph_config.json", "rb"))
 

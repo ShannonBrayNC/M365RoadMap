@@ -26,8 +26,8 @@ Features
 
 import argparse
 import csv
-import sys
 import re
+import sys
 from datetime import datetime, timedelta
 
 import requests
@@ -42,12 +42,14 @@ except Exception:
 
 # ---------- helpers ----------
 
+
 def clean_text(s):
     """Remove zero-width spaces and normalize whitespace; keep real Unicode."""
     if not isinstance(s, str):
         return s
     s = s.replace("\u200b", "")  # zero-width space
     return " ".join(s.split())
+
 
 def coerce_months(s: str | None):
     s = (s or "").strip()
@@ -58,6 +60,7 @@ def coerce_months(s: str | None):
         return n if 1 <= n <= 6 else None
     except Exception:
         return None
+
 
 def norm_instance(s: str) -> str:
     if not s:
@@ -73,16 +76,18 @@ def norm_instance(s: str) -> str:
         return "gcc"
     return t  # leave other values as-is (lowercased)
 
+
 def parse_isoish(dt_str: str | None):
     if not dt_str:
         return None
     fmts = ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%SZ")
     for fmt in fmts:
         try:
-            return datetime.strptime(dt_str[:len(fmt)], fmt)
+            return datetime.strptime(dt_str[: len(fmt)], fmt)
         except Exception:
             pass
     return None
+
 
 def parse_m365_fuzzy(dt_str: str | None):
     """Parse 'August CY2025', 'Q3 CY2025', 'H1 2025', '2025'."""
@@ -101,15 +106,17 @@ def parse_m365_fuzzy(dt_str: str | None):
     # Quarter
     m = re.match(r"^Q([1-4])\s+(\d{4})$", s, re.IGNORECASE)
     if m:
-        q = int(m.group(1)); y = int(m.group(2))
-        start_month = {1:1, 2:4, 3:7, 4:10}[q]
+        q = int(m.group(1))
+        y = int(m.group(2))
+        start_month = {1: 1, 2: 4, 3: 7, 4: 10}[q]
         return datetime(y, start_month, 1)
 
     # Half
     m = re.match(r"^H([12])\s+(\d{4})$", s, re.IGNORECASE)
     if m:
-        h = int(m.group(1)); y = int(m.group(2))
-        start_month = {1:1, 2:7}[h]
+        h = int(m.group(1))
+        y = int(m.group(2))
+        start_month = {1: 1, 2: 7}[h]
         return datetime(y, start_month, 1)
 
     # Year only
@@ -119,10 +126,13 @@ def parse_m365_fuzzy(dt_str: str | None):
 
     return None
 
+
 def parse_any_date(dt_str: str | None):
     d = parse_isoish(dt_str)
-    if d: return d
+    if d:
+        return d
     return parse_m365_fuzzy(dt_str)
+
 
 def instances_for(item):
     """
@@ -151,16 +161,18 @@ def instances_for(item):
 
     return [v for v in norm_vals if v]
 
+
 def instance_allowed(item, include_set, exclude_set):
     vals = instances_for(item)
     if exclude_set and any(v in exclude_set for v in vals):
         return False
     if include_set:
-        if not vals:   # keep unknowns when include_set is present? choose conservative:
+        if not vals:  # keep unknowns when include_set is present? choose conservative:
             # Conservative approach: do NOT keep unknowns when include filter is set.
             return False
         return any(v in include_set for v in vals)
     return True
+
 
 def in_date_window(item, months, since_dt, until_dt, keep_undated=False):
     """
@@ -203,14 +215,16 @@ def in_date_window(item, months, since_dt, until_dt, keep_undated=False):
         return False
     return True
 
+
 # ---------- main ----------
+
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--months", default="")
     ap.add_argument("--since", default="")
     ap.add_argument("--until", default="")
-    ap.add_argument("--keep-undated", default="false", choices=["true","false"])
+    ap.add_argument("--keep-undated", default="false", choices=["true", "false"])
     ap.add_argument("--include", default="")
     ap.add_argument("--exclude", default="")
     ap.add_argument("--emit", default="list", choices=["list", "csv"])
@@ -223,13 +237,15 @@ def main():
     months = coerce_months(args.months)
     since_dt = datetime.strptime(args.since, "%Y-%m-%d") if args.since else None
     until_dt = datetime.strptime(args.until, "%Y-%m-%d") if args.until else None
-    keep_undated = (args.keep_undated.lower() == "true")
+    keep_undated = args.keep_undated.lower() == "true"
 
     include_set = set(x.strip().lower() for x in args.include.split(",") if x.strip())
     exclude_set = set(x.strip().lower() for x in args.exclude.split(",") if x.strip())
 
     sess = requests.Session()
-    sess.headers.update({"User-Agent": "RoadmapFetcher/1.6 (+https://github.com/your-org/your-repo)"})
+    sess.headers.update(
+        {"User-Agent": "RoadmapFetcher/1.6 (+https://github.com/ShannonBrayNC/m365-roadmap)"}
+    )
     resp = sess.get(API, timeout=60)
     resp.raise_for_status()
     data = resp.json()
@@ -242,9 +258,12 @@ def main():
         parseable = 0
         for it in data:
             cands = [
-                it.get("releaseDate"), it.get("publicPreviewDate"), it.get("rolloutStart"),
+                it.get("releaseDate"),
+                it.get("publicPreviewDate"),
+                it.get("rolloutStart"),
                 it.get("publicDisclosureAvailabilityDate"),
-                it.get("modified") or it.get("lastModified"), it.get("created"),
+                it.get("modified") or it.get("lastModified"),
+                it.get("created"),
             ]
             any_dt = any(parse_any_date(x) for x in cands if isinstance(x, str))
             if any_dt:
@@ -265,9 +284,12 @@ def main():
         print(f"[debug] kept after filters: {len(out_items)}", file=sys.stderr)
 
     if args.emit == "csv":
+
         def write_csv(fh):
             w = csv.writer(fh)
-            w.writerow(["id","title","status","phase","targeted_dates","cloud_instances","link"])
+            w.writerow(
+                ["id", "title", "status", "phase", "targeted_dates", "cloud_instances", "link"]
+            )
             for it in out_items:
                 iid = it.get("id") or it.get("Id") or it.get("featureId") or ""
                 title = it.get("title") or it.get("Title") or ""
@@ -280,7 +302,9 @@ def main():
                 if isinstance(phases, list) and phases:
                     first = phases[0]
                     if isinstance(first, dict):
-                        phase = first.get("tagName") or first.get("name") or first.get("value") or ""
+                        phase = (
+                            first.get("tagName") or first.get("name") or first.get("value") or ""
+                        )
                     else:
                         phase = str(first)
 
@@ -292,7 +316,11 @@ def main():
                 )
 
                 clouds = instances_for(it)
-                link = f"https://www.microsoft.com/microsoft-365/roadmap?featureid={iid}" if iid else ""
+                link = (
+                    f"https://www.microsoft.com/microsoft-365/roadmap?featureid={iid}"
+                    if iid
+                    else ""
+                )
 
                 row = [
                     str(iid),
@@ -317,6 +345,7 @@ def main():
             if iid:
                 ids.append(str(iid))
         print(",".join(ids))
+
 
 if __name__ == "__main__":
     main()

@@ -1,5 +1,5 @@
 # Graph only (needs graph_config.json and $env:M365_PFX_PASSWORD)
-$env:M365_PFX_PASSWORD = "EdenEcho!"
+$env:M365_PFX_PASSWORD = "secrets.M365_PFX_PASSWORD"
 python .\scripts\selftest.py --months 1
 
 # Skip Graph; test RSS on a couple of IDs

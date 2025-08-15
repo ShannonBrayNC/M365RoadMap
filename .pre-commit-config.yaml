@@ -1,8 +1,26 @@
-repos:
-  - repo: local
-    hooks:
-      - id: validate-roadmap
-        name: Validate Roadmap Report
-        entry: python3 scripts/validate_report.py --input output/roadmap_report.md --check-deep-dive
-        language: system
-        pass_filenames: false
+- repo: https://github.com/PyCQA/bandit
+  rev: 1.7.9
+  hooks:
+    - id: bandit
+      name: bandit (repo sources only)
+      args:
+        - -q
+        - -r
+        - scripts
+        - tests
+        - --severity-level
+        - HIGH
+        - --confidence-level
+        - HIGH
+      exclude: >
+        (?x)(
+          ^\.venv/|
+          ^env/|
+          ^venv/|
+          ^output/|
+          ^\.git/|
+          .*/site-packages/|
+          ^build/|
+          ^dist/
+        )
+      pass_filenames: false

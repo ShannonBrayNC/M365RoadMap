@@ -22,6 +22,13 @@ import argparse
 import re
 import sys
 
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+
 MASTER_H = re.compile(r"^##\s*Master Summary Table\s*\(all IDs\)\s*$", re.IGNORECASE)
 SEP_RE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$")
 TABLE_HEADER_EXPECTED = [
@@ -36,15 +43,19 @@ TABLE_HEADER_EXPECTED = [
     "Official Roadmap link",
 ]
 
+
 def split_row(s: str):
     s = s.strip()
-    if s.startswith("|"): s = s[1:]
-    if s.endswith("|"): s = s[:-1]
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|"):
+        s = s[:-1]
     parts = [c.strip() for c in s.split("|")]
     # trim trailing empty cells
     while parts and parts[-1] == "":
         parts.pop()
     return parts
+
 
 def find_master_table(lines):
     """
@@ -83,6 +94,7 @@ def find_master_table(lines):
             return (i, i + 1, first_row, last_row)
     return None
 
+
 def find_all_tables(lines):
     """Return a list of (header_idx, sep_idx, first_row_idx, last_row_idx) for all pipe tables in the doc."""
     out = []
@@ -108,11 +120,15 @@ def find_all_tables(lines):
             i += 1
     return out
 
+
 def parse_ids_from_table(lines, header_idx, sep_idx, first_row_idx, last_row_idx):
     header_cells = split_row(lines[header_idx])
     # Hard check: exact match
     if header_cells != TABLE_HEADER_EXPECTED:
-        return None, f"Header mismatch.\nExpected: {TABLE_HEADER_EXPECTED}\nFound:    {header_cells}"
+        return (
+            None,
+            f"Header mismatch.\nExpected: {TABLE_HEADER_EXPECTED}\nFound:    {header_cells}",
+        )
 
     ids = []
     for i in range(first_row_idx, last_row_idx + 1):
@@ -124,6 +140,7 @@ def parse_ids_from_table(lines, header_idx, sep_idx, first_row_idx, last_row_idx
             row = row + [""] * (len(header_cells) - len(row))
         ids.append(row[0])
     return ids, None
+
 
 def deep_dive_sections_present(lines, ids):
     """
@@ -141,13 +158,14 @@ def deep_dive_sections_present(lines, ids):
             missing.append(rid)
     return missing
 
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True)
     ap.add_argument("--check-deep-dive", action="store_true")
     args = ap.parse_args()
 
-    with open(args.input, "r", encoding="utf-8") as f:
+    with open(args.input, encoding="utf-8") as f:
         lines = f.read().splitlines()
 
     errors = []
@@ -155,7 +173,9 @@ def main():
     # Exactly one Master table
     master = find_master_table(lines)
     if not master:
-        errors.append("Could not find '## Master Summary Table (all IDs)' followed by a GFM pipe table.")
+        errors.append(
+            "Could not find '## Master Summary Table (all IDs)' followed by a GFM pipe table."
+        )
     else:
         header_idx, sep_idx, first_row_idx, last_row_idx = master
         # Validate separator visually (already matched by regex)
@@ -186,6 +206,7 @@ def main():
 
     print("✅ Report validation passed.")
     sys.exit(0)
+
 
 if __name__ == "__main__":
     main()

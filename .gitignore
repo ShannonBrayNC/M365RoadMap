@@ -1,19 +1,43 @@
-# OS
-Thumbs.db
-.DS_Store
-
-# Node
-node_modules/
-.npm-cache/
-dist/
-.env
-
-# Python
-.venv/
 __pycache__/
-*.pyc
-.env*
-
-# IDE
+*.py[cod]
+*.so
+*.egg-info/
+.venv/
+venv/
+env/
+dist/
+build/
+.coverage
+coverage.xml
+htmlcov/
+.pytest_cache/
+.ipynb_checkpoints/
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
 .vscode/
 .idea/
+*.code-workspace
+
+# Project
+/output/*
+!/output/.gitkeep
+.env
+.env.*
+secrets.*
+*.pfx
+*.p12
+*.pem
+*.cer
+*.key
+*pfx.b64
+
+graph_config.json
+graph_config.inline.json
+!graph_config.example.json
+!graph_config.inline.example.json
+
+scripts/*.bak
+prompts/*.bak
+.pre-commit-config.yaml

@@ -1,5 +1,5 @@
-import sys
 import json
+import sys
 
 if len(sys.argv) < 2:
     print("_No stats file produced._")
@@ -7,11 +7,11 @@ if len(sys.argv) < 2:
 
 p = sys.argv[1]
 try:
-    with open(p, "r", encoding="utf-8") as f:
+    with open(p, encoding="utf-8") as f:
         data = json.load(f)
-    graph  = data.get("graph_rows", 0)
+    graph = data.get("graph_rows", 0)
     public = data.get("public_rows", 0)
-    rss    = data.get("rss_rows", 0)
+    rss = data.get("rss_rows", 0)
     print("## Fetch Stats")
     print(f"- Graph rows: **{graph}**")
     print(f"- Public rows: **{public}**")

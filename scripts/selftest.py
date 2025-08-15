@@ -18,18 +18,22 @@ Usage examples:
 
 Exit code is 0 on success (at least one method produced rows), 1 otherwise.
 """
+
 from __future__ import annotations
-import argparse, json, os, sys
-from datetime import datetime, timedelta, timezone
+
+import argparse
+import json
+import sys
+from datetime import UTC, datetime, timedelta
 
 # --- Local imports from your repo ---
 try:
     from graph_client import acquire_token
-except Exception as e:
+except Exception:
     acquire_token = None
 
 try:
-    from fetch_messages_graph import list_messages, map_mc_to_row, TABLE_HEADERS
+    from fetch_messages_graph import TABLE_HEADERS, list_messages, map_mc_to_row
 except Exception as e:
     print("[selftest] Could not import fetch_messages_graph pieces:", e, file=sys.stderr)
     sys.exit(1)
@@ -45,7 +49,7 @@ from fallback_rss_api import fetch_ids_rss
 
 
 def iso_utc_start_of_day(d: datetime) -> str:
-    return d.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc).isoformat()
+    return d.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=UTC).isoformat()
 
 
 def main():
@@ -56,8 +60,12 @@ def main():
     ap.add_argument("--tenant-cloud", default="Worldwide (Standard Multi-Tenant)")
     ap.add_argument("--ids", default="", help="Comma-separated Roadmap IDs for public fallbacks")
     ap.add_argument("--no-graph", action="store_true", help="Skip Graph check")
-    ap.add_argument("--no-public-scrape", action="store_true", help="Skip Playwright even if installed")
-    ap.add_argument("--samples", type=int, default=2, help="How many sample rows to display per method")
+    ap.add_argument(
+        "--no-public-scrape", action="store_true", help="Skip Playwright even if installed"
+    )
+    ap.add_argument(
+        "--samples", type=int, default=2, help="How many sample rows to display per method"
+    )
     args = ap.parse_args()
 
     # Compute since
@@ -66,13 +74,13 @@ def main():
         try:
             n = int(args.months)
             if 1 <= n <= 6:
-                since_dt = datetime.utcnow().replace(tzinfo=timezone.utc) - timedelta(days=int(30.44*n))
+                since_dt = datetime.utcnow().replace(tzinfo=UTC) - timedelta(days=int(30.44 * n))
                 since_iso = iso_utc_start_of_day(since_dt)
         except Exception:
             pass
     if args.since and not since_iso:
         try:
-            since_dt = datetime.strptime(args.since, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            since_dt = datetime.strptime(args.since, "%Y-%m-%d").replace(tzinfo=UTC)
             since_iso = iso_utc_start_of_day(since_dt)
         except Exception:
             pass
@@ -82,8 +90,10 @@ def main():
 
     print("=== Self-test: configuration ===")
     print(f"  Graph: {'ENABLED' if not args.no-graph else 'DISABLED'}  | config: {args.config}")
-    print(f"  Public scrape (Playwright): {'ENABLED' if (PLAYWRIGHT_OK and not args.no_public_scrape) else 'DISABLED'} (installed={PLAYWRIGHT_OK})")
-    print(f"  RSS/JSON fallback: ENABLED")
+    print(
+        f"  Public scrape (Playwright): {'ENABLED' if (PLAYWRIGHT_OK and not args.no_public_scrape) else 'DISABLED'} (installed={PLAYWRIGHT_OK})"
+    )
+    print("  RSS/JSON fallback: ENABLED")
     print(f"  IDs: {id_list if id_list else '(none given)'}")
     print(f"  Since: {since_iso or '(not set)'}")
     print()
@@ -93,7 +103,7 @@ def main():
     graph_err = None
     if not args.no_graph:
         try:
-            with open(args.config, "r", encoding="utf-8") as f:
+            with open(args.config, encoding="utf-8") as f:
                 cfg = json.load(f)
             if acquire_token is None:
                 raise RuntimeError("graph_client.acquire_token unavailable")
@@ -127,7 +137,9 @@ def main():
 
     # ---- Summaries ----
     print("\n=== Results ===")
-    print(f"[rows] Graph={len(graph_rows)} Public={len(public_rows)} RSS={len(rss_rows)} Total={len(graph_rows)+len(public_rows)+len(rss_rows)}\n")
+    print(
+        f"[rows] Graph={len(graph_rows)} Public={len(public_rows)} RSS={len(rss_rows)} Total={len(graph_rows)+len(public_rows)+len(rss_rows)}\n"
+    )
 
     def show_samples(label, rows):
         print(f"-- {label} sample rows (up to {args.samples}) --")
@@ -146,7 +158,10 @@ def main():
 
     overall_rows = len(graph_rows) + len(public_rows) + len(rss_rows)
     if overall_rows == 0:
-        print("Self-test produced no rows. Check credentials, secrets, or provide --ids.", file=sys.stderr)
+        print(
+            "Self-test produced no rows. Check credentials, secrets, or provide --ids.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     print("Self-test OK.")

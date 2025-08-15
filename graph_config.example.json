@@ -1,0 +1,8 @@
+{
+  "tenant_id": "00000000-0000-0000-0000-000000000000",
+  "client_id": "00000000-0000-0000-0000-000000000000",
+  "pfx_base64": "REPLACE_WITH_BASE64_PFX",
+  "pfx_password_env": "M365_PFX_PASSWORD",
+  "graph_base": "https://graph.microsoft.com/v1.0",
+  "authority_base": "https://login.microsoftonline.com"
+}

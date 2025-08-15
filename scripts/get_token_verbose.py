@@ -1,13 +1,15 @@
-import json, msal
+import json
+
 from graph_client import acquire_token  # uses your loader
 
+
 def main():
-    with open("graph_config.json","rb") as f:
+    with open("graph_config.json", "rb") as f:
         cfg = json.load(f)
     try:
         token = acquire_token(cfg)  # if you patched this earlier, it prints details
         print(token)
-    except Exception as e:
+    except Exception:
         # If acquire_token raises without printing MSAL result, try direct MSAL to show full error:
         tenant = cfg["tenant_id"]
         client = cfg["client_id"]
@@ -15,7 +17,14 @@ def main():
         scope = cfg.get("scope") or "https://graph.microsoft.com/.default"
 
         # Reuse the same key/cert that acquire_token() would produce
-        from graph_client import _load_from_pfx_b64, _load_from_pfx_path
+        import json
+
+        import msal
+        from graph_client import (
+            _load_from_pfx_b64,  # bring helpers into scope for the verbose fallback
+            _load_from_pfx_path,
+        )
+
         if "pfx_base64" in cfg:
             key, cert, thumb = _load_from_pfx_b64(cfg["pfx_base64"], cfg.get("pfx_password_env"))
         else:
@@ -29,6 +38,7 @@ def main():
         res = app.acquire_token_for_client(scopes=[scope])
         print("MSAL result:", json.dumps(res, indent=2))
         raise
+
 
 if __name__ == "__main__":
     main()

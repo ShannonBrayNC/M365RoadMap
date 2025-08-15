@@ -19,21 +19,30 @@ from __future__ import annotations
 
 import json
 import re
-from typing import List, Dict
+
 import requests
 from bs4 import BeautifulSoup
 
 TABLE_HEADERS = [
-    "ID","Title","Product/Workload","Status","Release phase",
-    "Targeted dates","Cloud instance","Short description","Official Roadmap link"
+    "ID",
+    "Title",
+    "Product/Workload",
+    "Status",
+    "Release phase",
+    "Targeted dates",
+    "Cloud instance",
+    "Short description",
+    "Official Roadmap link",
 ]
 
 FEED_URL = "https://www.microsoft.com/releasecommunications/api/v2/m365/rss"
 
+
 def _clean(s: str | None) -> str:
     if not s:
         return ""
-    return " ".join(s.replace("\u200b", "").replace("|"," / ").split())
+    return " ".join(s.replace("\u200b", "").replace("|", " / ").split())
+
 
 def _split_title_product(title: str) -> tuple[str, str]:
     if ":" in title:
@@ -41,11 +50,13 @@ def _split_title_product(title: str) -> tuple[str, str]:
         return _clean(left), _clean(right)
     return "", _clean(title)
 
+
 def _extract_feature_id(url_or_text: str) -> str:
     m = re.search(r"featureid=(\d+)", url_or_text, flags=re.I)
     return m.group(1) if m else ""
 
-def _row_from_item(item: Dict) -> List[str]:
+
+def _row_from_item(item: dict) -> list[str]:
     """
     Build a row from a JSON feed item (best-effort mapping).
     We expect keys like: title, link, description, categories, etc.
@@ -87,38 +98,45 @@ def _row_from_item(item: Dict) -> List[str]:
     product, _title_only = _split_title_product(title)
 
     return [
-        fid or "",                    # ID
-        title,                        # Title
-        product,                      # Product/Workload
-        status,                       # Status
-        phase,                        # Release phase
-        targeted,                     # Targeted dates
-        cloud,                        # Cloud instance (not in feed; keep blank)
-        desc,                         # Short description
-        link,                         # Official Roadmap link
+        fid or "",  # ID
+        title,  # Title
+        product,  # Product/Workload
+        status,  # Status
+        phase,  # Release phase
+        targeted,  # Targeted dates
+        cloud,  # Cloud instance (not in feed; keep blank)
+        desc,  # Short description
+        link,  # Official Roadmap link
     ]
 
-def _fetch_json() -> List[Dict]:
+
+def _fetch_json() -> list[dict]:
     r = requests.get(FEED_URL, headers={"Accept": "application/json"}, timeout=60)
     r.raise_for_status()
     # Some servers return text with JSON content-type; json.loads handles both
     return json.loads(r.text)
 
-def _fetch_xml_items() -> List[Dict]:
-    r = requests.get(FEED_URL, headers={"Accept": "application/rss+xml, application/xml, */*"}, timeout=60)
+
+def _fetch_xml_items() -> list[dict]:
+    r = requests.get(
+        FEED_URL, headers={"Accept": "application/rss+xml, application/xml, */*"}, timeout=60
+    )
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "xml")
     items = []
     for it in soup.find_all("item"):
-        items.append({
-            "title": it.title.text if it.title else "",
-            "link": it.link.text if it.link else "",
-            "description": it.description.text if it.description else "",
-            "categories": [c.text for c in it.find_all("category")],
-        })
+        items.append(
+            {
+                "title": it.title.text if it.title else "",
+                "link": it.link.text if it.link else "",
+                "description": it.description.text if it.description else "",
+                "categories": [c.text for c in it.find_all("category")],
+            }
+        )
     return items
 
-def fetch_ids_rss(id_list: List[str]) -> List[List[str]]:
+
+def fetch_ids_rss(id_list: list[str]) -> list[list[str]]:
     """
     Download the programmatic feed (JSON first, then XML) and filter by IDs.
     """
@@ -126,8 +144,8 @@ def fetch_ids_rss(id_list: List[str]) -> List[List[str]]:
     if not want:
         return []
 
-    items: List[Dict]
-    rows: List[List[str]] = []
+    items: list[dict]
+    rows: list[list[str]] = []
 
     # Try JSON first
     try:

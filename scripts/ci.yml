@@ -1,0 +1,270 @@
+name: CI & Roadmap Report
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      TITLE:
+        description: Base name for output files (no extension)
+        required: false
+        default: roadmap_report
+      PUBLIC_IDS:
+        description: Comma-separated Roadmap IDs to force (optional; else discovery/fetch)
+        required: false
+        default: ""
+      MONTHS:
+        description: Lookback window in months (for filters/fetch)
+        required: false
+        default: ""
+      SINCE:
+        description: ISO date (YYYY-MM-DD) to start from (overrides MONTHS if set)
+        required: false
+        default: ""
+      TENANT_CLOUD:
+        description: Cloud/Instance filter (Worldwide (Standard Multi-Tenant), GCC, GCC High, DoD)
+        required: false
+        default: "Worldwide (Standard Multi-Tenant)"
+      USE_GRAPH:
+        description: Use Microsoft Graph (true/false)
+        required: false
+        default: "true"
+      USE_PUBLIC_SCRAPE:
+        description: Use public HTML/JSON fallbacks (true/false)
+        required: false
+        default: "true"
+
+jobs:
+  ci:
+    name: Lint • Typecheck • Test • Security
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+          pip install ruff mypy pytest bandit detect-secrets
+
+      - name: Ruff (lint)
+        run: ruff check .
+
+      - name: Ruff (format check)
+        run: ruff format --check .
+
+      - name: Mypy
+        run: mypy .
+
+      - name: Tests
+        run: |
+          if [ -d tests ]; then
+            pytest -q
+          else
+            echo "No tests/ directory; skipping."
+          fi
+
+      - name: Bandit (security)
+        run: bandit -q -r .
+
+      - name: Detect-secrets
+        run: |
+          if [ -f .secrets.baseline ]; then
+            detect-secrets audit .secrets.baseline -n || true
+            detect-secrets scan --baseline .secrets.baseline --fail-instead-of-update
+          else
+            echo "No .secrets.baseline found; scanning all files (won't fail build)."
+            detect-secrets scan --all-files || true
+          fi
+
+      - name: Upload output (if present)
+        uses: actions/upload-artifact@v4
+        with:
+          name: output
+          if-no-files-found: ignore
+          path: output/*
+
+  roadmap_report:
+    # Manual run via "Run workflow" OR you can trigger from push by removing the if:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    name: Build Roadmap Master CSV/JSON
+    runs-on: ubuntu-latest
+    env:
+      # Map secrets → environment for convenience
+      TENANT: ${{ secrets.GRAPH_TENANT_ID }}
+      CLIENT: ${{ secrets.GRAPH_CLIENT_ID }}
+      PFX_B64: ${{ secrets.M365_PFX_BASE64 }}
+      PFX_PASSWORD_ENV: M365_PFX_PASSWORD
+      M365_PFX_PASSWORD: ${{ secrets.M365_PFX_PASSWORD }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      OPENAI_ORG_ID: ${{ secrets.OPENAI_ORG_ID }}
+
+      # Map inputs → environment
+      TITLE: ${{ github.event.inputs.TITLE }}
+      PUBLIC_IDS: ${{ github.event.inputs.PUBLIC_IDS }}
+      MONTHS: ${{ github.event.inputs.MONTHS }}
+      SINCE: ${{ github.event.inputs.SINCE }}
+      TENANT_CLOUD: ${{ github.event.inputs.TENANT_CLOUD }}
+      USE_GRAPH: ${{ github.event.inputs.USE_GRAPH }}
+      USE_PUBLIC_SCRAPE: ${{ github.event.inputs.USE_PUBLIC_SCRAPE }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install requests beautifulsoup4 lxml msal cryptography pandas tenacity
+          fi
+
+      # Build graph_config.json safely from secrets or reuse an existing one
+      - name: Prepare Graph config (optional)
+        id: graphcfg
+        shell: bash
+        run: |
+          set -euo pipefail
+          CFG_PATH="graph_config.json"
+          PFX="${PFX_B64:-}"
+          if [[ -z "${PFX}" && -f "${CFG_PATH}" ]]; then
+            echo "Reading pfx_base64 from ${CFG_PATH}"
+            PFX="$(python - <<'PY'
+import json
+print(json.load(open("graph_config.json","r",encoding="utf-8")).get("pfx_base64",""))
+PY
+)"
+          fi
+          if [[ -n "${TENANT:-}" && -n "${CLIENT:-}" && -n "${PFX:-}" ]]; then
+            python - <<'PY'
+import os, json
+cfg = {
+  "tenant_id": os.environ.get("TENANT",""),
+  "client_id": os.environ.get("CLIENT",""),
+  "pfx_base64": os.environ.get("PFX_B64",""),
+  "pfx_password_env": os.environ.get("PFX_PASSWORD_ENV","M365_PFX_PASSWORD"),
+  "graph_base": "https://graph.microsoft.com/v1.0"
+}
+open("graph_config.json","w",encoding="utf-8").write(json.dumps(cfg, ensure_ascii=False))
+print("graph_config.json written.")
+PY
+            echo "graph_cfg=graph_config.json" >> "$GITHUB_OUTPUT"
+          elif [[ -f "${CFG_PATH}" ]]; then
+            echo "graph_cfg=${CFG_PATH}" >> "$GITHUB_OUTPUT"
+          else
+            echo "graph_cfg=" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Graph config::No TENANT/CLIENT/PFX provided; Graph may be disabled."
+          fi
+
+      - name: Sanity check Graph auth (list 1 message)
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/graph_client.py --config "${{ steps.graphcfg.outputs.graph_cfg }}" --top 1 || true
+
+      - name: Fetch master data (Graph/Public/RSS)
+        id: fetch
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          CSV_OUT="output/${TITLE}_master.csv"
+          JSON_OUT="output/${TITLE}_master.json"
+          STATS_OUT="output/${TITLE}_fetch_stats.json"
+
+          to_lower() { echo "${1:-}" | tr '[:upper:]' '[:lower:]'; }
+          GRAPH_FLAG=""
+          [[ "$(to_lower "${USE_GRAPH:-true}")" == "true" ]] || GRAPH_FLAG="--no-graph"
+          PUBLIC_FLAG=""
+          [[ "$(to_lower "${USE_PUBLIC_SCRAPE:-true}")" == "true" ]] || PUBLIC_FLAG="--no-public-scrape"
+          IDS_FLAG=""
+          [[ -n "${PUBLIC_IDS}" ]] && IDS_FLAG="--ids ${PUBLIC_IDS}"
+
+          DATE_FLAGS=()
+          if [[ -n "${SINCE}" ]]; then
+            DATE_FLAGS+=( --since "${SINCE}" )
+          elif [[ -n "${MONTHS}" ]]; then
+            DATE_FLAGS+=( --months "${MONTHS}" )
+          fi
+
+          CFG_ARG=()
+          if [[ -n "${{ steps.graphcfg.outputs.graph_cfg }}" ]]; then
+            CFG_ARG=( --config "${{ steps.graphcfg.outputs.graph_cfg }}" )
+          fi
+
+          echo "Running unified fetch:"
+          echo "  Flags: ${GRAPH_FLAG} ${PUBLIC_FLAG} ${IDS_FLAG} ${DATE_FLAGS[*]}"
+          echo "  Graph config present? $([[ -n "${{ steps.graphcfg.outputs.graph_cfg }}" ]] && echo yes || echo no)"
+          echo "  TENANT set? $([[ -n "${TENANT:-}" ]] && echo yes || echo no)"
+          echo "  CLIENT set? $([[ -n "${CLIENT:-}" ]] && echo yes || echo no)"
+          echo "  PFX length: ${#PFX_B64:-0}"
+          echo "  PFX password env present? $([[ -n "${M365_PFX_PASSWORD:-}" ]] && echo yes || echo no)"
+
+          python scripts/fetch_messages_graph.py \
+            "${CFG_ARG[@]}" \
+            ${GRAPH_FLAG} ${PUBLIC_FLAG} ${IDS_FLAG} "${DATE_FLAGS[@]}" \
+            --tenant-cloud "${TENANT_CLOUD}" \
+            --emit csv --out "${CSV_OUT}" \
+            --stats-out "${STATS_OUT}"
+
+          python scripts/fetch_messages_graph.py \
+            "${CFG_ARG[@]}" \
+            ${GRAPH_FLAG} ${PUBLIC_FLAG} ${IDS_FLAG} "${DATE_FLAGS[@]}" \
+            --tenant-cloud "${TENANT_CLOUD}" \
+            --emit json --out "${JSON_OUT}"
+
+          echo "csv=${CSV_OUT}"     >> "$GITHUB_OUTPUT"
+          echo "json=${JSON_OUT}"   >> "$GITHUB_OUTPUT"
+          echo "stats=${STATS_OUT}" >> "$GITHUB_OUTPUT"
+
+      - name: Post-process Markdown to CSV/JSON (if report exists)
+        if: ${{ always() }}
+        shell: bash
+        env:
+          IN_MD: output/${{ github.event.inputs.TITLE }}.md
+          OUT_CSV: output/${{ github.event.inputs.TITLE }}.csv
+          OUT_JSON: output/${{ github.event.inputs.TITLE }}.json
+        run: |
+          set -euo pipefail
+          if [[ -f "${IN_MD}" ]]; then
+            echo "Converting ${IN_MD} → ${OUT_CSV}, ${OUT_JSON}"
+            python scripts/parse_roadmap_markdown.py \
+              --input "${IN_MD}" \
+              --csv   "${OUT_CSV}" \
+              --json  "${OUT_JSON}" \
+              --months "${MONTHS}" \
+              --since  "${SINCE}"
+          else
+            echo "No markdown found; skipping post-process."
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.TITLE }}
+          if-no-files-found: warn
+          path: |
+            output/${{ github.event.inputs.TITLE }}.md
+            output/${{ github.event.inputs.TITLE }}.csv
+            output/${{ github.event.inputs.TITLE }}.json
+            output/${{ github.event.inputs.TITLE }}_master.csv
+            output/${{ github.event.inputs.TITLE }}_master.json
+            output/${{ github.event.inputs.TITLE }}_fetch_stats.json
+            output/*

@@ -1,29 +1,11 @@
-# Microsoft Graph auth & cert handling
-msal==1.31.0
-cryptography==42.0.8
-pyopenssl==24.2.1
-
-# HTTP requests & parsing
-requests==2.32.3
-beautifulsoup4==4.12.3
-lxml==5.2.2
-
-# Data wrangling
-pandas==2.2.2
-python-dateutil==2.9.0.post0
-
-# Playwright for public roadmap scraping (optional; workflow guards install)
-playwright==1.45.0
-
-# CSV/JSON/Markdown processing
-markdown-it-py==3.0.0
-mdit-py-plugins==0.4.0
-
-# AI generation (Markdown deep-dive)
-openai==1.41.0
-
-# Optional: for Windows certificate store access if needed (not used in inline mode)
-pywin32==306; sys_platform == "win32"
-
-
-feedparser>=6.0.0
+requests>=2.31
+urllib3>=2.2
+beautifulsoup4>=4.12
+lxml>=5.2
+feedparser>=6.0.11
+python-dateutil>=2.9
+pandas>=2.2
+msal>=1.29.0
+cryptography>=42.0.0
+openai>=1.40.0   # only needed if you enable --use-openai
+pytest>=8.2

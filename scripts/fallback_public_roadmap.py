@@ -15,20 +15,29 @@ Notes:
 from __future__ import annotations
 
 import re
-from typing import List
+
 from playwright.sync_api import sync_playwright
 
 TABLE_HEADERS = [
-    "ID","Title","Product/Workload","Status","Release phase",
-    "Targeted dates","Cloud instance","Short description","Official Roadmap link"
+    "ID",
+    "Title",
+    "Product/Workload",
+    "Status",
+    "Release phase",
+    "Targeted dates",
+    "Cloud instance",
+    "Short description",
+    "Official Roadmap link",
 ]
 
 ROADMAP_URL = "https://www.microsoft.com/en-us/microsoft-365/roadmap?featureid={fid}"
 
+
 def _clean(s: str | None) -> str:
     if not s:
         return ""
-    return " ".join(s.replace("\u200b", "").replace("|"," / ").split())
+    return " ".join(s.replace("\u200b", "").replace("|", " / ").split())
+
 
 def _split_title_product(title: str) -> tuple[str, str]:
     """
@@ -39,6 +48,7 @@ def _split_title_product(title: str) -> tuple[str, str]:
         left, right = title.split(":", 1)
         return _clean(left), _clean(right)
     return "", _clean(title)
+
 
 def _extract_field_by_label(text: str, labels: list[str]) -> str:
     """
@@ -56,6 +66,7 @@ def _extract_field_by_label(text: str, labels: list[str]) -> str:
             return _clean(m2.group(1))
     return ""
 
+
 def _guess_fields_from_text(page_text: str) -> dict:
     """
     Heuristics over page text to extract fields.
@@ -63,31 +74,29 @@ def _guess_fields_from_text(page_text: str) -> dict:
     text = _clean(page_text)
 
     # Status (e.g., 'In development', 'Rolling out', 'Launched', etc.)
-    status = _extract_field_by_label(text, [
-        "Status", "Roadmap status", "Public roadmap status", "publicRoadmapStatus"
-    ])
+    status = _extract_field_by_label(
+        text, ["Status", "Roadmap status", "Public roadmap status", "publicRoadmapStatus"]
+    )
 
     # Release phase (e.g., 'General Availability', 'Preview')
-    phase = _extract_field_by_label(text, [
-        "Release phase", "Release Phase"
-    ])
+    phase = _extract_field_by_label(text, ["Release phase", "Release Phase"])
 
     # Targeted dates (e.g., 'September CY2025')
-    targeted = _extract_field_by_label(text, [
-        "Targeted Release", "Release", "Targeted date", "Targeted dates", "Timeline"
-    ])
+    targeted = _extract_field_by_label(
+        text, ["Targeted Release", "Release", "Targeted date", "Targeted dates", "Timeline"]
+    )
 
     # Cloud instance (e.g., 'Worldwide (Standard Multi-Tenant), GCC')
-    cloud = _extract_field_by_label(text, [
-        "Cloud instance", "Cloud Instance", "Cloud Instances"
-    ])
+    cloud = _extract_field_by_label(text, ["Cloud instance", "Cloud Instance", "Cloud Instances"])
 
     # Short description
     # Try to find a 'Description' block; else fall back to first paragraph after title
     desc = _extract_field_by_label(text, ["Description"])
     if not desc:
         # Look for a big paragraph-ish section
-        m = re.search(r"(Description|Details)\s*:\s*(.+?)(?:\n[A-Z][^\n]{0,40}:|\Z)", text, flags=re.S)
+        m = re.search(
+            r"(Description|Details)\s*:\s*(.+?)(?:\n[A-Z][^\n]{0,40}:|\Z)", text, flags=re.S
+        )
         if m:
             desc = _clean(m.group(2))
         else:
@@ -101,6 +110,7 @@ def _guess_fields_from_text(page_text: str) -> dict:
         "cloud": cloud,
         "desc": desc,
     }
+
 
 def _extract_title(page) -> str:
     # Prefer the visible H1; fallback to document.title
@@ -117,12 +127,13 @@ def _extract_title(page) -> str:
     except Exception:
         return ""
 
-def fetch_ids_public(id_list: List[str]) -> List[List[str]]:
+
+def fetch_ids_public(id_list: list[str]) -> list[list[str]]:
     """
     Use Playwright (Chromium) to fetch each roadmap item.
     Returns rows in TABLE_HEADERS shape.
     """
-    rows: List[List[str]] = []
+    rows: list[list[str]] = []
     if not id_list:
         return rows
 

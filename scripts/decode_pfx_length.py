@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-import json
 import base64
+import json
 import sys
 from pathlib import Path
 
@@ -13,7 +13,7 @@ if not cfg_path.exists():
     print(f"❌ File not found: {cfg_path}", file=sys.stderr)
     sys.exit(1)
 
-with open(cfg_path, "r", encoding="utf-8") as f:
+with open(cfg_path, encoding="utf-8") as f:
     cfg = json.load(f)
 
 pfx_b64 = cfg.get("pfx_base64", "")
