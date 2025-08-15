@@ -49,14 +49,12 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      # Map secrets → env
       TENANT:            ${{ secrets.GRAPH_TENANT_ID }}
       CLIENT:            ${{ secrets.GRAPH_CLIENT_ID }}
       PFX_B64:           ${{ secrets.M365_PFX_BASE64 }}
       PFX_PASSWORD_ENV:  M365_PFX_PASSWORD
       M365_PFX_PASSWORD: ${{ secrets.M365_PFX_PASSWORD }}
 
-      # Map inputs → env
       TITLE:            ${{ github.event.inputs.TITLE }}
       PUBLIC_IDS:       ${{ github.event.inputs.PUBLIC_IDS }}
       MONTHS:           ${{ github.event.inputs.MONTHS }}
@@ -94,11 +92,6 @@ jobs:
           JSON_OUT="output/${TITLE}_master.json"
           STATS_OUT="output/${TITLE}_fetch_stats.json"
 
-          # Toggle flags based on env
-          GRAPH_FLAG=""
-          [[ -n "${TENANT}" && -n "${CLIENT}" && -n "${PFX_B64}" ]] || GRAPH_FLAG="--no-graph"
-
-          # Date flags
           DATE_FLAGS=()
           if [[ -n "${SINCE}" ]]; then
             DATE_FLAGS+=( --since "${SINCE}" )
@@ -106,7 +99,6 @@ jobs:
             DATE_FLAGS+=( --months "${MONTHS}" )
           fi
 
-          echo "Running fetch_messages_graph.py"
           python scripts/fetch_messages_graph.py \
             "${DATE_FLAGS[@]}" \
             --emit csv --out "${CSV_OUT}" \
@@ -121,38 +113,11 @@ jobs:
           echo "stats=${STATS_OUT}" >> "$GITHUB_OUTPUT"
 
       - name: Generate Markdown report
-        id: gen
-        uses: ./.github/actions/generate-report
-        with:
-          title:  ${{ env.TITLE }}
-          master: ${{ steps.fetch.outputs.csv }}
-          out:    output/${{ env.TITLE }}.md
-          since:  ${{ env.SINCE }}
-          months: ${{ env.MONTHS }}
-          no_window:     ${{ env.NO_WINDOW }}
-          cloud_general: ${{ env.CLOUD_GENERAL }}
-          cloud_gcc:     ${{ env.CLOUD_GCC }}
-          cloud_gcch:    ${{ env.CLOUD_GCCH }}
-          cloud_dod:     ${{ env.CLOUD_DOD }}
-          forced_ids:    ${{ env.PUBLIC_IDS }}
-
-      - name: Post-process Markdown to CSV/JSON (optional)
-        if: ${{ always() && steps.gen.outcome == 'success' }}
-        env:
-          IN_MD:   output/${{ env.TITLE }}.md
-          OUT_CSV: output/${{ env.TITLE }}.csv
-          OUT_JSON: output/${{ env.TITLE }}.json
         run: |
-          if [[ -f "${IN_MD}" ]]; then
-            python scripts/parse_roadmap_markdown.py \
-              --input "${IN_MD}" \
-              --csv   "${OUT_CSV}" \
-              --json  "${OUT_JSON}" \
-              --months "${MONTHS}" \
-              --since  "${SINCE}"
-          else
-            echo "No markdown found; skipping post-process."
-          fi
+          python -m scripts.ci_generate_report \
+            --title "${TITLE}" \
+            --master "${{ steps.fetch.outputs.csv }}" \
+            --out "output/${TITLE}.md"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -161,8 +126,6 @@ jobs:
           if-no-files-found: warn
           path: |
             output/${{ env.TITLE }}.md
-            output/${{ env.TITLE }}.csv
-            output/${{ env.TITLE }}.json
             ${{ steps.fetch.outputs.csv }}
             ${{ steps.fetch.outputs.json }}
             ${{ steps.fetch.outputs.stats }}

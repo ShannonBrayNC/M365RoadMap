@@ -1,9 +1,2 @@
-# Normalize line endings across platforms
-* text=auto
-
-# Force LF for scripts & configs used in Linux CI
-*.sh text eol=lf
-*.py text eol=lf
-*.yml text eol=lf
+*.yml  text eol=lf
 *.yaml text eol=lf
-*.md text eol=lf
