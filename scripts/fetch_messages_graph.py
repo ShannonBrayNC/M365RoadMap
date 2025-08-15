@@ -419,6 +419,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--config", help="Path to graph_config.json (or use TENANT/CLIENT/PFX_B64 env)")
     p.add_argument("--since", help="ISO date (YYYY-MM-DD) start of window")
     p.add_argument("--months", type=int, help="Lookback months (ignored if --since provided)")
+    p.add_argument("--no-window", action="store_true", help="Disable months/since lookback filtering")
     p.add_argument("--ids", default="", help="Comma-separated Roadmap IDs to force-include")
     p.add_argument("--tenant-cloud", default="", help="Deprecated single cloud filter")
     p.add_argument("--cloud", action="append", default=[], help="Repeatable cloud filters (General, GCC, GCC High, DoD)")
@@ -435,12 +436,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     for c in args.cloud:
         clouds.append("Worldwide (Standard Multi-Tenant)" if c.strip().lower() == "general" else c)
 
+    # ----- compute 'since' unless --no-window -----
     since: Optional[dt.datetime] = None
-    if args.since:
-        since = _parse_date(args.since)
-    elif args.months:
-        days = int(max(1, args.months) * 30.5)
-        since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
+    if not args.no_window:
+        if args.since:
+            since = _parse_date(args.since)
+        elif args.months:
+            days = int(max(1, args.months) * 30.5)
+            since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
+    # else: since stays None → no date filtering anywhere
 
     forced_ids = [s.strip() for s in (args.ids or "").split(",") if s.strip()]
 

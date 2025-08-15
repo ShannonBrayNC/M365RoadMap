@@ -2,25 +2,11 @@
   rev: 1.7.9
   hooks:
     - id: bandit
-      name: bandit (repo sources only)
-      args:
-        - -q
-        - -r
-        - scripts
-        - tests
-        - --severity-level
-        - HIGH
-        - --confidence-level
-        - HIGH
-      exclude: >
+      args: ["-q", "-r", "."]
+      exclude: |
         (?x)(
           ^\.venv/|
-          ^env/|
           ^venv/|
-          ^output/|
-          ^\.git/|
-          .*/site-packages/|
-          ^build/|
-          ^dist/
+          ^env/|
+          ^output/
         )
-      pass_filenames: false

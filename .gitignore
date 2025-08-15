@@ -41,3 +41,4 @@ graph_config.inline.json
 scripts/*.bak
 prompts/*.bak
 .pre-commit-config.yaml
+Fetch-MessageGraph.ps1

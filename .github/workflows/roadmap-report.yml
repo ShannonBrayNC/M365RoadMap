@@ -12,15 +12,22 @@ on:
         required: false
         default: ""
       MONTHS:
-        description: Lookback window in months (leave blank to disable)
+        description: Lookback window in months (leave blank for none)
         required: false
         default: ""
       SINCE:
-        description: ISO date (YYYY-MM-DD) to start from (overrides MONTHS)
+        description: ISO date (YYYY-MM-DD) to start from (overrides months; blank for none)
         required: false
         default: ""
 
-      # Cloud checkboxes (default)
+      # Hard switch: ignore any date filters
+      NO_WINDOW:
+        type: boolean
+        required: false
+        default: false
+        description: Ignore months/since (no date filter at all)
+
+      # Cloud checkboxes
       CLOUD_GENERAL:
         type: boolean
         required: false
@@ -48,7 +55,7 @@ on:
       #   required: false
       #   default: General
 
-      # Optional AI
+      # Optional AI (not required for fetching)
       USE_OPENAI:
         type: boolean
         required: false
@@ -71,6 +78,7 @@ jobs:
       PUBLIC_IDS: ${{ github.event.inputs.PUBLIC_IDS }}
       MONTHS: ${{ github.event.inputs.MONTHS }}
       SINCE: ${{ github.event.inputs.SINCE }}
+      NO_WINDOW: ${{ github.event.inputs.NO_WINDOW }}
 
       CLOUD_GENERAL: ${{ github.event.inputs.CLOUD_GENERAL }}
       CLOUD_GCC: ${{ github.event.inputs.CLOUD_GCC }}
@@ -88,7 +96,7 @@ jobs:
       CLIENT: ${{ secrets.GRAPH_CLIENT_ID }}
       PFX_B64: ${{ secrets.M365_PFX_BASE64 }}
       PFX_PASSWORD_ENV: M365_PFX_PASSWORD
-      M365_PFX_PASSWORD: ${{ secrets.M365_PFX_PASSWORD }}   # <-- ensure value present
+      M365_PFX_PASSWORD: ${{ secrets.M365_PFX_PASSWORD }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       OPENAI_ORG_ID: ${{ secrets.OPENAI_ORG_ID }}
 
@@ -135,14 +143,14 @@ jobs:
               open("graph_config.json","w",encoding="utf-8").write(json.dumps(cfg, ensure_ascii=False))
               print("graph_config.json written.")
             PY
-            echo "graph_cfg=graph_config.json" >> "$GITHUB_OUTPUT"
-          elif [[ -f "${CFG_PATH}" ]]; then
-            echo "Existing ${CFG_PATH} will be used."
-            echo "graph_cfg=${CFG_PATH}" >> "$GITHUB_OUTPUT"
-          else
-            echo "graph_cfg=" >> "$GITHUB_OUTPUT"
-            echo "No Graph config available; will proceed if --no-graph is used."
-          fi
+              echo "graph_cfg=graph_config.json" >> "$GITHUB_OUTPUT"
+            elif [[ -f "${CFG_PATH}" ]]; then
+              echo "Existing ${CFG_PATH} will be used."
+              echo "graph_cfg=${CFG_PATH}" >> "$GITHUB_OUTPUT"
+            else
+              echo "graph_cfg=" >> "$GITHUB_OUTPUT"
+              echo "No Graph config available; will proceed if --no-graph is used."
+            fi
 
       - name: Build cloud args (booleans)
         id: clouds
@@ -157,6 +165,16 @@ jobs:
           if [[ "$(low "${{ github.event.inputs.CLOUD_DOD }}")" == "true" ]]; then args+=( --cloud "DoD" ); fi
           printf 'clouds=%q' "${args[*]}" >> "$GITHUB_OUTPUT"
 
+      - name: Debug inputs (one-time; safe to keep)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::notice:: TITLE=[$TITLE]"
+          echo "::notice:: SINCE=[$SINCE]"
+          echo "::notice:: MONTHS=[$MONTHS]"
+          echo "::notice:: NO_WINDOW=[$NO_WINDOW]"
+          echo "::notice:: CLOUDS=[GEN:$CLOUD_GENERAL GCC:$CLOUD_GCC GCCH:$CLOUD_GCCH DOD:$CLOUD_DOD]"
+
       - name: Fetch master data (Graph/Public/RSS)
         id: fetch
         shell: bash
@@ -168,10 +186,14 @@ jobs:
           STATS_OUT="output/${TITLE}_fetch_stats.json"
 
           DATE_FLAGS=()
-          if [[ -n "${SINCE}" ]]; then
-            DATE_FLAGS+=( --since "${SINCE}" )
-          elif [[ -n "${MONTHS}" ]]; then
-            DATE_FLAGS+=( --months "${MONTHS}" )
+          if [[ "${NO_WINDOW}" == "true" ]]; then
+            DATE_FLAGS+=( --no-window )
+          else
+            if [[ -n "${SINCE}" ]]; then
+              DATE_FLAGS+=( --since "${SINCE}" )
+            elif [[ -n "${MONTHS}" ]]; then
+              DATE_FLAGS+=( --months "${MONTHS}" )
+            fi
           fi
 
           CLOUDS_ARR=()
