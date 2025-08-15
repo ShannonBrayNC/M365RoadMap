@@ -183,6 +183,21 @@ jobs:
           echo "json=${JSON_OUT}"   >> "$GITHUB_OUTPUT"
           echo "stats=${STATS_OUT}" >> "$GITHUB_OUTPUT"
 
+
+      - name: Generate Markdown report
+        id: gen
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          MASTER="${{ steps.fetch.outputs.csv }}"
+          OUT_MD="output/${TITLE}.md"
+          echo "Generating Markdown from ${MASTER} -> ${OUT_MD}"
+          python -m scripts.generate_report --title "${TITLE}" --master "${MASTER}" --out "${OUT_MD}"
+          echo "md=${OUT_MD}" >> "$GITHUB_OUTPUT"
+
+
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
