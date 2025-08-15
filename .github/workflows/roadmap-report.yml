@@ -8,7 +8,7 @@ on:
         required: false
         default: roadmap_report
       PUBLIC_IDS:
-        description: Comma-separated Roadmap IDs to force include (optional)
+        description: Comma-separated Roadmap IDs to force include
         required: false
         default: ""
       MONTHS:
@@ -20,50 +20,50 @@ on:
         required: false
         default: ""
       NO_WINDOW:
-        description: Disable date window entirely
+        description: Exclude items with rollout window only (true/false)
         required: false
-        type: boolean
-        default: false
+        default: "true"
       CLOUD_GENERAL:
-        description: Include Worldwide (Standard Multi-Tenant) in banner
+        description: Include General (Worldwide) cloud
         required: false
-        type: boolean
-        default: true
+        default: "true"
       CLOUD_GCC:
-        description: Include GCC in banner
+        description: Include GCC cloud
         required: false
-        type: boolean
-        default: false
+        default: "false"
       CLOUD_GCCH:
-        description: Include GCC High in banner
+        description: Include GCC High cloud
         required: false
-        type: boolean
-        default: false
+        default: "false"
       CLOUD_DOD:
-        description: Include DoD in banner
+        description: Include DoD cloud
         required: false
-        type: boolean
-        default: false
+        default: "false"
+
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      TENANT:            ${{ secrets.GRAPH_TENANT_ID }}
-      CLIENT:            ${{ secrets.GRAPH_CLIENT_ID }}
-      PFX_B64:           ${{ secrets.M365_PFX_BASE64 }}
-      PFX_PASSWORD_ENV:  M365_PFX_PASSWORD
+      # Secrets → env (Graph)
+      TENANT: ${{ secrets.GRAPH_TENANT_ID }}
+      CLIENT: ${{ secrets.GRAPH_CLIENT_ID }}
+      PFX_B64: ${{ secrets.M365_PFX_BASE64 }}
+      PFX_PASSWORD_ENV: M365_PFX_PASSWORD
       M365_PFX_PASSWORD: ${{ secrets.M365_PFX_PASSWORD }}
 
-      TITLE:            ${{ github.event.inputs.TITLE }}
-      PUBLIC_IDS:       ${{ github.event.inputs.PUBLIC_IDS }}
-      MONTHS:           ${{ github.event.inputs.MONTHS }}
-      SINCE:            ${{ github.event.inputs.SINCE }}
-      NO_WINDOW:        ${{ github.event.inputs.NO_WINDOW }}
-      CLOUD_GENERAL:    ${{ github.event.inputs.CLOUD_GENERAL }}
-      CLOUD_GCC:        ${{ github.event.inputs.CLOUD_GCC }}
-      CLOUD_GCCH:       ${{ github.event.inputs.CLOUD_GCCH }}
-      CLOUD_DOD:        ${{ github.event.inputs.CLOUD_DOD }}
+      # Inputs → env
+      TITLE: ${{ github.event.inputs.TITLE }}
+      PUBLIC_IDS: ${{ github.event.inputs.PUBLIC_IDS }}
+      MONTHS: ${{ github.event.inputs.MONTHS }}
+      SINCE: ${{ github.event.inputs.SINCE }}
+      NO_WINDOW: ${{ github.event.inputs.NO_WINDOW }}
+      CLOUD_GENERAL: ${{ github.event.inputs.CLOUD_GENERAL }}
+      CLOUD_GCC: ${{ github.event.inputs.CLOUD_GCC }}
+      CLOUD_GCCH: ${{ github.event.inputs.CLOUD_GCCH }}
+      CLOUD_DOD: ${{ github.event.inputs.CLOUD_DOD }}
 
     steps:
       - name: Checkout
@@ -75,58 +75,162 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
+        shell: bash
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [[ -f requirements.txt ]]; then
+            pip install -r requirements.txt
+          else
+            pip install requests beautifulsoup4 lxml msal cryptography pandas
+          fi
 
       - name: Prepare Graph config (no heredocs)
+        id: graphcfg
+        shell: bash
         run: |
-          python -m scripts.ci_write_graph_config
+          set -euo pipefail
+          CFG_PATH="graph_config.json"
+          PFX="${PFX_B64:-}"
+
+          # If secret missing but file exists, try to re-use pfx_base64 from it
+          if [[ -z "${PFX}" && -f "${CFG_PATH}" ]]; then
+            echo "Reading pfx_base64 from ${CFG_PATH}"
+            PFX="$(python -c "import json;print(json.load(open('${CFG_PATH}','r',encoding='utf-8')).get('pfx_base64',''))")"
+          fi
+
+          if [[ -n "${TENANT:-}" && -n "${CLIENT:-}" && -n "${PFX:-}" ]]; then
+            python -c "import os,json; cfg={'tenant_id':os.environ.get('TENANT',''),
+              'client_id':os.environ.get('CLIENT',''),
+              'pfx_base64':os.environ.get('PFX_B64',''),
+              'pfx_password_env':os.environ.get('PFX_PASSWORD_ENV','M365_PFX_PASSWORD'),
+              'graph_base':'https://graph.microsoft.com/v1.0',
+              'authority_base':'https://login.microsoftonline.com'};
+              open('graph_config.json','w',encoding='utf-8').write(json.dumps(cfg,ensure_ascii=False))"
+            echo "graph_config.json written."
+            echo "graph_cfg=graph_config.json" >> "$GITHUB_OUTPUT"
+          elif [[ -f "${CFG_PATH}" ]]; then
+            echo "Using existing ${CFG_PATH}"
+            echo "graph_cfg=${CFG_PATH}" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::No Graph config available; Graph calls may fail and only RSS/public will be used."
+            echo "graph_cfg=" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Fetch master data (Graph/Public/RSS)
         id: fetch
+        shell: bash
         run: |
           set -euo pipefail
           mkdir -p output
-          CSV_OUT="output/${TITLE}_master.csv"
-          JSON_OUT="output/${TITLE}_master.json"
-          STATS_OUT="output/${TITLE}_fetch_stats.json"
 
+          OUT_CSV="output/${TITLE}_master.csv"
+          OUT_JSON="output/${TITLE}_master.json"
+          OUT_STATS="output/${TITLE}_fetch_stats.json"
+
+          # Date flags
           DATE_FLAGS=()
-          if [[ -n "${SINCE}" ]]; then
-            DATE_FLAGS+=( --since "${SINCE}" )
-          elif [[ -n "${MONTHS}" ]]; then
-            DATE_FLAGS+=( --months "${MONTHS}" )
-          fi
+          [[ -n "${SINCE}" ]] && DATE_FLAGS+=( --since "${SINCE}" )
+          [[ -n "${MONTHS}" ]] && DATE_FLAGS+=( --months "${MONTHS}" )
 
+          # Cloud flags (use array so multi-word survives)
+          CLOUD_FLAGS=()
+          [[ "${CLOUD_GENERAL,,}" == "true" ]] && CLOUD_FLAGS+=( --cloud "Worldwide (Standard Multi-Tenant)" )
+          [[ "${CLOUD_GCC,,}" == "true"     ]] && CLOUD_FLAGS+=( --cloud "GCC" )
+          [[ "${CLOUD_GCCH,,}" == "true"    ]] && CLOUD_FLAGS+=( --cloud "GCC High" )
+          [[ "${CLOUD_DOD,,}" == "true"     ]] && CLOUD_FLAGS+=( --cloud "DoD" )
+
+          # Window flag
+          WINDOW_FLAG=()
+          [[ "${NO_WINDOW,,}" == "true" ]] && WINDOW_FLAG+=( --no-window )
+
+          # Config flag
+          CFG_FLAG=()
+          [[ -n "${{ steps.graphcfg.outputs.graph_cfg }}" ]] && CFG_FLAG+=( --config "${{ steps.graphcfg.outputs.graph_cfg }}" )
+
+          echo "Running fetch_messages_graph.py with:"
+          echo "  ${CFG_FLAG[*]} ${WINDOW_FLAG[*]} ${DATE_FLAGS[*]} ${CLOUD_FLAGS[*]} --emit csv/json"
+
+          # CSV
           python scripts/fetch_messages_graph.py \
+            "${CFG_FLAG[@]}" \
+            "${WINDOW_FLAG[@]}" \
             "${DATE_FLAGS[@]}" \
-            --emit csv --out "${CSV_OUT}" \
-            --stats-out "${STATS_OUT}"
+            "${CLOUD_FLAGS[@]}" \
+            --emit csv --out "${OUT_CSV}" \
+            --stats-out "${OUT_STATS}"
 
+          # JSON
           python scripts/fetch_messages_graph.py \
+            "${CFG_FLAG[@]}" \
+            "${WINDOW_FLAG[@]}" \
             "${DATE_FLAGS[@]}" \
-            --emit json --out "${JSON_OUT}"
+            "${CLOUD_FLAGS[@]}" \
+            --emit json --out "${OUT_JSON}"
 
-          echo "csv=${CSV_OUT}"     >> "$GITHUB_OUTPUT"
-          echo "json=${JSON_OUT}"   >> "$GITHUB_OUTPUT"
-          echo "stats=${STATS_OUT}" >> "$GITHUB_OUTPUT"
+          echo "csv=${OUT_CSV}"     >> "$GITHUB_OUTPUT"
+          echo "json=${OUT_JSON}"   >> "$GITHUB_OUTPUT"
+          echo "stats=${OUT_STATS}" >> "$GITHUB_OUTPUT"
 
       - name: Generate Markdown report
+        id: gen
+        shell: bash
         run: |
-          python -m scripts.ci_generate_report \
+          set -euo pipefail
+          MASTER="${{ steps.fetch.outputs.csv }}"
+          OUT_MD="output/${TITLE}.md"
+
+          DATE_FLAGS=()
+          [[ -n "${SINCE}" ]] && DATE_FLAGS+=( --since "${SINCE}" )
+          [[ -n "${MONTHS}" ]] && DATE_FLAGS+=( --months "${MONTHS}" )
+
+          CLOUD_FLAGS=()
+          [[ "${CLOUD_GENERAL,,}" == "true" ]] && CLOUD_FLAGS+=( --cloud "Worldwide (Standard Multi-Tenant)" )
+          [[ "${CLOUD_GCC,,}" == "true"     ]] && CLOUD_FLAGS+=( --cloud "GCC" )
+          [[ "${CLOUD_GCCH,,}" == "true"    ]] && CLOUD_FLAGS+=( --cloud "GCC High" )
+          [[ "${CLOUD_DOD,,}" == "true"     ]] && CLOUD_FLAGS+=( --cloud "DoD" )
+
+          WINDOW_FLAG=()
+          [[ "${NO_WINDOW,,}" == "true" ]] && WINDOW_FLAG+=( --no-window )
+
+          echo "Generating Markdown from ${MASTER} -> ${OUT_MD}"
+          python -m scripts.generate_report \
             --title "${TITLE}" \
-            --master "${{ steps.fetch.outputs.csv }}" \
-            --out "output/${TITLE}.md"
+            --master "${MASTER}" \
+            --out "${OUT_MD}" \
+            "${WINDOW_FLAG[@]}" \
+            "${DATE_FLAGS[@]}" \
+            "${CLOUD_FLAGS[@]}" \
+            --forced-ids "${PUBLIC_IDS}"
+
+          echo "md=${OUT_MD}" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.TITLE }}
+          name: ${{ github.event.inputs.TITLE }}
           if-no-files-found: warn
           path: |
-            output/${{ env.TITLE }}.md
-            ${{ steps.fetch.outputs.csv }}
-            ${{ steps.fetch.outputs.json }}
-            ${{ steps.fetch.outputs.stats }}
+            output/${{ github.event.inputs.TITLE }}.md
+            output/${{ github.event.inputs.TITLE }}.csv
+            output/${{ github.event.inputs.TITLE }}.json
+            output/${{ github.event.inputs.TITLE }}_master.csv
+            output/${{ github.event.inputs.TITLE }}_master.json
+            output/${{ github.event.inputs.TITLE }}_fetch_stats.json
             output/*
+
+      - name: Write fetch stats to job summary
+        if: always()
+        shell: bash
+        env:
+          STATS: ${{ steps.fetch.outputs.stats }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Fetch Stats"
+            if [[ -n "${STATS:-}" && -f "$STATS" ]]; then
+              python scripts/write_fetch_stats_summary.py "$STATS"
+            else
+              echo "_No stats file produced._"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
