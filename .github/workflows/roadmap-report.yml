@@ -78,9 +78,12 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
+            # ensure the markdown renderer is present even if not in requirements.txt
+            pip install Markdown
           else
-            pip install requests beautifulsoup4 lxml msal cryptography pandas markdown
+            pip install requests beautifulsoup4 lxml msal cryptography pandas Markdown
           fi
+
 
       - name: Prepare graph_config.json (no heredocs)
         id: graphcfg
@@ -173,12 +176,17 @@ jobs:
           [ -f "${IN_MD}" ] || exit 0
           OUT_CSV="output/${TITLE}.csv"
           OUT_JSON="output/${TITLE}.json"
+
+          DATE_FLAGS=()
+          [ -n "${SINCE}" ] && DATE_FLAGS+=(--since "${SINCE}")
+          [ -n "${MONTHS}" ] && DATE_FLAGS+=(--months "${MONTHS}")
+
           python scripts/parse_roadmap_markdown.py \
             --input "${IN_MD}" \
             --csv   "${OUT_CSV}" \
             --json  "${OUT_JSON}" \
-            --months "${MONTHS}" \
-            --since  "${SINCE}"
+            "${DATE_FLAGS[@]}"
+
 
       - name: Render HTML
         if: always()
