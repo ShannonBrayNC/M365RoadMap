@@ -46,54 +46,28 @@ except ImportError:
     from report_templates import CLOUD_LABELS, normalize_clouds, parse_date_soft  # noqa
 
 # ------------------------------- CLI ---------------------------------
+def _as_set(x):
+    """Normalize any value to a set of strings."""
+    if x is None:
+        return set()
+    if isinstance(x, (set, list, tuple)):
+        return set(map(str, x))
+    return {str(x)}
 
-def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", help="graph_config.json (or use env via GraphConfig.from_env)")
-    ap.add_argument("--since", default="", help="YYYY-MM-DD lower bound for LastModified/Published date")
-    ap.add_argument("--months", type=int, default=None, help="Lookback window in months (approx 30d each)")
-    ap.add_argument("--ids", default="", help="Comma-separated Roadmap IDs to force include")
-    ap.add_argument(
-        "--tenant-cloud",
-        default="",
-        help="Deprecated alias for --cloud; still accepted for compatibility.",
-    )
-    # Accept multi-word clouds without quotes: nargs="+" captures tokens like
-    # --cloud Worldwide (Standard Multi-Tenant) as ['Worldwide','(Standard','Multi-Tenant)']
-    ap.add_argument(
-        "--cloud",
-        action="append",
-        nargs="+",
-        default=None,
-        help="Cloud(s) to include (repeatable). Examples: "
-             "'General', 'GCC', 'GCC High', 'DoD', 'Worldwide (Standard Multi-Tenant)'.",
-    )
-    ap.add_argument("--no-graph", action="store_true", help="Skip Graph calls")
-    ap.add_argument("--no-public-scrape", action="store_true", help="Skip RSS/public fallback")
-    ap.add_argument(
-        "--emit",
-        choices=("csv", "json"),
-        required=True,
-        help="Output format",
-    )
-    ap.add_argument("--out", required=True, help="Output file path")
-    ap.add_argument("--no-window", action="store_true", help="Disable date windowing entirely")
-    ap.add_argument("--stats-out", default="", help="Optional path to write a small stats JSON")
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(...)
+    # allow multiple --cloud flags: --cloud "GCC" --cloud "DoD"
+    p.add_argument("--cloud", dest="clouds", action="append", default=[], help="Cloud filter; repeatable")
+    # ... your other args ...
+    args = p.parse_args(argv)
 
-    args = ap.parse_args(argv)
+    # Normalize clouds into a set
+    selected: set[str] = set()
+    for c in args.clouds:
+        normalized = normalize_clouds(c)  # may be "General" OR ["General"]
+        selected |= _as_set(normalized)
 
-    # Flatten --cloud where each occurrence may be a list of tokens (nargs="+")
-    selected: Set[str] = set()
-    if args.cloud:
-        for parts in args.cloud:
-            normalized = normalize_clouds(" ".join(parts))
-            selected |= normalized
-
-    # Back-compat: --tenant-cloud
-    if args.tenant_cloud:
-        selected |= normalize_clouds(args.tenant_cloud)
-
-    args.selected_clouds = selected
+    args.clouds = selected  # downstream code can rely on a set[str]
     return args
 
 
