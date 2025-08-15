@@ -135,11 +135,11 @@ jobs:
             python - <<'PY'
               import os, json
               cfg={"tenant_id":os.environ.get("TENANT",""),
-                  "client_id":os.environ.get("CLIENT",""),
-                  "pfx_base64":os.environ.get("PFX_B64",""),
-                  "pfx_password_env":os.environ.get("PFX_PASSWORD_ENV","M365_PFX_PASSWORD"),
-                  "graph_base":"https://graph.microsoft.com/v1.0",
-                  "authority_base":"https://login.microsoftonline.com"}
+                "client_id":os.environ.get("CLIENT",""),
+                "pfx_base64":os.environ.get("PFX_B64",""),
+                "pfx_password_env":os.environ.get("PFX_PASSWORD_ENV","M365_PFX_PASSWORD"),
+                "graph_base":"https://graph.microsoft.com/v1.0",
+                "authority_base":"https://login.microsoftonline.com"}
               open("graph_config.json","w",encoding="utf-8").write(json.dumps(cfg, ensure_ascii=False))
               print("graph_config.json written.")
             PY
