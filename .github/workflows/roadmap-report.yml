@@ -87,8 +87,7 @@ jobs:
             pip install requests beautifulsoup4 lxml feedparser python-dateutil pandas msal cryptography
           fi
 
-      # ---------- FIXED: no split heredocs ----------
-      - name: Prepare Graph config
+      - name: Prepare Graph config (no heredocs)
         id: graphcfg
         shell: bash
         run: |
@@ -96,30 +95,17 @@ jobs:
           CFG_PATH="graph_config.json"
           PFX="${PFX_B64:-}"
 
-          # If PFX secret missing but a config file exists, read pfx_base64 from it using a one-liner
+          # If secret missing but a config file exists, read pfx_base64 from it
           if [[ -z "${PFX}" && -f "${CFG_PATH}" ]]; then
             echo "Reading pfx_base64 from ${CFG_PATH}"
             PFX="$(python -c 'import json,sys; print(json.load(open(sys.argv[1],\"r\",encoding=\"utf-8\")).get(\"pfx_base64\",\"\"))' "${CFG_PATH}")"
           fi
 
+          # Small debug (masked): show lengths only
+          python -c 'import os,base64; b=os.environ.get("PFX_B64",""); print(f"PFX_B64 length: {len(b)}"); print(f"Decoded PFX bytes: {len(base64.b64decode(b)) if b else 0}")'
+
           if [[ -n "${TENANT:-}" && -n "${CLIENT:-}" && -n "${PFX:-}" ]]; then
-            # Write graph_config.json safely using argv (avoids env quoting issues)
-            python - "$TENANT" "$CLIENT" "$PFX" "$PFX_PASSWORD_ENV" <<
-            'PY'
-              import json, sys
-              tenant, client, pfx_b64, pfx_pwd_env = sys.argv[1:5]
-              cfg = 
-              {
-                "tenant_id": tenant,
-                "client_id": client,
-                "pfx_base64": pfx_b64,
-                "pfx_password_env": pfx_pwd_env or "M365_PFX_PASSWORD",
-                "graph_base": "https://graph.microsoft.com/v1.0",
-                "authority_base": "https://login.microsoftonline.com",
-              }
-              open("graph_config.json","w",encoding="utf-8").write(json.dumps(cfg, ensure_ascii=False))
-              print("graph_config.json written.")
-            PY
+            python -c 'import os, json; cfg={"tenant_id":os.environ.get("TENANT",""),"client_id":os.environ.get("CLIENT",""),"pfx_base64":os.environ.get("PFX_B64",""),"pfx_password_env":os.environ.get("PFX_PASSWORD_ENV","M365_PFX_PASSWORD"),"graph_base":"https://graph.microsoft.com/v1.0","authority_base":"https://login.microsoftonline.com"}; open("graph_config.json","w",encoding="utf-8").write(json.dumps(cfg, ensure_ascii=False)); print("graph_config.json written.")'
             echo "graph_cfg=graph_config.json" >> "$GITHUB_OUTPUT"
           elif [[ -f "${CFG_PATH}" ]]; then
             echo "Using existing ${CFG_PATH}"
@@ -140,7 +126,8 @@ jobs:
           if [[ "$(tolow "${CLOUD_GCC}")" == "true" ]]; then args+=( --cloud "GCC" ); fi
           if [[ "$(tolow "${CLOUD_GCCH}")" == "true" ]]; then args+=( --cloud "GCC High" ); fi
           if [[ "$(tolow "${CLOUD_DOD}")" == "true" ]]; then args+=( --cloud "DoD" ); fi
-          printf 'clouds=%q' "${args[*]}" >> "$GITHUB_OUTPUT"
+          # shellcheck disable=SC2125
+          echo "clouds=${args[*]}" >> "$GITHUB_OUTPUT"
 
       - name: Debug inputs
         shell: bash
@@ -172,9 +159,9 @@ jobs:
             fi
           fi
 
-          CLOUDS_EXPANDED=${{ steps.clouds.outputs.clouds }}
-          # shellcheck disable=SC2206
-          CLOUDS_ARR=(${CLOUDS_EXPANDED})
+          CLOUDS_EXPANDED="${{ steps.clouds.outputs.clouds }}"
+          # Split CLOUDS_EXPANDED by spaces into array safely
+          IFS=' ' read -r -a CLOUDS_ARR <<< "${CLOUDS_EXPANDED}"
 
           CFG_ARG=()
           if [[ -n "${{ steps.graphcfg.outputs.graph_cfg }}" ]]; then
@@ -182,6 +169,7 @@ jobs:
           fi
 
           echo "Running fetch_messages_graph.py with: ${CFG_ARG[*]} ${DATE_FLAGS[*]} ${CLOUDS_ARR[*]}"
+
           python scripts/fetch_messages_graph.py \
             "${CFG_ARG[@]}" \
             "${DATE_FLAGS[@]}" \
