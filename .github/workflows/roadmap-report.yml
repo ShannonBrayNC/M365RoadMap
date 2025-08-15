@@ -19,10 +19,6 @@ on:
         description: ISO date (YYYY-MM-DD) to start from (overrides months; blank for none)
         required: false
         default: ""
-      NO_WINDOW:
-        description: Exclude items with delivery windows (true/false)
-        required: false
-        default: "true"
       CLOUD_GENERAL:
         description: Include Worldwide (General)
         required: false
