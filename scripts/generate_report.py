@@ -3,204 +3,164 @@ from __future__ import annotations
 
 import argparse
 import csv
-import os
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+import datetime as dt
+import re
+from pathlib import Path
+from typing import Dict, Iterable, List, Tuple
 
-import pandas as pd
-
-# Robust imports so it works as "python -m scripts.generate_report" or direct "python scripts/generate_report.py"
-try:
-    from scripts.report_templates import FeatureRecord, render_feature_markdown  # type: ignore
-except ModuleNotFoundError:
-    import sys
-    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-    try:
-        from scripts.report_templates import FeatureRecord, render_feature_markdown  # type: ignore
-    except ModuleNotFoundError:
-        from report_templates import FeatureRecord, render_feature_markdown  # type: ignore
+from scripts.report_templates import FeatureRecord, render_feature_markdown
 
 
-def _read_master_csv(path: str) -> pd.DataFrame:
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Master CSV not found: {path}")
-    # Permissive CSV read
-    return pd.read_csv(
-        path,
-        dtype=str,
-        keep_default_na=False,
-        na_values=[],
-        quoting=csv.QUOTE_MINIMAL,
-        on_bad_lines="skip",
+def _first(row: Dict[str, str], names: Iterable[str], default: str = "") -> str:
+    for n in names:
+        if n in row and str(row[n]).strip():
+            return str(row[n]).strip()
+    return default
+
+
+ID_PATTERNS = [
+    re.compile(r"\bRoadmap ID[:\s]*([0-9]{3,8})\b", re.I),
+    re.compile(r"/details/([0-9]{3,8})\b", re.I),
+    re.compile(r"/feature/([0-9]{3,8})\b", re.I),
+    re.compile(r"\b(?:FR|ID)[:\s#]*([0-9]{3,8})\b", re.I),
+]
+
+
+def _extract_id(row: Dict[str, str]) -> str:
+    id_ = _first(row, ["roadmap_id", "id", "feature_id"])
+    if id_ and id_.isdigit():
+        return id_
+    hay = " ".join(
+        [
+            _first(row, ["roadmap_url", "link", "url"]),
+            _first(row, ["body_html", "body", "description", "summary"]),
+            _first(row, ["title", "name", "subject"]),
+        ]
     )
+    for pat in ID_PATTERNS:
+        m = pat.search(hay or "")
+        if m:
+            return m.group(1)
+    return ""
 
 
-def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    # Normalize to a common set of names we reference later
-    rename_map = {
-        "Feature ID": "feature_id",
-        "Roadmap ID": "feature_id",
-        "ID": "feature_id",
-        "Title": "title",
-        "Feature Title": "title",
-        "Workload": "workload",
-        "Cloud": "cloud",
-        "Clouds": "cloud",
-        "Tenant Cloud": "cloud",
-        "Status": "status",
-        "Release Phase": "releasePhase",
-        "Phase": "releasePhase",
-        "Release Date": "releaseDate",
-        "Target": "releaseDate",
-        "Last Modified": "lastModified",
-        "LastModified": "lastModified",
-        "Body": "description",
-        "Body Text": "description",
-        "Source": "source",
-    }
-    cols = {c: rename_map.get(c, c) for c in df.columns}
-    return df.rename(columns=cols)
-
-
-def _best_sort_key(row: Dict[str, str]) -> Tuple[int, str]:
-    """
-    Sort primarily by lastModified desc (missing last), then by feature_id asc.
-    Using negative timestamp for descending behavior.
-    """
-    lm = row.get("lastModified", "") or row.get("lastModifiedDateTime", "")
+def _last_modified(row: Dict[str, str]) -> str:
+    raw = _first(
+        row,
+        ["last_modified", "lastModifiedDateTime", "last_modified_utc", "modified", "updated"],
+    )
+    if not raw:
+        return ""
+    # Normalize to Z
     try:
-        for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%m/%d/%Y", "%Y/%m/%d"):
-            try:
-                dt = datetime.strptime(lm[: len(fmt)], fmt)
-                return (-int(dt.timestamp()), row.get("feature_id", row.get("id", "")))
-            except Exception:
-                pass
+        # Try common ISO forms
+        ts = raw.replace("Z", "+00:00")
+        return dt.datetime.fromisoformat(ts).astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
     except Exception:
-        pass
-    return (0, row.get("feature_id", row.get("id", "")))
+        return raw  # keep original if unknown
 
 
-def _group_unique_features(df: pd.DataFrame) -> List[Dict[str, str]]:
-    """
-    Collapse duplicates by feature_id, keeping the most recently modified.
-    """
-    rows = df.to_dict(orient="records")
-    by_id: Dict[str, Dict[str, str]] = {}
-    for r in rows:
-        fid = (r.get("feature_id") or r.get("id") or "").strip()
-        key = fid or f"_noid_{len(by_id)}"
-        if key not in by_id:
-            by_id[key] = r
-        else:
-            # Keep newer
-            if _best_sort_key(r) >= _best_sort_key(by_id[key]):
-                by_id[key] = r
-    out = list(by_id.values())
-    out.sort(key=_best_sort_key, reverse=False)  # negative ts already in key
+def _sources(row: Dict[str, str]) -> List[str]:
+    s = _first(row, ["source", "source_type", "source_kind"]).lower()
+    out: List[str] = []
+    if "graph" in s:
+        out.append("Graph")
+    if "rss" in s:
+        out.append("RSS")
+    if "public" in s:
+        out.append("Public JSON")
+    if not out and s:
+        out.append(s.title())
     return out
 
 
-def _make_toc(features: List[Dict[str, str]]) -> str:
-    """
-    Build a Markdown Table of Contents with links to per-feature anchors.
-    """
-    lines = ["## Table of contents", ""]
-    for row in features:
-        fid = (row.get("feature_id") or row.get("id") or "").strip() or "noid"
-        title = (row.get("title") or row.get("feature_title") or "").strip() or "(Untitled Feature)"
-        lines.append(f"- [{fid} — {title}](#feature-{fid})")
-    lines.append("")
-    return "\n".join(lines)
+def _dedupe_keep_best(a: Dict[str, str], b: Dict[str, str]) -> Dict[str, str]:
+    # Prefer richer title, latest modified
+    pick = dict(a)
+    if len(_first(b, ["title", "name", "subject"])) > len(_first(a, ["title", "name", "subject"])):
+        pick = dict(b)
+    ta = _last_modified(a)
+    tb = _last_modified(b)
+    if tb and (not ta or tb > ta):
+        pick = dict(b)
+    return pick
 
 
-def _filters_banner(title: str, since: str, months: str, no_window: bool, clouds: List[str], forced_ids: str) -> str:
-    parts: List[str] = [f"# {title}", ""]
-    parts.append(f"_Generated {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}_\n")
-    parts.append("### Report filters\n")
-    if no_window:
-        parts.append("- **Date window:** none (no-window)")
-    else:
-        if since:
-            parts.append(f"- **Since:** {since}")
-        elif months:
-            parts.append(f"- **Lookback (months):** {months}")
-        else:
-            parts.append("- **Date window:** not specified")
-    if clouds:
-        parts.append(f"- **Clouds:** {', '.join(clouds)}")
-    else:
-        parts.append("- **Clouds:** (not specified)")
-    if forced_ids:
-        parts.append(f"- **Forced IDs:** {forced_ids}")
-    parts.append("\n---\n")
-    return "\n".join(parts)
+def build_features(rows: List[Dict[str, str]]) -> Tuple[List[FeatureRecord], int]:
+    by_id: Dict[str, Dict[str, str]] = {}
+    skipped = 0
+    for r in rows:
+        rid = _extract_id(r)
+        if not rid:
+            skipped += 1
+            continue
+        prev = by_id.get(rid)
+        by_id[rid] = _dedupe_keep_best(prev, r) if prev else r
+
+    feats: List[FeatureRecord] = []
+    for rid, r in by_id.items():
+        title = _first(r, ["title", "name", "subject"], default=f"Roadmap item {rid}")
+        cloud = _first(
+            r,
+            ["cloud", "clouds", "tenant_cloud", "cloud_instance"],
+        )
+        status = _first(r, ["status", "state", "releasePhase", "release_phase"])
+        fr = FeatureRecord(
+            id=rid,
+            title=title,
+            cloud=cloud,
+            status=status,
+            last_modified=_last_modified(r),
+            sources=_sources(r),
+            tags=[],
+        )
+        feats.append(fr)
+
+    # Sort by numeric ID desc by default
+    feats.sort(key=lambda f: int(f.id), reverse=True)
+    return feats, skipped
 
 
-def build_report_markdown(
-    title: str,
-    features: List[Dict[str, str]],
-    limit: Optional[int] = None,
-    include_toc: bool = True,
-    banner: Optional[str] = None,
-) -> str:
+def read_master_csv(path: Path) -> List[Dict[str, str]]:
+    rows: List[Dict[str, str]] = []
+    with path.open("r", encoding="utf-8", newline="") as f:
+        rdr = csv.DictReader(f)
+        for r in rdr:
+            rows.append({k: (v or "") for k, v in r.items()})
+    return rows
+
+
+def render_document(title: str, features: List[FeatureRecord]) -> str:
     parts: List[str] = []
-    if banner:
-        parts.append(banner)
-    else:
-        parts.append(f"# {title}\n\n_Generated {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}_\n---\n")
-
-    if limit:
-        features = features[:limit]
-
-    if include_toc:
-        parts.append(_make_toc(features))
-
-    for row in features:
-        fr = FeatureRecord.from_row(row)
-        parts.append(render_feature_markdown(fr, now=datetime.utcnow()))
-
-    return "\n".join(parts).strip() + "\n"
+    parts.append(f"# {title}\n")
+    parts.append(f"_Generated {dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}_\n")
+    parts.append("---\n")
+    for fr in features:
+        parts.append(render_feature_markdown(fr))
+    return "\n".join(parts).rstrip() + "\n"
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Generate a narrative Markdown report from master CSV with a fixed scaffold per feature.")
-    ap.add_argument("--title", required=True, help="Report title (used in H1 and artifact names)")
-    ap.add_argument("--master", required=True, help="Path to the unified master CSV")
-    ap.add_argument("--out", required=True, help="Output Markdown path")
-    ap.add_argument("--limit", type=int, default=0, help="Limit number of features (0 = all)")
-    # Optional: echo filters used so HTML mirrors context
-    ap.add_argument("--since", default="", help="ISO date YYYY-MM-DD (informational banner only)")
-    ap.add_argument("--months", default="", help="Lookback months (informational banner only)")
-    ap.add_argument("--no-window", action="store_true", help="Informational banner: no date window applied")
-    ap.add_argument("--cloud", action="append", default=[], help="One or more cloud labels for banner (repeatable)")
-    ap.add_argument("--forced-ids", default="", help="Comma-separated forced IDs for banner only")
-    ap.add_argument("--no-toc", action="store_true", help="Disable table of contents")
+    ap = argparse.ArgumentParser(description="Generate Markdown report with strict scaffold")
+    ap.add_argument("--title", required=True)
+    ap.add_argument("--master", required=True, help="CSV produced by fetch_messages_graph.py")
+    ap.add_argument("--out", required=True, help="Markdown output path")
+    ap.add_argument("--no-window", action="store_true", help="unused (kept for CLI compatibility)")
+    ap.add_argument("--since", default="", help="ignored here; applied later by parser")
+    ap.add_argument("--months", default="", help="ignored here; applied later by parser")
+    ap.add_argument("--cloud", action="append", default=[], help="ignored here; prose only")
+    ap.add_argument("--forced-ids", default="", help="comma-separated IDs to forcibly include if present")
     args = ap.parse_args()
 
-    df = _normalize_columns(_read_master_csv(args.master))
-    features = _group_unique_features(df)
+    rows = read_master_csv(Path(args.master))
+    feats, skipped = build_features(rows)
 
-    banner = _filters_banner(
-        title=args.title,
-        since=args.since,
-        months=args.months,
-        no_window=args.no_window,
-        clouds=args.cloud or [],
-        forced_ids=args.forced_ids,
-    )
+    doc = render_document(args.title, feats)
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(doc, encoding="utf-8")
 
-    md = build_report_markdown(
-        title=args.title,
-        features=features,
-        limit=(args.limit or None),
-        include_toc=(not args.no_toc),
-        banner=banner,
-    )
-
-    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
-    with open(args.out, "w", encoding="utf-8") as f:
-        f.write(md)
-    print(f"Wrote report: {args.out} (features={len(features)})")
+    print(f"Wrote report: {out_path} (features={len(feats)}; skipped_no_id={skipped})")
 
 
 if __name__ == "__main__":
