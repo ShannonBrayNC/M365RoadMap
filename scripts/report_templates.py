@@ -1,120 +1,162 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Iterable, List
+from dataclasses import dataclass, asdict
+from typing import Dict, List, Optional
 
 
-def _as_list(x: Iterable[str] | None) -> List[str]:
-    if not x:
+CLOUD_LABELS = ("General", "GCC", "GCC High", "DoD")
+WORLDWIDE_SYNONYMS = {
+    "Worldwide (Standard Multi-Tenant)",
+    "Worldwide",
+    "Standard Multi-Tenant",
+    "General",
+    "WW",
+    "Public",
+}
+
+
+def _first(d: Dict, *keys, default: str = "") -> str:
+    for k in keys:
+        if k in d and str(d[k]).strip():
+            return str(d[k]).strip()
+    return default
+
+
+def normalize_clouds(raw: str | None) -> List[str]:
+    if not raw:
         return []
-    return [str(s).strip() for s in x if str(s).strip()]
-
-
-def _md_escape(text: str) -> str:
-    # Minimal escape to keep headings clean
-    return (text or "").replace("\n", " ").strip()
+    parts = {p.strip() for p in str(raw).replace(";", ",").split(",")}
+    out: List[str] = []
+    for p in parts:
+        if not p:
+            continue
+        if p in WORLDWIDE_SYNONYMS:
+            out.append("General")
+        elif p in {"GCC", "US Gov GCC"}:
+            out.append("GCC")
+        elif p in {"GCC High", "US Gov GCC High", "GCCH"}:
+            out.append("GCC High")
+        elif p in {"DoD", "US Gov DoD"}:
+            out.append("DoD")
+    # stable order, de-duped
+    ordered = [c for c in CLOUD_LABELS if c in set(out)]
+    return ordered
 
 
 @dataclass
 class FeatureRecord:
-    """
-    Canonical “unit” that the generator emits and the parser expects.
-
-    Heading (one per feature):
-        ## [<id>] — <title>
-
-    Immediately followed by a fenced meta block we can parse without external YAML:
-        ```feature
-        id: 123456
-        title: Example feature
-        cloud: Worldwide (Standard Multi-Tenant)
-        status: Rolling out
-        last_modified: 2025-08-15T04:12:00Z
-        sources:
-          - Graph
-          - RSS
-        tags:
-          - SharePoint
-          - Copilot
-        ```
-    Then fixed sections in this order (the parser can ignore prose but needs headings):
-        ### What it is (confirmed)
-        ### Why it matters
-        ### What’s confirmed vs. inferred
-        ### How you’ll use it (practical workflow)
-        ### Cloud availability
-        ### Notes
-    """
-
     id: str
-    title: str
-    cloud: str = ""
+    title: str = ""
+    product: str = ""
     status: str = ""
-    last_modified: str = ""
-    sources: List[str] = field(default_factory=list)
-    tags: List[str] = field(default_factory=list)
+    release_phase: str = ""
+    eta: str = ""
+    clouds: List[str] | None = None
+    updated: str = ""
+    source: str = ""
+    summary: str = ""
+    link: str = ""
 
-    # Optional narrative; OK to leave blank
-    summary_confirmed: str = ""
-    why_it_matters: str = ""
-    confirmed_vs_inferred: str = ""
-    how_to_use: str = ""
-    notes: str = ""
+    @staticmethod
+    def from_row(row: Dict) -> "FeatureRecord":
+        fid = _first(row, "id", "Id", "ID", "FeatureId", "Feature ID", default="")
+        title = _first(row, "title", "Title", "feature_name", "Feature")
+        product = _first(row, "product", "Product", "workload")
+        status = _first(row, "status", "Status", "state", "Lifecycle")
+        release_phase = _first(row, "releasePhase", "Release phase", "phase")
+        eta = _first(row, "releaseDate", "Release date", "eta", "Targeted Release")
+        clouds_raw = _first(
+            row, "cloud", "Cloud", "clouds", "Cloud Instances", "Clouds"
+        )
+        clouds = normalize_clouds(clouds_raw)
+        updated = _first(
+            row,
+            "lastModifiedDateTime",
+            "Last modified",
+            "modified",
+            "Last Updated",
+            "updated",
+        )
+        src = _first(row, "source", "Source")
+        # Prefer provided link else manufacture Roadmap link
+        link = _first(row, "link", "Link", "url", "URL")
+        if not link and fid:
+            link = f"https://www.microsoft.com/microsoft-365/roadmap?filters=searchterms={fid}"
+        # Summary/description-ish
+        summary = _first(row, "summary", "Summary", "description", "Description", "body")
+        return FeatureRecord(
+            id=str(fid),
+            title=title,
+            product=product,
+            status=status,
+            release_phase=release_phase,
+            eta=eta,
+            clouds=clouds,
+            updated=updated,
+            source=src,
+            summary=summary,
+            link=link,
+        )
 
-    def _meta_block(self) -> str:
-        def list_block(name: str, items: List[str]) -> str:
-            if not items:
-                return f"{name}: []"
-            lines = [f"{name}:"]
-            for it in items:
-                lines.append(f"  - {it}")
-            return "\n".join(lines)
+    def to_meta_json(self) -> str:
+        # Minimal, stable payload for parser
+        d = asdict(self)
+        # keep only primitives the parser filters on
+        meta = {
+            "id": d["id"],
+            "title": d["title"],
+            "product": d["product"],
+            "status": d["status"],
+            "release_phase": d["release_phase"],
+            "eta": d["eta"],
+            "clouds": d["clouds"] or [],
+            "updated": d["updated"],
+            "link": d["link"],
+            "source": d["source"],
+        }
+        import json
 
-        parts = [
-            f"id: {self.id}",
-            f"title: {_md_escape(self.title)}",
-            f"cloud: {_md_escape(self.cloud)}",
-            f"status: {_md_escape(self.status)}",
-            f"last_modified: {self.last_modified}",
-            list_block("sources", _as_list(self.sources)),
-            list_block("tags", _as_list(self.tags)),
-        ]
-        return "```feature\n" + "\n".join(parts) + "\n```"
+        return json.dumps(meta, ensure_ascii=False, separators=(",", ":"))
 
-    def to_markdown_section(self) -> str:
-        h2 = f"## [{self.id}] — {_md_escape(self.title)}"
-        meta = self._meta_block()
-
-        def sec(h: str, body: str) -> str:
-            body = (body or "").rstrip()
-            if not body:
-                body = "_(no notes)_"
-            return f"### {h}\n{body}\n"
-
-        # Provide very light defaults if prose is missing
-        wc = self.summary_confirmed or "_(summary pending)_"
-        wim = self.why_it_matters or "_(impact notes pending)_"
-        cvi = self.confirmed_vs_inferred or "- **Confirmed:**\n- **Inferred:**"
-        htu = self.how_to_use or "- _(usage notes pending)_"
-        ca = f"- {self.cloud or 'Unspecified'}"
-        notes = self.notes or ""
-
-        return "\n".join(
-            [
-                h2,
-                "",
-                meta,
-                "",
-                sec("What it is (confirmed)", wc),
-                sec("Why it matters", wim),
-                sec("What’s confirmed vs. inferred", cvi),
-                sec("How you’ll use it (practical workflow)", htu),
-                sec("Cloud availability", ca),
-                sec("Notes", notes),
-            ]
-        ) + "\n"
-
-
-def render_feature_markdown(fr: FeatureRecord) -> str:
-    return fr.to_markdown_section()
+    def render_markdown(self) -> str:
+        # checkbox list (visual only)
+        ck = []
+        have = set(self.clouds or [])
+        for label in CLOUD_LABELS:
+            ck.append(f"- [{'x' if label in have else ' '}] {label}")
+        clouds_line = ", ".join(self.clouds or [])
+        # Header & meta
+        buf = []
+        buf.append(f"## Feature {self.id} — {self.title or '(untitled)'}")
+        buf.append("")
+        buf.append(
+            f"> **Product:** {self.product or '—'}  "
+            f"**Clouds:** {clouds_line or '—'}  "
+            f"**Status:** {self.status or '—'}  "
+            f"**Phase:** {self.release_phase or '—'}  "
+            f"**ETA:** {self.eta or '—'}"
+        )
+        buf.append(
+            f"> **Updated:** {self.updated or '—'}  "
+            f"**Source:** {self.source or '—'}  "
+            f"**Link:** {self.link or '—'}"
+        )
+        buf.append(f"<!-- FEATURE:{self.id}:START -->")
+        buf.append(f"<!-- META {self.to_meta_json()} -->")
+        buf.append("")
+        buf.append("### Summary")
+        buf.append(self.summary or "_No summary available._")
+        buf.append("")
+        buf.append("### Change Impact")
+        buf.append("_Author notes here._")
+        buf.append("")
+        buf.append("### Tenant Availability")
+        buf.extend(ck)
+        buf.append("")
+        buf.append("### Links")
+        if self.link:
+            buf.append(f"- Roadmap: {self.link}")
+        buf.append(f"<!-- FEATURE:{self.id}:END -->")
+        buf.append("")
+        return "\n".join(buf)

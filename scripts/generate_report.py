@@ -1,178 +1,135 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import argparse
 import csv
 import datetime as dt
-import re
+import sys
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, List, Tuple
 
-
-# allow running this file directly:  python scripts/generate_report.py
+# Make "scripts" importable even when running as a file
 try:
-    from scripts.report_templates import FeatureRecord, render_feature_markdown
-except ModuleNotFoundError:  # running from inside scripts/
-    import os, sys
-    sys.path.append(os.path.dirname(os.path.dirname(__file__)))  # add repo root
-    from scripts.report_templates import FeatureRecord, render_feature_markdown
+    from scripts.report_templates import FeatureRecord
+except Exception:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from scripts.report_templates import FeatureRecord  # type: ignore
 
 
-
-from scripts.report_templates import FeatureRecord, render_feature_markdown
-
-
-def _first(row: Dict[str, str], names: Iterable[str], default: str = "") -> str:
-    for n in names:
-        if n in row and str(row[n]).strip():
-            return str(row[n]).strip()
-    return default
-
-
-ID_PATTERNS = [
-    re.compile(r"\bRoadmap ID[:\s]*([0-9]{3,8})\b", re.I),
-    re.compile(r"/details/([0-9]{3,8})\b", re.I),
-    re.compile(r"/feature/([0-9]{3,8})\b", re.I),
-    re.compile(r"\b(?:FR|ID)[:\s#]*([0-9]{3,8})\b", re.I),
-]
-
-
-def _extract_id(row: Dict[str, str]) -> str:
-    id_ = _first(row, ["roadmap_id", "id", "feature_id"])
-    if id_ and id_.isdigit():
-        return id_
-    hay = " ".join(
-        [
-            _first(row, ["roadmap_url", "link", "url"]),
-            _first(row, ["body_html", "body", "description", "summary"]),
-            _first(row, ["title", "name", "subject"]),
-        ]
-    )
-    for pat in ID_PATTERNS:
-        m = pat.search(hay or "")
-        if m:
-            return m.group(1)
-    return ""
-
-
-def _last_modified(row: Dict[str, str]) -> str:
-    raw = _first(
-        row,
-        ["last_modified", "lastModifiedDateTime", "last_modified_utc", "modified", "updated"],
-    )
-    if not raw:
-        return ""
-    # Normalize to Z
-    try:
-        # Try common ISO forms
-        ts = raw.replace("Z", "+00:00")
-        return dt.datetime.fromisoformat(ts).astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
-    except Exception:
-        return raw  # keep original if unknown
-
-
-def _sources(row: Dict[str, str]) -> List[str]:
-    s = _first(row, ["source", "source_type", "source_kind"]).lower()
-    out: List[str] = []
-    if "graph" in s:
-        out.append("Graph")
-    if "rss" in s:
-        out.append("RSS")
-    if "public" in s:
-        out.append("Public JSON")
-    if not out and s:
-        out.append(s.title())
-    return out
-
-
-def _dedupe_keep_best(a: Dict[str, str], b: Dict[str, str]) -> Dict[str, str]:
-    # Prefer richer title, latest modified
-    pick = dict(a)
-    if len(_first(b, ["title", "name", "subject"])) > len(_first(a, ["title", "name", "subject"])):
-        pick = dict(b)
-    ta = _last_modified(a)
-    tb = _last_modified(b)
-    if tb and (not ta or tb > ta):
-        pick = dict(b)
-    return pick
-
-
-def build_features(rows: List[Dict[str, str]]) -> Tuple[List[FeatureRecord], int]:
-    by_id: Dict[str, Dict[str, str]] = {}
-    skipped = 0
-    for r in rows:
-        rid = _extract_id(r)
-        if not rid:
-            skipped += 1
-            continue
-        prev = by_id.get(rid)
-        by_id[rid] = _dedupe_keep_best(prev, r) if prev else r
-
-    feats: List[FeatureRecord] = []
-    for rid, r in by_id.items():
-        title = _first(r, ["title", "name", "subject"], default=f"Roadmap item {rid}")
-        cloud = _first(
-            r,
-            ["cloud", "clouds", "tenant_cloud", "cloud_instance"],
-        )
-        status = _first(r, ["status", "state", "releasePhase", "release_phase"])
-        fr = FeatureRecord(
-            id=rid,
-            title=title,
-            cloud=cloud,
-            status=status,
-            last_modified=_last_modified(r),
-            sources=_sources(r),
-            tags=[],
-        )
-        feats.append(fr)
-
-    # Sort by numeric ID desc by default
-    feats.sort(key=lambda f: int(f.id), reverse=True)
-    return feats, skipped
-
-
-def read_master_csv(path: Path) -> List[Dict[str, str]]:
+def read_rows(master_csv: Path) -> List[Dict[str, str]]:
     rows: List[Dict[str, str]] = []
-    with path.open("r", encoding="utf-8", newline="") as f:
+    with master_csv.open("r", encoding="utf-8", newline="") as f:
         rdr = csv.DictReader(f)
         for r in rdr:
-            rows.append({k: (v or "") for k, v in r.items()})
+            rows.append({k: (v or "").strip() for k, v in r.items()})
     return rows
 
 
-def render_document(title: str, features: List[FeatureRecord]) -> str:
-    parts: List[str] = []
-    parts.append(f"# {title}\n")
-    parts.append(f"_Generated {dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}_\n")
-    parts.append("---\n")
-    for fr in features:
-        parts.append(render_feature_markdown(fr))
-    return "\n".join(parts).rstrip() + "\n"
+def dedupe_latest(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """
+    Keep the latest row per id using lastModifiedDateTime (or preserve order).
+    """
+    def get_id(r: Dict[str, str]) -> str:
+        for k in ("id", "Id", "ID", "FeatureId", "Feature ID"):
+            v = r.get(k)
+            if v:
+                return str(v).strip()
+        return ""
+
+    def get_updated(r: Dict[str, str]) -> Tuple[int, str]:
+        # Fallback to '' so max keeps later string order if needed
+        s = r.get("lastModifiedDateTime") or r.get("Last modified") or r.get("updated") or ""
+        return (0, s)
+
+    latest: Dict[str, Dict[str, str]] = {}
+    for r in rows:
+        fid = get_id(r)
+        if not fid:
+            # keep non-id rows out
+            continue
+        if fid not in latest:
+            latest[fid] = r
+            continue
+        # naive compare; if equal we keep first
+        if get_updated(r) > get_updated(latest[fid]):
+            latest[fid] = r
+    return list(latest.values())
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description="Generate Markdown report with strict scaffold")
-    ap.add_argument("--title", required=True)
-    ap.add_argument("--master", required=True, help="CSV produced by fetch_messages_graph.py")
-    ap.add_argument("--out", required=True, help="Markdown output path")
-    ap.add_argument("--no-window", action="store_true", help="unused (kept for CLI compatibility)")
-    ap.add_argument("--since", default="", help="ignored here; applied later by parser")
-    ap.add_argument("--months", default="", help="ignored here; applied later by parser")
-    ap.add_argument("--cloud", action="append", default=[], help="ignored here; prose only")
-    ap.add_argument("--forced-ids", default="", help="comma-separated IDs to forcibly include if present")
-    args = ap.parse_args()
+def write_report(title: str, records: List[FeatureRecord], out_md: Path) -> None:
+    out_md.parent.mkdir(parents=True, exist_ok=True)
+    now = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    with out_md.open("w", encoding="utf-8", newline="\n") as w:
+        w.write(f"# {title}\n\n")
+        w.write(f"_Generated {now}_\n\n")
+        w.write("---\n\n")
+        for rec in records:
+            w.write(rec.render_markdown())
+    print(f"Wrote report: {out_md} (features={len(records)})", file=sys.stderr)
 
-    rows = read_master_csv(Path(args.master))
-    feats, skipped = build_features(rows)
 
-    doc = render_document(args.title, feats)
-    out_path = Path(args.out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(doc, encoding="utf-8")
+def main(argv: List[str]) -> int:
+    import argparse
 
-    print(f"Wrote report: {out_path} (features={len(feats)}; skipped_no_id={skipped})")
+    ap = argparse.ArgumentParser(description="Generate Markdown report from master CSV.")
+    ap.add_argument("--title", required=True, help="Title for the report")
+    ap.add_argument("--master", required=True, help="Path to master CSV")
+    ap.add_argument("--out", required=True, help="Output Markdown path")
+    ap.add_argument("--since", default="", help="ISO date filter (optional)")
+    ap.add_argument("--months", default="", help="Lookback in months (optional)")
+    ap.add_argument("--no-window", action="store_true", help="(compat flag) ignored")
+    args = ap.parse_args(argv)
+
+    master = Path(args.master)
+    if not master.exists():
+        print(f"[generate_report] ERROR: master CSV missing: {master}", file=sys.stderr)
+        # still write header so downstream won't crash
+        write_report(args.title, [], Path(args.out))
+        return 2
+
+    rows = read_rows(master)
+    if not rows:
+        write_report(args.title, [], Path(args.out))
+        return 0
+
+    # Optional date filter
+    since_dt: dt.datetime | None = None
+    if args.since.strip():
+        try:
+            since_dt = dt.datetime.fromisoformat(args.since.strip())
+        except Exception:
+            pass
+    elif args.months.strip():
+        try:
+            months = int(args.months.strip())
+            since_dt = dt.datetime.utcnow() - dt.timedelta(days=months * 30)
+        except Exception:
+            pass
+
+    def keep_row(r: Dict[str, str]) -> bool:
+        if not since_dt:
+            return True
+        s = r.get("lastModifiedDateTime") or r.get("Last modified") or r.get("updated")
+        if not s:
+            return True
+        for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d", "%Y-%m-%dT%H:%M:%S.%fZ"):
+            try:
+                # best effort
+                t = dt.datetime.strptime(s[: len(fmt)], fmt)
+                break
+            except Exception:
+                t = None  # type: ignore
+        if not t:
+            return True
+        if t.tzinfo:
+            t = t.astimezone(dt.timezone.utc).replace(tzinfo=None)
+        return t >= since_dt
+
+    rows = [r for r in rows if keep_row(r)]
+    rows = dedupe_latest(rows)
+    records = [FeatureRecord.from_row(r) for r in rows if r]
+    write_report(args.title, records, Path(args.out))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main(sys.argv[1:]))
