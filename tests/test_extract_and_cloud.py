@@ -1,4 +1,4 @@
-from  scripts.fetch_messages_graph import extract_roadmap_ids_from_html, include_by_cloud
+from   scripts.fetch_messages_graph import extract_roadmap_ids_from_html, include_by_cloud
 
 
 def test_id_extraction_variants():

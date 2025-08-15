@@ -16,18 +16,14 @@ on:
         required: false
         default: ""
       SINCE:
-        description: ISO date (YYYY-MM-DD) to start from (overrides months; blank for none)
+        description: ISO date (YYYY-MM-DD) to start from (blank for none)
         required: false
         default: ""
-
-      # Hard switch: ignore any date filters
       NO_WINDOW:
         type: boolean
         required: false
-        default: false
-        description: Ignore months/since (no date filter at all)
-
-      # Cloud checkboxes
+        default: true
+        description: Ignore months/since (no date filter)
       CLOUD_GENERAL:
         type: boolean
         required: false
@@ -49,30 +45,10 @@ on:
         default: false
         description: Include DoD
 
-      # Fallback (commented) — single textbox:
-      # CLOUDS:
-      #   description: Comma-separated clouds (e.g. General,GCC High,DoD)
-      #   required: false
-      #   default: General
-
-      # Optional AI (not required for fetching)
-      USE_OPENAI:
-        type: boolean
-        required: false
-        default: false
-        description: Use OpenAI to auto-fill narrative sections
-      OPENAI_MODEL:
-        required: false
-        default: gpt-4o-mini
-        description: OpenAI model when using AI
-      PROMPT_PATH:
-        required: false
-        default: prompts/feature_summarize_tailored.md
-        description: Prompt file for AI summarization
-
 jobs:
   build:
     runs-on: ubuntu-latest
+
     env:
       TITLE: ${{ github.event.inputs.TITLE }}
       PUBLIC_IDS: ${{ github.event.inputs.PUBLIC_IDS }}
@@ -85,20 +61,11 @@ jobs:
       CLOUD_GCCH: ${{ github.event.inputs.CLOUD_GCCH }}
       CLOUD_DOD: ${{ github.event.inputs.CLOUD_DOD }}
 
-      # CLOUDS: ${{ github.event.inputs.CLOUDS }}  # (fallback only)
-
-      USE_OPENAI: ${{ github.event.inputs.USE_OPENAI }}
-      OPENAI_MODEL: ${{ github.event.inputs.OPENAI_MODEL }}
-      PROMPT_PATH: ${{ github.event.inputs.PROMPT_PATH }}
-
-      # Secrets → env
       TENANT: ${{ secrets.GRAPH_TENANT_ID }}
       CLIENT: ${{ secrets.GRAPH_CLIENT_ID }}
       PFX_B64: ${{ secrets.M365_PFX_BASE64 }}
       PFX_PASSWORD_ENV: M365_PFX_PASSWORD
       M365_PFX_PASSWORD: ${{ secrets.M365_PFX_PASSWORD }}
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      OPENAI_ORG_ID: ${{ secrets.OPENAI_ORG_ID }}
 
     steps:
       - name: Checkout
@@ -117,7 +84,7 @@ jobs:
           if [[ -f requirements.txt ]]; then
             pip install -r requirements.txt
           else
-            pip install requests beautifulsoup4 lxml feedparser python-dateutil pandas openai msal cryptography
+            pip install requests beautifulsoup4 lxml feedparser python-dateutil pandas msal cryptography
           fi
 
       - name: Prepare Graph config
@@ -129,53 +96,48 @@ jobs:
           PFX="${PFX_B64:-}"
           if [[ -z "${PFX}" && -f "${CFG_PATH}" ]]; then
             echo "Reading pfx_base64 from ${CFG_PATH}"
-            PFX="$(python -c 'import json,sys;print(json.load(open(sys.argv[1],\"r\",encoding=\"utf-8\")).get(\"pfx_base64\",\"\"))' "${CFG_PATH}")"
-          fi
-          if [[ -n "${TENANT:-}" && -n "${CLIENT:-}" && -n "${PFX:-}" ]]; then
-            python - <<'PY'
+            PFX="$(python - <<'PY'
+            import json;print(json.load(open("graph_config.json","r",encoding="utf-8")).get("pfx_base64",""))
+            PY
+              )"
+                        fi
+                        if [[ -n "${TENANT:-}" && -n "${CLIENT:-}" && -n "${PFX:-}" ]]; then
+                          python - <<'PY'
               import os, json
-              cfg={"tenant_id":os.environ.get("TENANT",""),
-                  "client_id":os.environ.get("CLIENT",""),
-                  "pfx_base64":os.environ.get("PFX_B64",""),
-                  "pfx_password_env":os.environ.get("PFX_PASSWORD_ENV","M365_PFX_PASSWORD"),
-                  "graph_base":"https://graph.microsoft.com/v1.0",
-                  "authority_base":"https://login.microsoftonline.com"}
+              cfg = {
+                "tenant_id": os.environ.get("TENANT",""),
+                "client_id": os.environ.get("CLIENT",""),
+                "pfx_base64": os.environ.get("PFX_B64",""),
+                "pfx_password_env": os.environ.get("PFX_PASSWORD_ENV","M365_PFX_PASSWORD"),
+                "graph_base": "https://graph.microsoft.com/v1.0",
+                "authority_base": "https://login.microsoftonline.com"
+              }
               open("graph_config.json","w",encoding="utf-8").write(json.dumps(cfg, ensure_ascii=False))
               print("graph_config.json written.")
             PY
-              echo "graph_cfg=graph_config.json" >> "$GITHUB_OUTPUT"
-            elif [[ -f "${CFG_PATH}" ]]; then
-              echo "Existing ${CFG_PATH} will be used."
-              echo "graph_cfg=${CFG_PATH}" >> "$GITHUB_OUTPUT"
-            else
-              echo "graph_cfg=" >> "$GITHUB_OUTPUT"
-              echo "No Graph config available; will proceed if --no-graph is used."
-            fi
+            echo "graph_cfg=graph_config.json" >> "$GITHUB_OUTPUT"
+          elif [[ -f "${CFG_PATH}" ]]; then
+            echo "Using existing ${CFG_PATH}"
+            echo "graph_cfg=${CFG_PATH}" >> "$GITHUB_OUTPUT"
+          else
+            echo "graph_cfg=" >> "$GITHUB_OUTPUT"
+            echo "::warning::No Graph config available; Graph calls will be skipped if --no-graph is set."
+          fi
 
-      - name: Build cloud args (booleans)
+      - name: Build cloud args (checkboxes)
         id: clouds
         shell: bash
         run: |
           set -euo pipefail
           args=()
-          low() { echo "${1:-}" | tr '[:upper:]' '[:lower:]'; }
-          if [[ "$(low "${{ github.event.inputs.CLOUD_GENERAL }}")" == "true" ]]; then args+=( --cloud "Worldwide (Standard Multi-Tenant)" ); fi
-          if [[ "$(low "${{ github.event.inputs.CLOUD_GCC }}")" == "true" ]]; then args+=( --cloud "GCC" ); fi
-          if [[ "$(low "${{ github.event.inputs.CLOUD_GCCH }}")" == "true" ]]; then args+=( --cloud "GCC High" ); fi
-          if [[ "$(low "${{ github.event.inputs.CLOUD_DOD }}")" == "true" ]]; then args+=( --cloud "DoD" ); fi
+          tolow() { echo "${1:-}" | tr '[:upper:]' '[:lower:]'; }
+          if [[ "$(tolow "${CLOUD_GENERAL}")" == "true" ]]; then args+=( --cloud "Worldwide (Standard Multi-Tenant)" ); fi
+          if [[ "$(tolow "${CLOUD_GCC}")" == "true" ]]; then args+=( --cloud "GCC" ); fi
+          if [[ "$(tolow "${CLOUD_GCCH}")" == "true" ]]; then args+=( --cloud "GCC High" ); fi
+          if [[ "$(tolow "${CLOUD_DOD}")" == "true" ]]; then args+=( --cloud "DoD" ); fi
           printf 'clouds=%q' "${args[*]}" >> "$GITHUB_OUTPUT"
 
-      - name: Debug inputs (one-time; safe to keep)
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "::notice:: TITLE=[$TITLE]"
-          echo "::notice:: SINCE=[$SINCE]"
-          echo "::notice:: MONTHS=[$MONTHS]"
-          echo "::notice:: NO_WINDOW=[$NO_WINDOW]"
-          echo "::notice:: CLOUDS=[GEN:$CLOUD_GENERAL GCC:$CLOUD_GCC GCCH:$CLOUD_GCCH DOD:$CLOUD_DOD]"
-
-      - name: Fetch master data (Graph/Public/RSS)
+      - name: Fetch master data
         id: fetch
         shell: bash
         run: |
@@ -196,14 +158,15 @@ jobs:
             fi
           fi
 
-          CLOUDS_ARR=()
-          # shellcheck disable=SC2206
-          CLOUDS_ARR=(${{ steps.clouds.outputs.clouds }})
+          CLOUDS_EXPANDED=${{ steps.clouds.outputs.clouds }}
+          CLOUDS_ARR=(${CLOUDS_EXPANDED})
 
           CFG_ARG=()
           if [[ -n "${{ steps.graphcfg.outputs.graph_cfg }}" ]]; then
             CFG_ARG=( --config "${{ steps.graphcfg.outputs.graph_cfg }}" )
           fi
+
+          echo "Running fetch_messages_graph.py with: ${CFG_ARG[*]} ${DATE_FLAGS[*]} ${CLOUDS_ARR[*]}"
 
           python scripts/fetch_messages_graph.py \
             "${CFG_ARG[@]}" \
@@ -223,11 +186,6 @@ jobs:
           echo "csv=${CSV_OUT}"     >> "$GITHUB_OUTPUT"
           echo "json=${JSON_OUT}"   >> "$GITHUB_OUTPUT"
           echo "stats=${STATS_OUT}" >> "$GITHUB_OUTPUT"
-
-      - name: Dump fetch stats (debug)
-        if: always()
-        run: |
-          test -f "${{ steps.fetch.outputs.stats }}" && cat "${{ steps.fetch.outputs.stats }}" || echo "no stats file"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

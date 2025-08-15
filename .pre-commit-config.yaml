@@ -1,12 +1,90 @@
-- repo: https://github.com/PyCQA/bandit
-  rev: 1.7.9
-  hooks:
-    - id: bandit
-      args: ["-q", "-r", "."]
-      exclude: |
-        (?x)(
-          ^\.venv/|
-          ^venv/|
-          ^env/|
-          ^output/
-        )
+# .pre-commit-config.yaml
+minimum_pre_commit_version: "2.20.0"
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-yaml
+      - id: check-json
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: mixed-line-ending
+      - id: check-merge-conflict
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.5.7
+    hooks:
+      - id: ruff
+        args: [--fix]
+        exclude: "^(.venv|output)/"
+      - id: ruff-format
+        exclude: "^(.venv|output)/"
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.10.0
+    hooks:
+      - id: mypy
+        additional_dependencies: []
+        exclude: "^(.venv|output)/"
+
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+        args: ["--baseline", ".secrets.baseline"]
+        exclude: "(^output/|^prompts/|^\\.venv/)"
+
+  - repo: https://github.com/PyCQA/bandit
+    rev: 1.7.9
+    hooks:
+      - id: bandit
+        args:
+          ["-q", "-r", ".", "--exclude", ".venv,output,tests,.git"]
+        exclude: "^(.venv|output)/"
+
+  - repo: https://github.com/executablebooks/mdformat
+    rev: 0.7.17
+    hooks:
+      - id: mdformat
+      - id: mdformat-frontmatter
+      - id: mdformat-gfm
+
+  # Local safety guards
+  - repo: local
+    hooks:
+      - id: block-certs-and-keys
+        name: Block certificate/private key files
+        entry: bash -c 'echo "Refusing to commit certificate/private key-like files."; exit 1'
+        language: system
+        files: >
+          (?x)^(
+            .*\.pfx$|
+            .*\.p12$|
+            .*\.pem$|
+            .*\.cer$|
+            .*\.key$|
+            .*pfx\.b64$
+          )
+
+      - id: block-real-configs
+        name: Block committing real graph_config files
+        entry: bash -c 'echo "Commit .example.json instead of real graph_config.*.json"; exit 1'
+        language: system
+        files: ^graph_config(\.inline)?\.json$
+
+      - id: block-output-artifacts
+        name: Block output artifacts
+        entry: bash -c 'echo "Do not commit files under /output"; exit 1'
+        language: system
+        files: ^output/.+
+
+# (Optional) keep this commented until your report generation is stable
+#  - repo: local
+#    hooks:
+#      - id: validate-roadmap
+#        name: Validate Roadmap Report
+#        entry: python scripts/validate_report.py --input output/roadmap_report.md
+#        language: system
+#        pass_filenames: false
+#        stages: [manual]

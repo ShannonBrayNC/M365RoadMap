@@ -22,7 +22,7 @@ class GraphConfig:
     tenant_id: str
     client_id: str
     pfx_base64: str
-    pfx_password_env: str = "M365_PFX_PASSWORD"
+    pfx_password_env: str
     graph_base: str = DEFAULT_GRAPH_BASE
     authority_base: str = DEFAULT_AUTHORITY
 
