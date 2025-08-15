@@ -8,6 +8,17 @@ import re
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
+
+# allow running this file directly:  python scripts/generate_report.py
+try:
+    from scripts.report_templates import FeatureRecord, render_feature_markdown
+except ModuleNotFoundError:  # running from inside scripts/
+    import os, sys
+    sys.path.append(os.path.dirname(os.path.dirname(__file__)))  # add repo root
+    from scripts.report_templates import FeatureRecord, render_feature_markdown
+
+
+
 from scripts.report_templates import FeatureRecord, render_feature_markdown
 
 
