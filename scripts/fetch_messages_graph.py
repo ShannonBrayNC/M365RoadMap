@@ -1,55 +1,12 @@
-# -*- coding: utf-8 -*-
-"""
-fetch_messages_graph.py
-Import-safe header so this script works whether called as:
-  - python -m scripts.fetch_messages_graph ...
-  - python scripts/fetch_messages_graph.py ...
-"""
-
-from __future__ import annotations
-
-# stdlib imports you likely already have below; harmless if duplicated
-import argparse
-import csv
-import datetime as dt
-import json
-import logging
-import os
-import re
 import sys
 from pathlib import Path
-from typing import Iterable, Optional
-
-# --- import shim: allow both "python -m" and "python scripts/..." styles ---
-REPO_ROOT = Path(__file__).resolve().parents[1]  # repo root
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-try:
-    # Preferred when run as a package: python -m scripts.fetch_messages_graph
-    from scripts.report_templates import normalize_clouds, parse_date_soft
-except ImportError:
-    # Fallback when run as a file from the scripts/ directory
-    from report_templates import normalize_clouds, parse_date_soft  # type: ignore[misc]
-
-# Cloud helpers shared with generator/parser
-# --- import shim: allow running as "python scripts/foo.py" or "-m scripts.foo"
-
-ROOT = Path(__file__).resolve().parents[1]  # repo root
+ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-try:
-    from scripts.report_templates import CLOUD_LABELS, normalize_clouds, parse_date_soft  # adjust names per file needs
-except ImportError:
-    # Fallback if running with sys.path[0] == scripts/
-    from report_templates import CLOUD_LABELS, normalize_clouds, parse_date_soft  # noqa
-
-# ------------------------------- CLI ---------------------------------
 import argparse
-from typing import Iterable, Set
+from typing import Set
 
 def _as_set(x) -> Set[str]:
-    """Normalize any value to a set of strings."""
     if x is None:
         return set()
     if isinstance(x, (set, list, tuple)):
@@ -59,45 +16,49 @@ def _as_set(x) -> Set[str]:
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         prog="fetch_messages_graph",
-        description="Fetch M365 roadmap/messages from Graph and RSS and emit CSV/JSON."
+        description="Fetch M365 messages from Graph + RSS and emit CSV/JSON."
     )
 
     # Inputs / filters
     p.add_argument("--config", dest="config", default=None,
-                   help="Path to graph_config.json (contains pfx_base64, tenant, client).")
+                   help="Path to graph_config.json (tenant, client, pfx).")
     p.add_argument("--since", dest="since", default=None,
-                   help="Only include items modified on/after this date (YYYY-MM-DD).")
+                   help="Only include items on/after this date (YYYY-MM-DD).")
     p.add_argument("--months", dest="months", type=int, default=None,
                    help="Relative time window in months from today.")
     p.add_argument("--cloud", dest="clouds", action="append", default=[],
-                   help="Cloud filter; repeatable. e.g. --cloud 'Worldwide (Standard Multi-Tenant)'")
+                   help="Repeatable cloud filter, e.g. --cloud 'Worldwide (Standard Multi-Tenant)'")
 
     # Behavior flags
     p.add_argument("--no-window", dest="no_window", action="store_true",
-                   help="Headless auth only (no device/browser window).")
+                   help="Headless auth only (no browser/device prompt).")
+    p.add_argument("--no-graph", dest="no_graph", action="store_true",
+                   help="Skip Microsoft Graph fetch.")
+    p.add_argument("--no-rss", dest="no_rss", action="store_true",
+                   help="Skip RSS fetch.")
 
     # Outputs
     p.add_argument("--emit", choices=["csv", "json"], required=True,
-                   help="Output format to emit.")
+                   help="Output format.")
     p.add_argument("--out", required=True,
-                   help="Output file path for --emit.")
+                   help="Output file path.")
     p.add_argument("--stats-out", dest="stats_out", default=None,
                    help="Optional: write fetch statistics JSON here.")
 
-    # Optional explicit include list
+    # Explicit include list
     p.add_argument("--public-ids", dest="public_ids", default=None,
-                   help="Comma-separated explicit Roadmap IDs to include.")
+                   help="Comma-separated Roadmap IDs to include explicitly.")
 
     args = p.parse_args(argv)
 
-    # Normalize clouds into a set of canonical labels
+    # Normalize clouds to a set of canonical labels
     selected: Set[str] = set()
     for c in args.clouds:
-        normalized = normalize_clouds(c)   # your existing helper; may return "General" or ["General", ...]
+        normalized = normalize_clouds(c)  # your helper; may return a string or list
         selected |= _as_set(normalized)
-    args.clouds = selected  # downstream code can use a set[str]
+    args.clouds = selected
 
-    # Normalize public_ids into a set if provided
+    # Normalize public_ids
     if args.public_ids:
         args.public_ids = {pid.strip() for pid in args.public_ids.split(",") if pid.strip()}
 
