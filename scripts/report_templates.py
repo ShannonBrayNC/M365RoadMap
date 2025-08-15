@@ -2,8 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional
-
+from typing import Dict, List
 
 CLOUD_LABELS = ("General", "GCC", "GCC High", "DoD")
 WORLDWIDE_SYNONYMS = {
@@ -15,13 +14,22 @@ WORLDWIDE_SYNONYMS = {
     "Public",
 }
 
-
 def _first(d: Dict, *keys, default: str = "") -> str:
     for k in keys:
-        if k in d and str(d[k]).strip():
-            return str(d[k]).strip()
+        if k in d:
+            v = str(d[k]).strip()
+            if v:
+                return v
     return default
 
+def _first_contains(d: Dict, needle: str) -> str:
+    n = needle.lower()
+    for k in d.keys():
+        if n in k.lower():
+            v = str(d.get(k, "")).strip()
+            if v:
+                return v
+    return ""
 
 def normalize_clouds(raw: str | None) -> List[str]:
     if not raw:
@@ -39,10 +47,7 @@ def normalize_clouds(raw: str | None) -> List[str]:
             out.append("GCC High")
         elif p in {"DoD", "US Gov DoD"}:
             out.append("DoD")
-    # stable order, de-duped
-    ordered = [c for c in CLOUD_LABELS if c in set(out)]
-    return ordered
-
+    return [c for c in CLOUD_LABELS if c in set(out)]
 
 @dataclass
 class FeatureRecord:
@@ -60,31 +65,90 @@ class FeatureRecord:
 
     @staticmethod
     def from_row(row: Dict) -> "FeatureRecord":
-        fid = _first(row, "id", "Id", "ID", "FeatureId", "Feature ID", default="")
-        title = _first(row, "title", "Title", "feature_name", "Feature")
-        product = _first(row, "product", "Product", "workload")
-        status = _first(row, "status", "Status", "state", "Lifecycle")
-        release_phase = _first(row, "releasePhase", "Release phase", "phase")
-        eta = _first(row, "releaseDate", "Release date", "eta", "Targeted Release")
-        clouds_raw = _first(
-            row, "cloud", "Cloud", "clouds", "Cloud Instances", "Clouds"
+        fid = _first(
+            row,
+            "PublicId",
+            "MessageId",
+            "id",
+            "Id",
+            "ID",
+            "FeatureId",
+            "Feature ID",
+            "FeatureID",
+            "Roadmap ID",
+            "RoadmapId",
+            "RoadmapID",
+            default="",
         )
+
+        title = _first(row, "Title", "title", "feature_name", "Feature", "Feature Name")
+        if not title:
+            title = _first_contains(row, "title")
+
+        product = _first(row, "Product_Workload", "product", "Product", "workload", "Workload", "Service")
+        if not product:
+            product = _first_contains(row, "product")
+
+        status = _first(row, "Status", "status", "state", "Lifecycle", "Release status")
+        if not status:
+            status = _first_contains(row, "status")
+
+        release_phase = _first(row, "Release phase", "releasePhase", "phase", "Phase")
+        if not release_phase:
+            release_phase = _first_contains(row, "phase")
+
+        eta = _first(
+            row,
+            "ReleaseDate",
+            "releaseDate",
+            "Release date",
+            "eta",
+            "ETA",
+            "Targeted Release",
+            "GA Date",
+        )
+        if not eta:
+            eta = _first_contains(row, "date")
+
+        clouds_raw = _first(
+            row,
+            "Cloud_instance",
+            "cloud",
+            "Cloud",
+            "clouds",
+            "Clouds",
+            "Cloud Instance(s)",
+            "Cloud Instance(s) Supported",
+            "Cloud Instance(s) availability",
+        )
+        if not clouds_raw:
+            clouds_raw = _first_contains(row, "cloud")
         clouds = normalize_clouds(clouds_raw)
+
         updated = _first(
             row,
+            "LastModified",
             "lastModifiedDateTime",
             "Last modified",
+            "Last Modified",
             "modified",
             "Last Updated",
             "updated",
+            "Update Date",
         )
-        src = _first(row, "source", "Source")
-        # Prefer provided link else manufacture Roadmap link
-        link = _first(row, "link", "Link", "url", "URL")
+        if not updated:
+            updated = _first_contains(row, "modified")
+
+        src = _first(row, "Source", "source", "Feed", "Origin")
+
+        link = _first(row, "Official_Roadmap_link", "link", "Link", "url", "URL")
         if not link and fid:
             link = f"https://www.microsoft.com/microsoft-365/roadmap?filters=searchterms={fid}"
-        # Summary/description-ish
+
         summary = _first(row, "summary", "Summary", "description", "Description", "body")
+        if not summary:
+            summary = _first_contains(row, "description")
+
         return FeatureRecord(
             id=str(fid),
             title=title,
@@ -100,33 +164,27 @@ class FeatureRecord:
         )
 
     def to_meta_json(self) -> str:
-        # Minimal, stable payload for parser
-        d = asdict(self)
-        # keep only primitives the parser filters on
+        from json import dumps
         meta = {
-            "id": d["id"],
-            "title": d["title"],
-            "product": d["product"],
-            "status": d["status"],
-            "release_phase": d["release_phase"],
-            "eta": d["eta"],
-            "clouds": d["clouds"] or [],
-            "updated": d["updated"],
-            "link": d["link"],
-            "source": d["source"],
+            "id": self.id,
+            "title": self.title,
+            "product": self.product,
+            "status": self.status,
+            "release_phase": self.release_phase,
+            "eta": self.eta,
+            "clouds": self.clouds or [],
+            "updated": self.updated,
+            "link": self.link,
+            "source": self.source,
         }
-        import json
-
-        return json.dumps(meta, ensure_ascii=False, separators=(",", ":"))
+        return dumps(meta, ensure_ascii=False, separators=(",", ":"))
 
     def render_markdown(self) -> str:
-        # checkbox list (visual only)
         ck = []
         have = set(self.clouds or [])
         for label in CLOUD_LABELS:
             ck.append(f"- [{'x' if label in have else ' '}] {label}")
         clouds_line = ", ".join(self.clouds or [])
-        # Header & meta
         buf = []
         buf.append(f"## Feature {self.id} — {self.title or '(untitled)'}")
         buf.append("")

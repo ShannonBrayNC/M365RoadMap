@@ -5,14 +5,14 @@ import csv
 import datetime as dt
 import sys
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Set
 
-# Make "scripts" importable even when running as a file
+# Ensure "scripts" is importable whether run via module or file
 try:
-    from scripts.report_templates import FeatureRecord
+    from scripts.report_templates import FeatureRecord, normalize_clouds
 except Exception:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from scripts.report_templates import FeatureRecord  # type: ignore
+    from scripts.report_templates import FeatureRecord, normalize_clouds  # type: ignore
 
 
 def read_rows(master_csv: Path) -> List[Dict[str, str]]:
@@ -24,33 +24,53 @@ def read_rows(master_csv: Path) -> List[Dict[str, str]]:
     return rows
 
 
-def dedupe_latest(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    """
-    Keep the latest row per id using lastModifiedDateTime (or preserve order).
-    """
-    def get_id(r: Dict[str, str]) -> str:
-        for k in ("id", "Id", "ID", "FeatureId", "Feature ID"):
-            v = r.get(k)
+def _row_id(r: Dict[str, str]) -> str:
+    # Common ID aliases
+    for k in (
+        "PublicId",
+        "MessageId",
+        "id",
+        "Id",
+        "ID",
+        "FeatureId",
+        "Feature ID",
+        "FeatureID",
+        "Roadmap ID",
+        "RoadmapId",
+        "RoadmapID",
+    ):
+        v = r.get(k)
+        if v and str(v).strip():
+            return str(v).strip()
+    # Fallback: any column containing "id"
+    for k in r.keys():
+        if "id" in k.lower():
+            v = str(r.get(k, "")).strip()
             if v:
-                return str(v).strip()
-        return ""
+                return v
+    return ""
 
-    def get_updated(r: Dict[str, str]) -> Tuple[int, str]:
-        # Fallback to '' so max keeps later string order if needed
-        s = r.get("lastModifiedDateTime") or r.get("Last modified") or r.get("updated") or ""
-        return (0, s)
 
+def _row_updated_key(r: Dict[str, str]) -> Tuple[int, str]:
+    s = (
+        r.get("LastModified")
+        or r.get("lastModifiedDateTime")
+        or r.get("Last modified")
+        or r.get("Last Modified")
+        or r.get("updated")
+        or r.get("Last Updated")
+        or ""
+    )
+    return (1 if s else 0, s)
+
+
+def dedupe_latest(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
     latest: Dict[str, Dict[str, str]] = {}
     for r in rows:
-        fid = get_id(r)
+        fid = _row_id(r)
         if not fid:
-            # keep non-id rows out
             continue
-        if fid not in latest:
-            latest[fid] = r
-            continue
-        # naive compare; if equal we keep first
-        if get_updated(r) > get_updated(latest[fid]):
+        if fid not in latest or _row_updated_key(r) > _row_updated_key(latest[fid]):
             latest[fid] = r
     return list(latest.values())
 
@@ -67,6 +87,21 @@ def write_report(title: str, records: List[FeatureRecord], out_md: Path) -> None
     print(f"Wrote report: {out_md} (features={len(records)})", file=sys.stderr)
 
 
+def _parse_date(s: str) -> dt.datetime | None:
+    if not s:
+        return None
+    try:
+        return dt.datetime.fromisoformat(s)
+    except Exception:
+        pass
+    for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d", "%Y-%m-%dT%H:%M:%S.%fZ"):
+        try:
+            return dt.datetime.strptime(s[: len(fmt)], fmt)
+        except Exception:
+            pass
+    return None
+
+
 def main(argv: List[str]) -> int:
     import argparse
 
@@ -76,58 +111,97 @@ def main(argv: List[str]) -> int:
     ap.add_argument("--out", required=True, help="Output Markdown path")
     ap.add_argument("--since", default="", help="ISO date filter (optional)")
     ap.add_argument("--months", default="", help="Lookback in months (optional)")
-    ap.add_argument("--no-window", action="store_true", help="(compat flag) ignored")
+    ap.add_argument("--no-window", action="store_true", help="Compatibility flag (no-op)")
+
+    # Accept CI flags and actually use them
+    ap.add_argument(
+        "--cloud",
+        action="append",
+        default=[],
+        help='Repeatable cloud filter, e.g. "Worldwide (Standard Multi-Tenant)", "GCC", "GCC High", "DoD".',
+    )
+    ap.add_argument(
+        "--forced-ids",
+        default="",
+        help="Comma/semicolon separated feature IDs to force-include (bypass date/cloud filters).",
+    )
+
     args = ap.parse_args(argv)
 
     master = Path(args.master)
     if not master.exists():
         print(f"[generate_report] ERROR: master CSV missing: {master}", file=sys.stderr)
-        # still write header so downstream won't crash
         write_report(args.title, [], Path(args.out))
         return 2
 
     rows = read_rows(master)
-    if not rows:
-        write_report(args.title, [], Path(args.out))
-        return 0
+    total = len(rows)
 
-    # Optional date filter
+    # Optional date window
     since_dt: dt.datetime | None = None
     if args.since.strip():
-        try:
-            since_dt = dt.datetime.fromisoformat(args.since.strip())
-        except Exception:
-            pass
+        since_dt = _parse_date(args.since.strip())
     elif args.months.strip():
         try:
             months = int(args.months.strip())
             since_dt = dt.datetime.utcnow() - dt.timedelta(days=months * 30)
         except Exception:
-            pass
+            since_dt = None
 
-    def keep_row(r: Dict[str, str]) -> bool:
+    def keep_row_by_date(r: Dict[str, str]) -> bool:
         if not since_dt:
             return True
-        s = r.get("lastModifiedDateTime") or r.get("Last modified") or r.get("updated")
-        if not s:
-            return True
-        for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d", "%Y-%m-%dT%H:%M:%S.%fZ"):
-            try:
-                # best effort
-                t = dt.datetime.strptime(s[: len(fmt)], fmt)
-                break
-            except Exception:
-                t = None  # type: ignore
+        s = (
+            r.get("LastModified")
+            or r.get("lastModifiedDateTime")
+            or r.get("Last modified")
+            or r.get("Last Modified")
+            or r.get("updated")
+            or r.get("Last Updated")
+            or ""
+        )
+        t = _parse_date(s)
         if not t:
             return True
         if t.tzinfo:
             t = t.astimezone(dt.timezone.utc).replace(tzinfo=None)
         return t >= since_dt
 
-    rows = [r for r in rows if keep_row(r)]
+    rows = [r for r in rows if _row_id(r)]
+    with_id = len(rows)
+    rows = [r for r in rows if keep_row_by_date(r)]
+    after_date = len(rows)
     rows = dedupe_latest(rows)
-    records = [FeatureRecord.from_row(r) for r in rows if r]
+    after_dedupe = len(rows)
+
+    # Convert to records
+    records = [FeatureRecord.from_row(r) for r in rows]
+
+    # Cloud filter
+    selected_clouds = normalize_clouds(",".join(args.cloud or []))
+    if selected_clouds:
+        sc = set(selected_clouds)
+        records = [rec for rec in records if set(rec.clouds or []).intersection(sc)]
+
+    # Forced IDs: ensure present
+    forced_ids: Set[str] = set(
+        s.strip() for s in (args.forced_ids or "").replace(";", ",").split(",") if s.strip()
+    )
+    if forced_ids:
+        by_id = {rec.id: rec for rec in records}
+        original = read_rows(master)
+        for fid in forced_ids:
+            for r in original:
+                if _row_id(r) == fid:
+                    by_id[fid] = FeatureRecord.from_row(r)
+                    break
+        records = list(by_id.values())
+
     write_report(args.title, records, Path(args.out))
+    print(
+        f"[generate_report] rows: total={total} with_id={with_id} after_date={after_date} after_dedupe={after_dedupe} final={len(records)}",
+        file=sys.stderr,
+    )
     return 0
 
 
