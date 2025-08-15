@@ -188,13 +188,14 @@ jobs:
             "${DATE_FLAGS[@]}"
 
 
-      - name: Render HTML
-        if: always()
+      - name: Markdown → HTML
+        shell: bash
         run: |
           set -euo pipefail
           IN_MD="output/${TITLE}.md"
           [ -f "${IN_MD}" ] || exit 0
-          python scripts/md_to_html.py --input "${IN_MD}" --out "output/${TITLE}.html"
+          python scripts/md_to_html.py "output/${TITLE}.md" "output/${TITLE}.html"
+
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
