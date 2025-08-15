@@ -6,6 +6,7 @@ import os
 import sys
 from pathlib import Path
 
+
 def main() -> None:
     tenant = os.environ.get("TENANT") or os.environ.get("GRAPH_TENANT_ID") or ""
     client = os.environ.get("CLIENT") or os.environ.get("GRAPH_CLIENT_ID") or ""
@@ -32,6 +33,7 @@ def main() -> None:
 
     print("No Graph config available; set TENANT, CLIENT and PFX_B64 secrets.", file=sys.stderr)
     # still succeed; fetch will cope if --no-graph is set
+
 
 if __name__ == "__main__":
     main()

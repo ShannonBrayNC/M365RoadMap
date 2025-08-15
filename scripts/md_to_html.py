@@ -1,72 +1,56 @@
-#!/usr/bin/env python3
 from __future__ import annotations
-
-# Allows `python scripts/md_to_html.py` from repo root
-try:
-    from scripts import _importlib_local  # noqa: F401
-except Exception:
-    pass
 
 import argparse
 import datetime as dt
 from pathlib import Path
 
 try:
-    import markdown  # pip install markdown
-except Exception:
-    raise SystemExit("Please: pip install markdown")
+    import markdown  # type: ignore[import-untyped]
+except Exception as exc:  # pragma: no cover
+    raise SystemExit("Please: pip install markdown") from exc
 
 
-HTML_WRAP = """<!doctype html>
+_HTML_SHELL = """<!doctype html>
 <html lang="en">
-<head>
-<meta charset="utf-8">
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>{title}</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-  body {{ font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji"; margin: 2rem; line-height: 1.5; }}
-  h1,h2,h3,h4 {{ line-height: 1.2; }}
-  code, pre {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }}
-  .meta {{ color:#6b7280; font-size: 0.9rem; margin-bottom: 1rem; }}
-  hr {{ border: 0; border-top: 1px solid #e5e7eb; margin: 2rem 0; }}
+body{{font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin:2rem; line-height:1.5}}
+code, pre{{font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace}}
+hr{{border:none;border-top:1px solid #e5e7eb;margin:2rem 0}}
+h1,h2,h3{{line-height:1.2}}
+.meta{{color:#6b7280}}
 </style>
-</head>
 <body>
-<div class="meta">Generated {generated}</div>
-{body}
+<h1>{title}</h1>
+<p class="meta">Generated {generated} UTC</p>
+<hr/>
+{content}
 </body>
 </html>
 """
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--input", help="Markdown input path")
-    ap.add_argument("--out", help="HTML output path")
-    # Also allow positional fallback: md_to_html.py IN.md OUT.html
-    ap.add_argument("positional", nargs="*", help=argparse.SUPPRESS)
-    args = ap.parse_args()
+def main(argv: list[str] | None = None) -> None:
+    p = argparse.ArgumentParser()
+    p.add_argument("input", help="Markdown input path")
+    p.add_argument("out", help="HTML output path")
+    p.add_argument("--title", help="Optional HTML title", default="Roadmap Report")
+    args = p.parse_args(argv)
 
-    in_path: Path
-    out_path: Path
+    src = Path(args.input)
+    out = Path(args.out)
 
-    if args.input and args.out:
-        in_path = Path(args.input)
-        out_path = Path(args.out)
-    else:
-        if len(args.positional) != 2:
-            raise SystemExit("Usage: md_to_html.py --input IN.md --out OUT.html  (or: md_to_html.py IN.md OUT.html)")
-        in_path = Path(args.positional[0])
-        out_path = Path(args.positional[1])
+    md_text = src.read_text(encoding="utf-8")
+    html_body = markdown.markdown(md_text, extensions=["tables", "toc", "fenced_code"])  # type: ignore[no-untyped-call]
 
-    md_text = in_path.read_text(encoding="utf-8")
-    html_body = markdown.markdown(md_text, extensions=["tables", "fenced_code"])
-    generated = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    html_text = HTML_WRAP.format(title=in_path.stem, body=html_body, generated=generated)
+    generated = dt.datetime.now(dt.UTC).strftime("%Y-%m-%d %H:%M")
+    html_full = _HTML_SHELL.format(title=args.title, generated=generated, content=html_body)
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(html_text, encoding="utf-8")
-    print(f"Wrote {out_path} ({out_path.stat().st_size} bytes)")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(html_full, encoding="utf-8")
+    print(f"Wrote {out} ({len(html_full)} bytes)")
 
 
 if __name__ == "__main__":

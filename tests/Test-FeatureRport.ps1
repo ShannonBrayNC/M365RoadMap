@@ -13,4 +13,3 @@ python scripts/generate_feature_reports.py `
   "output/Test-FeatureRport.md"
 )
 python $arguments
-

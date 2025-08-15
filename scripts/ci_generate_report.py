@@ -5,7 +5,6 @@ import os
 import shlex
 import subprocess
 import sys
-from typing import List
 
 
 def _truthy(s: str | None) -> bool:
@@ -21,7 +20,7 @@ def main() -> None:
     # We just forward those; we only add optional flags from env.
 
     # Build argv safely (no heredocs, no shell conditionals).
-    argv: List[str] = [sys.executable, "-m", "scripts.generate_report"]
+    argv: list[str] = [sys.executable, "-m", "scripts.generate_report"]
 
     # The action passes required args on CLI; keep them first
     # NOTE: we pick them from sys.argv to keep this wrapper generic.

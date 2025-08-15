@@ -1,236 +1,221 @@
-# -*- coding: utf-8 -*-
-"""
-parse_roadmap_markdown.py
-Import-safe header so this script works whether called as:
-  - python -m scripts.parse_roadmap_markdown ...
-  - python scripts/parse_roadmap_markdown.py ...
-"""
-
 from __future__ import annotations
 
-# stdlib imports you likely already have below; harmless if duplicated
 import argparse
+import csv
 import datetime as dt
 import json
-import logging
 import re
-import sys
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Optional
-import csv
+
+# ------------------------------ parsing helpers ------------------------------
 
 
-# --- import shim: allow both "python -m" and "python scripts/..." styles ---
-REPO_ROOT = Path(__file__).resolve().parents[1]  # repo root
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-try:
-    # Preferred when run as a package: python -m scripts.parse_roadmap_markdown
-    from scripts.report_templates import CLOUD_LABELS, normalize_clouds, parse_date_soft
-except ImportError:
-    # Fallback when run as a file from the scripts/ directory
-    from report_templates import CLOUD_LABELS, normalize_clouds, parse_date_soft  # type: ignore[misc]
-
-
-
-# Strict markers that must match generator output
-H_FEATURE = re.compile(r"^##\s*\[(?P<id>[^\]]+)\]\s*(?P<title>.+?)\s*$")
-H_SUMMARY = re.compile(r"^###\s*Summary\s*$", re.I)
-H_CHANGING = re.compile(r"^###\s*What’s changing\s*$", re.I)
-H_IMPACT = re.compile(r"^###\s*Impact and rollout\s*$", re.I)
-H_ACTIONS = re.compile(r"^###\s*Action items\s*$", re.I)
-
-META_PATTERNS = {
-    "Product/Workload": re.compile(r"^\*\*Product/Workload:\*\*\s*(?P<val>.*)$"),
-    "Status": re.compile(r"^\*\*Status:\*\*\s*(?P<val>.*)$"),
-    "Cloud(s)": re.compile(r"^\*\*Cloud\(s\):\*\*\s*(?P<val>.*)$"),
-    "Last Modified": re.compile(r"^\*\*Last Modified:\*\*\s*(?P<val>.*)$"),
-    "Release Date": re.compile(r"^\*\*Release Date:\*\*\s*(?P<val>.*)$"),
-    "Source": re.compile(r"^\*\*Source:\*\*\s*(?P<val>.*)$"),
-    "Message ID": re.compile(r"^\*\*Message ID:\*\*\s*(?P<val>.*)$"),
-    "Official Roadmap": re.compile(r"^\*\*Official Roadmap:\*\*\s*(?P<val>.*)$"),
-}
+def _parse_iso_soft(s: str | None) -> dt.datetime | None:
+    """Parse a variety of date-ish strings, return timezone-aware UTC or None."""
+    if not s or s.strip() in {"—", "-"}:
+        return None
+    txt = s.strip()
+    try:
+        # Normalize Z to +00:00 for fromisoformat
+        if txt.endswith("Z"):
+            txt = txt[:-1] + "+00:00"
+        d = dt.datetime.fromisoformat(txt)
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=dt.UTC)
+        return d.astimezone(dt.UTC)
+    except Exception:
+        for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"):
+            try:
+                d2 = dt.datetime.strptime(txt, fmt).replace(tzinfo=dt.UTC)
+                return d2
+            except Exception:
+                pass
+    return None
 
 
-def months_to_dt_utc_approx(months: int) -> dt.datetime:
-    days = max(1, int(months) * 30)
-    return dt.datetime.utcnow() - dt.timedelta(days=days)
+_FEATURE_HEADER_RE = re.compile(r"^\[(?P<id>[^\]]+)\]\s+(?P<title>.+)$")
+# Known meta keys and the exact label used in the MD
+_KEYS = [
+    "Product/Workload",
+    "Status",
+    "Cloud(s)",
+    "Last Modified",
+    "Release Date",
+    "Source",
+    "Message ID",
+    "Official Roadmap",
+]
 
 
-def parse_features(md_text: str) -> List[Dict[str, str]]:
-    lines = md_text.splitlines()
-    i = 0
-    n = len(lines)
-    out: List[Dict[str, str]] = []
+def _split_meta_fields(line: str) -> dict[str, str]:
+    """
+    Extract 'Key: Value' pairs from the single meta line by scanning for our known keys
+    and capturing the text until the start of the next key.
+    """
+    result: dict[str, str] = {}
 
-    while i < n:
-        m = H_FEATURE.match(lines[i])
+    # Build sorted index of key positions
+    positions: list[tuple[int, str]] = []
+    for key in _KEYS:
+        pat = f"{key}:"
+        idx = line.find(pat)
+        if idx >= 0:
+            positions.append((idx, key))
+    positions.sort()
+
+    for i, (start, key) in enumerate(positions):
+        pat_len = len(f"{key}:")
+        end = positions[i + 1][0] if i + 1 < len(positions) else len(line)
+        val = line[start + pat_len : end].strip()
+        result[key] = val
+    return result
+
+
+def _clouds_to_list(clouds: str) -> list[str]:
+    if not clouds or clouds.strip() in {"—", "-"}:
+        return []
+    return [c.strip() for c in re.split(r"[;,]", clouds) if c.strip()]
+
+
+def _iter_features(md_lines: Iterable[str]) -> Iterable[dict[str, str]]:
+    """
+    Yields dicts with keys:
+      public_id, title, product, status, clouds, last_modified, release_date,
+      source, message_id, official_roadmap
+    """
+    it = iter(md_lines)
+    for raw in it:
+        m = _FEATURE_HEADER_RE.match(raw.strip())
         if not m:
-            i += 1
             continue
+        public_id = m.group("id").strip()
+        title = m.group("title").strip()
 
-        # Start of a feature
-        cur: Dict[str, str] = {
-            "PublicId": m.group("id").strip(),
-            "Title": m.group("title").strip(),
-            "Product_Workload": "",
-            "Status": "",
-            "LastModified": "",
-            "ReleaseDate": "",
-            "Cloud_instance": "",
-            "Official_Roadmap_link": "",
-            "Source": "",
-            "MessageId": "",
-            # Narrative fields
-            "Summary": "",
-            "WhatsChanging": "",
-            "ImpactAndRollout": "",
-            "ActionItems": "",
+        # Next non-empty line should be the meta line
+        meta_line = ""
+        for nxt in it:
+            if nxt.strip():
+                meta_line = nxt.strip()
+                break
+
+        meta = _split_meta_fields(meta_line)
+
+        yield {
+            "public_id": public_id,
+            "title": title,
+            "product": meta.get("Product/Workload", ""),
+            "status": meta.get("Status", ""),
+            "clouds": meta.get("Cloud(s)", ""),
+            "last_modified": meta.get("Last Modified", ""),
+            "release_date": meta.get("Release Date", ""),
+            "source": meta.get("Source", ""),
+            "message_id": meta.get("Message ID", ""),
+            "official_roadmap": meta.get("Official Roadmap", ""),
         }
-        i += 1
-
-        # Read meta block (bold label lines) until a blank + a "### ..." section
-        while i < n and lines[i].strip():
-            matched_any = False
-            for key, pat in META_PATTERNS.items():
-                mm = pat.match(lines[i])
-                if mm:
-                    val = mm.group("val").strip()
-                    if key == "Product/Workload":
-                        cur["Product_Workload"] = val
-                    elif key == "Status":
-                        cur["Status"] = val
-                    elif key == "Cloud(s)":
-                        cur["Cloud_instance"] = val
-                    elif key == "Last Modified":
-                        cur["LastModified"] = val
-                    elif key == "Release Date":
-                        cur["ReleaseDate"] = val
-                    elif key == "Source":
-                        cur["Source"] = val
-                    elif key == "Message ID":
-                        cur["MessageId"] = val
-                    elif key == "Official Roadmap":
-                        cur["Official_Roadmap_link"] = val
-                    matched_any = True
-                    break
-            if not matched_any:
-                break  # meta block ended
-            i += 1
-
-        # Skip possible single blank line
-        if i < n and not lines[i].strip():
-            i += 1
-
-        # Section bodies until next feature or EOF
-        def read_section() -> str:
-            nonlocal i
-            buf: List[str] = []
-            while i < n and not H_FEATURE.match(lines[i]) and not H_SUMMARY.match(lines[i]) and not H_CHANGING.match(lines[i]) and not H_IMPACT.match(lines[i]) and not H_ACTIONS.match(lines[i]):
-                buf.append(lines[i])
-                i += 1
-            return "\n".join(buf).strip()
-
-        while i < n and not H_FEATURE.match(lines[i]):
-            if H_SUMMARY.match(lines[i]):
-                i += 1
-                cur["Summary"] = read_section()
-            elif H_CHANGING.match(lines[i]):
-                i += 1
-                cur["WhatsChanging"] = read_section()
-            elif H_IMPACT.match(lines[i]):
-                i += 1
-                cur["ImpactAndRollout"] = read_section()
-            elif H_ACTIONS.match(lines[i]):
-                i += 1
-                cur["ActionItems"] = read_section()
-            else:
-                # Unexpected line inside feature; consume it to avoid infinite loop
-                i += 1
-
-        out.append(cur)
-
-    return out
 
 
-def write_csv_json(
-    rows: List[Dict[str, str]],
-    csv_path: Optional[Path],
-    json_path: Optional[Path],
-) -> None:
-    if not rows:
-        # Still write empty skeleton so downstream steps don't blow up
-        headers = [
-            "PublicId",
-            "Title",
-            "Source",
-            "Product_Workload",
-            "Status",
-            "LastModified",
-            "ReleaseDate",
-            "Cloud_instance",
-            "Official_Roadmap_link",
-            "MessageId",
-            "Summary",
-            "WhatsChanging",
-            "ImpactAndRollout",
-            "ActionItems",
-        ]
-        if csv_path:
-            with csv_path.open("w", encoding="utf-8", newline="") as f:
-                csv.writer(f).writerow(headers)
-            print("No data to write to CSV.")
-        if json_path:
-            json_path.write_text("[]", encoding="utf-8")
-        return
-
-    headers = list(rows[0].keys())
-    if csv_path:
-        with csv_path.open("w", encoding="utf-8", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=headers)
-            w.writeheader()
-            w.writerows(rows)
-        print(f"CSV written to {csv_path}")
-    if json_path:
-        json_path.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"JSON written to {json_path}")
+def _in_window(
+    last_modified: dt.datetime | None,
+    since: dt.datetime | None,
+    months: int | None,
+    now_utc: dt.datetime,
+) -> bool:
+    """Apply --since or --months filter if provided."""
+    if last_modified is None:
+        return True  # keep if unknown
+    if since and last_modified < since:
+        return False
+    if months is not None:
+        cutoff = now_utc - dt.timedelta(days=months * 30)
+        if last_modified < cutoff:
+            return False
+    return True
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--input", required=True, help="Markdown input produced by generate_report.py")
-    ap.add_argument("--csv", default="", help="Optional CSV output")
-    ap.add_argument("--json", default="", help="Optional JSON output")
-    ap.add_argument("--months", type=int, default=None, help="Optional lookback months")
-    ap.add_argument("--since", default="", help="Optional YYYY-MM-DD lower bound (overrides months)")
-    args = ap.parse_args()
+# ------------------------------ write helpers --------------------------------
+
+
+def _write_csv(rows: list[dict[str, str]], out_path: Path) -> None:
+    headers = [
+        "PublicId",
+        "Title",
+        "Source",
+        "Product_Workload",
+        "Status",
+        "LastModified",
+        "ReleaseDate",
+        "Cloud_instance",
+        "Official_Roadmap_link",
+        "MessageId",
+    ]
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(headers)
+        for r in rows:
+            w.writerow(
+                [
+                    r.get("public_id", ""),
+                    r.get("title", ""),
+                    r.get("source", ""),
+                    r.get("product", ""),
+                    r.get("status", ""),
+                    r.get("last_modified", ""),
+                    r.get("release_date", ""),
+                    r.get("clouds", ""),
+                    r.get("official_roadmap", ""),
+                    r.get("message_id", ""),
+                ]
+            )
+
+
+def _write_json(rows: list[dict[str, str]], out_path: Path) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as f:
+        json.dump(rows, f, indent=2, ensure_ascii=False)
+
+
+# ----------------------------------- CLI -------------------------------------
+
+
+def main(argv: list[str] | None = None) -> None:
+    p = argparse.ArgumentParser()
+    p.add_argument("--input", required=True, help="Path to markdown report.")
+    p.add_argument("--csv", help="CSV output path", default=None)
+    p.add_argument("--json", help="JSON output path", default=None)
+    p.add_argument("--months", type=int, default=None, help="Limit to last N months")
+    p.add_argument(
+        "--since", type=str, default=None, help="Limit to items modified on/after YYYY-MM-DD"
+    )
+    args = p.parse_args(argv)
 
     src = Path(args.input)
-    md_text = src.read_text(encoding="utf-8")
+    if not src.exists():
+        raise SystemExit(f"Input not found: {src}")
 
-    feats = parse_features(md_text)
+    now = dt.datetime.now(dt.UTC)
+    since_dt = _parse_iso_soft(args.since) if args.since else None
 
-    # Filter by dates if requested (based on LastModified)
-    since_dt: Optional[dt.datetime] = None
-    if args.months is not None:
-        since_dt = months_to_dt_utc_approx(args.months)
-    if args.since:
-        try:
-            since_dt = dt.datetime.strptime(args.since.strip(), "%Y-%m-%d")
-        except Exception:
-            pass
+    lines = src.read_text(encoding="utf-8").splitlines()
+    all_rows = list(_iter_features(lines))
 
-    if since_dt is not None:
-        feats = [
-            r
-            for r in feats
-            if (parse_date_soft(r.get("LastModified", "")) or dt.datetime.min) >= since_dt
-        ]
+    filtered: list[dict[str, str]] = []
+    for row in all_rows:
+        lm = _parse_iso_soft(row.get("last_modified"))
+        if _in_window(lm, since_dt, args.months, now):
+            filtered.append(row)
 
-    csv_path = Path(args.csv) if args.csv else None
-    json_path = Path(args.json) if args.json else None
-    write_csv_json(feats, csv_path, json_path)
+    # Always write CSV/JSON if requested, even if empty — but be explicit
+    if args.csv:
+        _write_csv(filtered, Path(args.csv))
+        if not filtered:
+            print("No data to write to CSV.")
+    if args.json:
+        _write_json(filtered, Path(args.json))
+
+    # quiet exit
+    return
 
 
 if __name__ == "__main__":

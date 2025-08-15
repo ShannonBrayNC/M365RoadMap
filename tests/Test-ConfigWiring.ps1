@@ -35,7 +35,7 @@ python scripts/fetch_messages_graph.py `
   --cloud "General" --cloud "GCC" --cloud "GCC High" --cloud "DoD" `
   --emit csv --out output/roadmap_report_master.csv `
   --stats-out output/fetch_stats.json
-  
+
 
 # 3) Generate the final report (sample)
 python scripts/generate_feature_reports.py `
@@ -46,5 +46,3 @@ python scripts/generate_feature_reports.py `
 
 
   certutil -dump _diag.pfx -p $env:M365_PFX_PASSWORD
-
-  

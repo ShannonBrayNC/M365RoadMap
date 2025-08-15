@@ -1,11 +1,11 @@
 from __future__ import annotations
-from dataclasses import dataclass
-from typing import Optional, Dict
+
 import datetime as dt
 import re
+from dataclasses import dataclass
 
 # ---- Cloud helpers expected by other scripts ----
-CLOUD_LABELS: Dict[str, str] = {
+CLOUD_LABELS: dict[str, str] = {
     "General": "Worldwide (Standard Multi-Tenant)",
     "GCC": "GCC",
     "GCC High": "GCC High",
@@ -13,7 +13,8 @@ CLOUD_LABELS: Dict[str, str] = {
     "Worldwide (Standard Multi-Tenant)": "Worldwide (Standard Multi-Tenant)",
 }
 
-def normalize_clouds(raw: Optional[str]) -> str:
+
+def normalize_clouds(raw: str | None) -> str:
     s = (raw or "").strip()
     if not s:
         return "—"
@@ -22,8 +23,11 @@ def normalize_clouds(raw: Optional[str]) -> str:
         return CLOUD_LABELS["General"]
     return CLOUD_LABELS.get(s, s)
 
+
 _ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
-def parse_date_soft(value: Optional[str]) -> str:
+
+
+def parse_date_soft(value: str | None) -> str:
     """
     Try to normalize various date-ish inputs to YYYY-MM-DD.
     If parsing fails, return the original string (or '—' if empty).
@@ -49,29 +53,33 @@ def parse_date_soft(value: Optional[str]) -> str:
             continue
     return s
 
+
 # ---- Markdown rendering (for generate_report.py) ----
 
-def _dash(v: Optional[str]) -> str:
+
+def _dash(v: str | None) -> str:
     v = (v or "").strip()
     return v if v else "—"
+
 
 @dataclass
 class FeatureRecord:
     public_id: str
     title: str
-    product_workload: Optional[str] = None
-    status: Optional[str] = None
-    clouds_display: Optional[str] = None
-    last_modified: Optional[str] = None
-    release_date: Optional[str] = None
-    source: Optional[str] = None
-    message_id: Optional[str] = None
-    official_url: Optional[str] = None
+    product_workload: str | None = None
+    status: str | None = None
+    clouds_display: str | None = None
+    last_modified: str | None = None
+    release_date: str | None = None
+    source: str | None = None
+    message_id: str | None = None
+    official_url: str | None = None
     # Filled from Message Center body extraction:
-    summary: Optional[str] = None
-    whats_changing: Optional[str] = None
-    impact_rollout: Optional[str] = None
-    action_items: Optional[str] = None
+    summary: str | None = None
+    whats_changing: str | None = None
+    impact_rollout: str | None = None
+    action_items: str | None = None
+
 
 def render_header(title: str, generated_utc: str, cloud_display: str, total_features: int) -> str:
     lines = []
@@ -83,8 +91,10 @@ def render_header(title: str, generated_utc: str, cloud_display: str, total_feat
     lines.append("")
     return "\n".join(lines)
 
-def _section(label: str, body: Optional[str]) -> str:
+
+def _section(label: str, body: str | None) -> str:
     return f"{label}\n{(body or '(pending)')}\n"
+
 
 def render_feature_markdown(fr: FeatureRecord) -> str:
     header = f"[{fr.public_id}] {fr.title}"

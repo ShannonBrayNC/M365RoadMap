@@ -39,6 +39,15 @@ on:
         description: Include DoD
         required: false
         default: "false"
+      products:
+        description: "Products/workloads to include (CSV or ; separated: e.g., Teams, Intune, SharePoint). Leave blank for all."
+        required: false
+        type: string
+      deep_dive:
+        description: "Include AI deep dive (RSS/public) sources"
+        required: false
+        default: true
+        type: boolean
 
 jobs:
   build:
