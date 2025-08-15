@@ -11,6 +11,8 @@ import re  # ← and this
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
+from dataclasses import dataclass, asdict
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 try:
     import requests  # type: ignore[import-untyped]
