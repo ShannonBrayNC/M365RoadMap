@@ -1,494 +1,459 @@
 #!/usr/bin/env python3
-# scripts/fetch_messages_graph.py
 from __future__ import annotations
+
+# Allow running from repo root: `python scripts/fetch_messages_graph.py`
+try:
+    from scripts import _importlib_local  # noqa: F401
+except Exception:
+    pass
 
 import argparse
 import csv
 import datetime as dt
+import html
 import json
-import os
 import re
 import sys
-from dataclasses import dataclass, asdict
-from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
-# Optional deps
-try:
-    from bs4 import BeautifulSoup  # type: ignore
-except Exception:  # pragma: no cover
-    BeautifulSoup = None  # type: ignore
-
-try:
-    import feedparser  # type: ignore
-except Exception:  # pragma: no cover
-    feedparser = None  # type: ignore
-
-# Local Graph client
+# Optional Graph client (only used when --config is provided or env has creds)
 try:
     from scripts.graph_client import GraphClient, GraphConfig  # type: ignore
-except Exception:
-    from graph_client import GraphClient, GraphConfig  # type: ignore
+except Exception:  # pragma: no cover - unit tests can run without Graph
+    GraphClient = None  # type: ignore
+    GraphConfig = None  # type: ignore
 
-PUBLIC_ROADMAP_JSON = "https://www.microsoft.com/releasecommunications/api/v1/m365"
-PUBLIC_ROADMAP_RSS = "https://www.microsoft.com/releasecommunications/api/v2/m365/rss"
+# Cloud helpers shared with generator/parser
+from scripts.report_templates import normalize_clouds, parse_date_soft
 
 
+# ------------------------------- CLI ---------------------------------
 
-
-def _session_with_retries() -> requests.Session:
-    s = requests.Session()
-    retry = Retry(
-        total=5,
-        connect=5,
-        read=5,
-        backoff_factor=1.2,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset({"GET"}),
-        respect_retry_after_header=True,
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", help="graph_config.json (or use env via GraphConfig.from_env)")
+    ap.add_argument("--since", default="", help="YYYY-MM-DD lower bound for LastModified/Published date")
+    ap.add_argument("--months", type=int, default=None, help="Lookback window in months (approx 30d each)")
+    ap.add_argument("--ids", default="", help="Comma-separated Roadmap IDs to force include")
+    ap.add_argument(
+        "--tenant-cloud",
+        default="",
+        help="Deprecated alias for --cloud; still accepted for compatibility.",
     )
-    adapter = HTTPAdapter(max_retries=retry)
-    s.mount("https://", adapter)
-    s.mount("http://", adapter)
-    return s
+    # Accept multi-word clouds without quotes: nargs="+" captures tokens like
+    # --cloud Worldwide (Standard Multi-Tenant) as ['Worldwide','(Standard','Multi-Tenant)']
+    ap.add_argument(
+        "--cloud",
+        action="append",
+        nargs="+",
+        default=None,
+        help="Cloud(s) to include (repeatable). Examples: "
+             "'General', 'GCC', 'GCC High', 'DoD', 'Worldwide (Standard Multi-Tenant)'.",
+    )
+    ap.add_argument("--no-graph", action="store_true", help="Skip Graph calls")
+    ap.add_argument("--no-public-scrape", action="store_true", help="Skip RSS/public fallback")
+    ap.add_argument(
+        "--emit",
+        choices=("csv", "json"),
+        required=True,
+        help="Output format",
+    )
+    ap.add_argument("--out", required=True, help="Output file path")
+    ap.add_argument("--no-window", action="store_true", help="Disable date windowing entirely")
+    ap.add_argument("--stats-out", default="", help="Optional path to write a small stats JSON")
+
+    args = ap.parse_args(argv)
+
+    # Flatten --cloud where each occurrence may be a list of tokens (nargs="+")
+    selected: Set[str] = set()
+    if args.cloud:
+        for parts in args.cloud:
+            normalized = normalize_clouds(" ".join(parts))
+            selected |= normalized
+
+    # Back-compat: --tenant-cloud
+    if args.tenant_cloud:
+        selected |= normalize_clouds(args.tenant_cloud)
+
+    args.selected_clouds = selected
+    return args
 
 
-def _iso(dt_: Optional[dt.datetime]) -> str:
-    if not dt_:
-        return ""
-    if dt_.tzinfo is None:
-        dt_ = dt_.replace(tzinfo=dt.timezone.utc)
-    return dt_.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+# ----------------------------- Utilities ------------------------------
 
-
-def _parse_date(maybe_date: Any) -> Optional[dt.datetime]:
-    if not maybe_date:
-        return None
-    try:
-        from dateutil import parser as dateparser  # type: ignore
-        return dateparser.isoparse(str(maybe_date))
-    except Exception:
-        try:
-            return dt.datetime.strptime(str(maybe_date)[:10], "%Y-%m-%d").replace(tzinfo=dt.timezone.utc)
-        except Exception:
-            return None
-
-
-# ------------- Cloud selection -------------
-def _norm_cloud(s: str) -> str:
-    s = (s or "").strip().lower()
-    if not s:
-        return ""
-    if s in {"general", "worldwide", "standard", "ww", "worldwide (standard multi-tenant)"}:
-        return "worldwide (standard multi-tenant)"
-    if s in {"gcc high", "gcch", "high"}:
-        return "gcc high"
-    if s in {"dod", "us dod", "department of defense"}:
-        return "dod"
-    if s in {"gcc"}:
-        return "gcc"
-    return s
-
-
-def include_by_cloud(item_cloud: str, clouds_selected: List[str]) -> bool:
-    if not clouds_selected:
-        return True
-    sel = {_norm_cloud(c) for c in clouds_selected}
-    if not item_cloud:
-        return True  # unknown cloud → include
-    return _norm_cloud(item_cloud) in sel
-
-
-# ------------- Roadmap ID extraction -------------
-_PATTERNS = [
-    # Canonical URL query patterns
-    re.compile(r"featureid(?:=|%3[dD])(\d{4,7})", re.I),
-    re.compile(r"searchterms?(?:=|%3[dD])(\d{4,7})", re.I),
-    # Path pattern
-    re.compile(r"/roadmap/feature/(\d{4,7})", re.I),
-    # Prose like "Feature ID: 498158" or "Roadmap ID-498158"
-    re.compile(r"(?:feature\s*id|roadmap\s*id)\s*[:#-]?\s*(\d{4,7})", re.I),
-    # Any 6-digit near the word 'roadmap' or 'feature'
-    re.compile(r"(?:roadmap|feature)[^0-9]{0,20}(\d{6})", re.I),
-    # Fallback: 49xxxx tokens surrounded by non-alnum
-    re.compile(r"(?:^|[^A-Za-z0-9])(49\d{3,4})(?:[^A-Za-z0-9]|$)"),
+HEADERS_MASTER = [
+    "PublicId",
+    "Title",
+    "Source",
+    "Product_Workload",
+    "Status",
+    "LastModified",
+    "ReleaseDate",
+    "Cloud_instance",
+    "Official_Roadmap_link",
+    "MessageId",
 ]
 
+ROADMAP_LINK_TMPL = "https://www.microsoft.com/microsoft-365/roadmap?filters=&searchterms={id}"
 
-def _ids_from_text(text: str) -> set[str]:
-    ids: set[str] = set()
-    low = text.lower()
-    for pat in _PATTERNS:
-        for m in pat.findall(low):
-            ids.add(str(m))
-    return {i for i in ids if i.isdigit() and 400000 <= int(i) <= 999999}
+# Very tolerant Roadmap-ID scraping from HTML bodies (Graph) or RSS descriptions
+_RE_ROADMAP_ID = re.compile(
+    r"(?:Roadmap\s*ID|Feature\s*ID|Roadmap\s*#|Feature\s*#)\D{0,10}(\d{3,8})",
+    re.I,
+)
 
+_RE_ANY_ID = re.compile(r"\b(\d{4,8})\b")
 
-def extract_roadmap_ids_from_html(html_body: str) -> set[str]:
-    if not html_body:
-        return set()
-    ids = set()
-    ids |= _ids_from_text(html_body)
-    if BeautifulSoup is None:
-        return ids
-    import html as htmllib, urllib.parse as up
-    soup = BeautifulSoup(htmllib.unescape(html_body), "lxml")
-    for a in soup.find_all("a"):
-        href = a.get("href") or ""
-        if not href:
-            continue
-        parsed = up.urlparse(href)
-        q = up.parse_qs(parsed.query)
-        if "url" in q:  # redir.aspx?url=<encoded target>
-            href = up.unquote(q["url"][0])
-        ids |= _ids_from_text(href.lower())
-        q2 = up.parse_qs(up.urlparse(href).query)
-        for key in ("featureid", "searchterm", "searchterms"):
-            for v in q2.get(key, []):
-                if v.isdigit() and 400000 <= int(v) <= 999999:
-                    ids.add(v)
-    return ids
+_RE_CLOUD = re.compile(r"Cloud\s*Instance:\s*([^<\n\r]+)", re.I)
+_RE_STATUS = re.compile(r"Status:\s*([^<\n\r]+)", re.I)
+_RE_WORKLOAD = re.compile(r"(?:Workload|Product):\s*([^<\n\r]+)", re.I)
+_RE_RELEASE = re.compile(r"(?:Release\s*(?:date|phase)?\s*:\s*|GA\s*:\s*)([^<\n\r]+)", re.I)
 
 
-# ------------- Data model -------------
-@dataclass
-class Row:
-    PublicId: str
-    Title: str
-    Source: str  # graph | public-json | rss | forced
-    Product_Workload: str = ""
-    Status: str = ""
-    LastModified: str = ""
-    ReleaseDate: str = ""
-    Cloud_instance: str = ""
-    Official_Roadmap_link: str = ""
-    MessageId: str = ""  # Graph MC id
+def safe_get(d: Dict, *keys, default=None):
+    cur = d
+    for k in keys:
+        if not isinstance(cur, dict) or k not in cur:
+            return default
+        cur = cur[k]
+    return cur
 
 
-def _row_link(fid: str) -> str:
-    return f"https://www.microsoft.com/microsoft-365/roadmap?searchterms={fid}"
+def to_iso(dt_str: str) -> str:
+    """Best-effort to normalize dates to ISO."""
+    d = parse_date_soft(dt_str)
+    return d.strftime("%Y-%m-%d") if d else (dt_str.strip() if dt_str else "")
 
 
-# ------------- Fetchers -------------
-def fetch_public_json(stats: Dict[str, Any]) -> List[Dict[str, Any]]:
-    s = _session_with_retries()
-    try:
-        r = s.get(PUBLIC_ROADMAP_JSON, timeout=(5, 30))
-        r.raise_for_status()
-        data = r.json()
-        items = data if isinstance(data, list) else data.get("value") or data.get("items") or []
-        stats.setdefault("source_counts", {}).setdefault("public-json-raw", 0)
-        stats["source_counts"]["public-json-raw"] = len(items)
-        return items
-    except Exception as e:  # pragma: no cover
-        stats.setdefault("errors", []).append(f"public-json: {e}")
+# ------------------------- Public helpers (tests) ---------------------
+
+def extract_roadmap_ids_from_html(html_text: str) -> List[str]:
+    """
+    Extract plausible roadmap IDs from an HTML (or text) blob.
+    Prefers labeled forms like 'Roadmap ID: 123456' but will fall back
+    to bare 4-8 digit numbers when present.
+    """
+    if not html_text:
         return []
+    text = html.unescape(html_text)
+    ids = set(m.group(1) for m in _RE_ROADMAP_ID.finditer(text))
+    if not ids:
+        ids = set(m.group(1) for m in _RE_ANY_ID.finditer(text))
+    # Drop obvious non-roadmap values (leading zeros or too big/small)
+    out = [i.lstrip("0") or "0" for i in ids if 1000 <= int(i) <= 99999999]
+    return sorted(set(out), key=int)
 
 
-def transform_public_items(items: List[Dict[str, Any]]) -> List[Row]:
-    rows: List[Row] = []
-    for it in items:
-        lower = {k.lower(): k for k in it.keys()}
-        fid = ""
-        for key in ("featureid", "publicid", "id", "feature_id"):
-            k = lower.get(key)
-            if k:
-                v = str(it.get(k) or "").strip()
-                if v.isdigit():
-                    fid = v
-                    break
-        if not fid:
-            for lk in ("link", "roadmaplink", "url", "weburl"):
-                k = lower.get(lk)
-                if k:
-                    m = re.search(r"(\d{6})", str(it.get(k) or ""))
-                    if m:
-                        fid = m.group(1)
-                        break
-        if not fid:
-            continue
-        title = str(it.get(lower.get("title") or "title", "") or "")
-        product = str(it.get(lower.get("workload") or lower.get("product") or "workload", "") or "")
-        status = str(it.get(lower.get("status") or lower.get("state") or "status", "") or "")
-        cloud = str(it.get(lower.get("cloud instance") or lower.get("cloud") or "cloud", "") or "")
-        lm = str(it.get(lower.get("lastmodified") or lower.get("lastupdated") or "lastModified", "") or "")
-        rel = str(it.get(lower.get("releasedate") or lower.get("startdate") or "releaseDate", "") or "")
-        rows.append(
-            Row(
-                PublicId=fid,
-                Title=title,
-                Source="public-json",
-                Product_Workload=product,
-                Status=status,
-                LastModified=_iso(_parse_date(lm)),
-                ReleaseDate=_iso(_parse_date(rel)),
-                Cloud_instance=cloud,
-                Official_Roadmap_link=_row_link(fid),
-            )
-        )
-    return rows
+def include_by_cloud(row_cloud_field: str, selected: Set[str]) -> bool:
+    """
+    Determine if a row with 'Cloud_instance' should be included for selected clouds.
+    Missing cloud is treated as 'General' only if 'General' was requested.
+    """
+    if not selected:
+        return True
+    tags = normalize_clouds(row_cloud_field)
+    if tags:
+        return bool(tags & selected)
+    return "General" in selected
 
 
-def fetch_rss(stats: Dict[str, Any]) -> List[Dict[str, Any]]:
-    if feedparser is None:
-        stats.setdefault("errors", []).append("rss: feedparser not installed; skipping")
-        return []
+# ------------------------------ Fetchers ------------------------------
+
+def fetch_graph_rows(cfg_path: Optional[str], since_dt: Optional[dt.datetime], sources: Dict[str, int], errors: List[str]) -> List[Dict[str, str]]:
+    rows: List[Dict[str, str]] = []
+    if GraphClient is None or GraphConfig is None:
+        return rows
+
+    # Build config
     try:
-        fp = feedparser.parse(PUBLIC_ROADMAP_RSS)
-        entries = getattr(fp, "entries", []) or []
-        stats.setdefault("source_counts", {}).setdefault("rss-raw", 0)
-        stats["source_counts"]["rss-raw"] = len(entries)
-        return [e for e in entries]
-    except Exception as e:  # pragma: no cover
-        stats.setdefault("errors", []).append(f"rss: {e}")
-        return []
-
-
-def transform_rss(entries: List[Dict[str, Any]]) -> List[Row]:
-    rows: List[Row] = []
-    for e in entries:
-        title = str(e.get("title", "") or "")
-        summary = str(e.get("summary", "") or "")
-        link = str(e.get("link", "") or "")
-        fid = ""
-        m = re.search(r"(\d{6})", link) or re.search(r"(\d{6})", summary)
-        if m:
-            fid = m.group(1)
-        if not fid:
-            continue
-        lm = e.get("updated") or e.get("published") or ""
-        rows.append(
-            Row(
-                PublicId=fid,
-                Title=title,
-                Source="rss",
-                LastModified=_iso(_parse_date(lm)),
-                Official_Roadmap_link=_row_link(fid),
-            )
-        )
-    return rows
-
-
-def fetch_graph(cfg_path: Optional[str], since: Optional[dt.datetime], stats: Dict[str, Any]) -> List[Dict[str, Any]]:
-    try:
-        cfg = GraphConfig.from_file(cfg_path) if (cfg_path and os.path.exists(cfg_path)) else GraphConfig.from_env()
-        client = GraphClient(cfg)
+        if cfg_path:
+            cfg = GraphConfig.from_file(cfg_path)
+        else:
+            cfg = GraphConfig.from_env()
     except Exception as e:
-        stats.setdefault("errors", []).append(f"graph-init: {e}")
-        return []
-    msgs: List[Dict[str, Any]] = []
+        errors.append(f"graph-config: {e}")
+        return rows
+
     try:
-        kwargs: Dict[str, Any] = {"top": 100, "include_drafts": True}
-        if since:
-            kwargs["last_modified_ge"] = since
-        for msg in client.iter_service_messages(**kwargs):
-            msgs.append(msg)
-        stats.setdefault("source_counts", {})["graph-raw"] = len(msgs)
-        return msgs
-    except Exception as e:  # pragma: no cover
-        stats.setdefault("errors", []).append(f"graph-fetch: {e}")
-        return []
+        cli = GraphClient(cfg)
+        it = cli.iter_service_messages(
+            top=100,
+            last_modified_ge=None if not since_dt else since_dt,
+        )
+        for msg in it:
+            sources["graph-raw"] = sources.get("graph-raw", 0) + 1
+            title = (msg.get("title") or "").strip()
+            mid = (msg.get("id") or "").strip()
+            lm = (msg.get("lastModifiedDateTime") or "").strip()
+            last_mod = to_iso(lm)
 
+            # Services/workloads is a list
+            services = msg.get("services") or []
+            product = ", ".join([s for s in services if isinstance(s, str)]) if isinstance(services, list) else ""
 
-def transform_graph_messages(msgs: List[Dict[str, Any]]) -> List[Row]:
-    rows: List[Row] = []
-    for m in msgs:
-        mcid = str(m.get("id", "") or "")
-        title = str(m.get("title", "") or "")
-        services = ", ".join(m.get("services", []) or [])
-        classification = str(m.get("classification", "") or m.get("state", "") or "")
-        lm = str(m.get("lastModifiedDateTime", "") or "")
-        body_html = ""
-        try:
-            body_html = m.get("body", {}).get("content", "") or ""
-        except Exception:
-            pass  # body may be missing
-        fids = extract_roadmap_ids_from_html(body_html)
-        if not fids:
-            rows.append(
-                Row(
-                    PublicId="",
-                    Title=title,
-                    Source="graph",
-                    Product_Workload=services,
-                    Status=classification,
-                    LastModified=_iso(_parse_date(lm)),
-                    MessageId=mcid,
-                )
-            )
-            continue
-        for fid in sorted(fids):
-            rows.append(
-                Row(
-                    PublicId=fid,
-                    Title=title,
-                    Source="graph",
-                    Product_Workload=services,
-                    Status=classification,
-                    LastModified=_iso(_parse_date(lm)),
-                    Official_Roadmap_link=_row_link(fid),
-                    MessageId=mcid,
-                )
-            )
+            # Body content
+            body_html = safe_get(msg, "body", "content", default="") or ""
+            rids = extract_roadmap_ids_from_html(body_html)
+
+            if not rids:
+                # Still record a message row without a Roadmap ID (optional)
+                continue
+
+            for rid in rids:
+                row = {
+                    "PublicId": rid,
+                    "Title": title,
+                    "Source": "graph",
+                    "Product_Workload": product,
+                    "Status": "",  # Graph messages don't map cleanly to Roadmap status
+                    "LastModified": last_mod,
+                    "ReleaseDate": "",
+                    "Cloud_instance": "",  # not directly in Graph message; downstream may enrich
+                    "Official_Roadmap_link": ROADMAP_LINK_TMPL.format(id=rid),
+                    "MessageId": mid,
+                }
+                rows.append(row)
+                sources["graph"] = sources.get("graph", 0) + 1
+
+    except Exception as e:
+        errors.append(f"graph-fetch: {e}")
+
     return rows
 
 
-# ------------- Filtering & merge -------------
-def _within_window(row: Row, since: Optional[dt.datetime]) -> bool:
-    if since is None:
-        return True
-    d = _parse_date(row.LastModified) or _parse_date(row.ReleaseDate)
-    if not d:
-        return True
-    return d >= since
+def fetch_rss_rows(since_dt: Optional[dt.datetime], sources: Dict[str, int], errors: List[str]) -> List[Dict[str, str]]:
+    """
+    Minimal dependency RSS fetch for the public Roadmap feed.
+    """
+    rows: List[Dict[str, str]] = []
+    url = "https://www.microsoft.com/en-us/microsoft-365/RoadmapFeatureRSS"
+    try:
+        resp = requests.get(url, timeout=(10, 30))
+        resp.raise_for_status()
+        xml = resp.text
+    except Exception as e:
+        errors.append(f"rss-fetch: {e}")
+        return rows
 
+    # Crude item splitting; the feed is simple enough for this.
+    items = re.split(r"</item>\s*<item>", xml, flags=re.I)
+    if items:
+        # normalize: first/last may have surrounding tags
+        if items[0].strip().endswith("</item>"):
+            pass
+        else:
+            # remove header up to first <item>
+            first_split = re.split(r"<item>", items[0], flags=re.I)
+            items[0] = first_split[-1]
+        if items[-1].strip().startswith("<item>"):
+            pass
+        else:
+            # strip closing tags after last </item>
+            items[-1] = re.split(r"</item>", items[-1], 1, flags=re.I)[0]
 
-def merge_sources(
-    graph_rows: List[Row],
-    public_rows: List[Row],
-    rss_rows: List[Row],
-    forced_ids: List[str],
-    clouds: List[str],
-    since: Optional[dt.datetime],
-    stats: Dict[str, Any],
-) -> List[Row]:
-    out: List[Row] = []
-    for r in graph_rows:
-        if _within_window(r, since):
-            out.append(r)
-    for r in public_rows:
-        if include_by_cloud(r.Cloud_instance, clouds) and _within_window(r, since):
-            out.append(r)
-    for r in rss_rows:
-        if _within_window(r, since):
-            out.append(r)
-
-    have = {r.PublicId for r in out if r.PublicId}
-    for fid in forced_ids:
-        if fid and fid.isdigit() and fid not in have:
-            out.append(Row(PublicId=fid, Title="", Source="forced", Official_Roadmap_link=_row_link(fid)))
-
-    seen: set[Tuple[str, str, str]] = set()
-    dedup: List[Row] = []
-    for r in out:
-        key = (r.Source, r.PublicId or "", r.MessageId or "")
-        if key in seen:
+    for raw in items:
+        if "<title>" not in raw:
             continue
-        seen.add(key)
-        dedup.append(r)
+        sources["rss-raw"] = sources.get("rss-raw", 0) + 1
 
-    cnts = {"graph": 0, "public-json": 0, "rss": 0, "forced": 0}
-    for r in dedup:
-        cnts[r.Source] = cnts.get(r.Source, 0) + 1
-    stats.setdefault("source_counts", {}).update(cnts)
-    return dedup
+        title = re.search(r"<title><!\[CDATA\[(.*?)\]\]></title>|<title>(.*?)</title>", raw, re.I | re.S)
+        ttext = html.unescape((title.group(1) or title.group(2) or "").strip()) if title else ""
+
+        linkm = re.search(r"<link>(.*?)</link>", raw, re.I | re.S)
+        link = (linkm.group(1).strip() if linkm else "")
+
+        descm = re.search(r"<description><!\[CDATA\[(.*?)\]\]></description>|<description>(.*?)</description>", raw, re.I | re.S)
+        desc = (descm.group(1) or descm.group(2) or "").strip() if descm else ""
+
+        pubm = re.search(r"<pubDate>(.*?)</pubDate>", raw, re.I | re.S)
+        pub = (pubm.group(1).strip() if pubm else "")
+        # Some feeds include lastUpdate - we stick to pubDate if present
+
+        # Extract metadata from description HTML/text
+        rid_list = extract_roadmap_ids_from_html(desc) or extract_roadmap_ids_from_html(ttext) or extract_roadmap_ids_from_html(link)
+        cloud_val = (re.search(_RE_CLOUD, desc or "") or re.search(_RE_CLOUD, ttext or "") or re.search(_RE_CLOUD, link or ""))
+        status_val = (re.search(_RE_STATUS, desc or "") or re.search(_RE_STATUS, ttext or ""))
+        workload_val = (re.search(_RE_WORKLOAD, desc or "") or re.search(_RE_WORKLOAD, ttext or ""))
+        release_val = (re.search(_RE_RELEASE, desc or "") or None)
+
+        clouds = cloud_val.group(1).strip() if cloud_val else ""
+        status = status_val.group(1).strip() if status_val else ""
+        workload = workload_val.group(1).strip() if workload_val else ""
+        release = to_iso(release_val.group(1)) if release_val else ""
+
+        # If no explicit roadmap ID extracted, try the link querystring (?filters=&searchterms=123456)
+        if not rid_list and "searchterms=" in link:
+            try:
+                rid_list = [re.search(r"searchterms=(\d+)", link).group(1)]
+            except Exception:
+                pass
+
+        if not rid_list:
+            continue
+
+        for rid in rid_list:
+            row = {
+                "PublicId": rid,
+                "Title": ttext,
+                "Source": "rss",
+                "Product_Workload": workload,
+                "Status": status,
+                "LastModified": to_iso(pub),
+                "ReleaseDate": release,
+                "Cloud_instance": clouds,
+                "Official_Roadmap_link": link or ROADMAP_LINK_TMPL.format(id=rid),
+                "MessageId": "",  # not applicable for RSS
+            }
+            rows.append(row)
+            sources["rss"] = sources.get("rss", 0) + 1
+
+    return rows
 
 
-# ------------- I/O -------------
-def write_csv(rows: List[Row], path: str) -> None:
-    cols = [
-        "PublicId",
-        "Title",
-        "Source",
-        "Product_Workload",
-        "Status",
-        "LastModified",
-        "ReleaseDate",
-        "Cloud_instance",
-        "Official_Roadmap_link",
-        "MessageId",
-    ]
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=cols)
+# --------------------------- Transformations --------------------------
+
+def apply_window(rows: List[Dict[str, str]], since_dt: Optional[dt.datetime]) -> List[Dict[str, str]]:
+    if since_dt is None:
+        return rows
+    out: List[Dict[str, str]] = []
+    for r in rows:
+        d = parse_date_soft(r.get("LastModified") or r.get("ReleaseDate") or "")
+        if d and d >= since_dt:
+            out.append(r)
+    return out
+
+
+def dedupe_latest(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """
+    Keep the latest record per PublicId, based on LastModified/ReleaseDate.
+    """
+    best: Dict[str, Tuple[dt.datetime, Dict[str, str]]] = {}
+    for r in rows:
+        pid = (r.get("PublicId") or "").strip()
+        if not pid:
+            continue
+        d = parse_date_soft(r.get("LastModified") or r.get("ReleaseDate") or "") or dt.datetime.min
+        cur = best.get(pid)
+        if cur is None or d >= cur[0]:
+            best[pid] = (d, r)
+    return [v[1] for v in best.values()]
+
+
+def filter_by_cloud(rows: List[Dict[str, str]], selected: Set[str]) -> List[Dict[str, str]]:
+    if not selected:
+        return rows
+    return [r for r in rows if include_by_cloud(r.get("Cloud_instance", ""), selected)]
+
+
+def sort_rows(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    def key(r: Dict[str, str]):
+        d = parse_date_soft(r.get("LastModified") or r.get("ReleaseDate") or "") or dt.datetime.min
+        return (d, r.get("PublicId") or "")
+    return sorted(rows, key=key, reverse=True)
+
+
+# ------------------------------ Writers -------------------------------
+
+def write_csv(out_path: Path, rows: List[Dict[str, str]]) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=HEADERS_MASTER)
         w.writeheader()
         for r in rows:
-            w.writerow(asdict(r))
+            w.writerow({k: r.get(k, "") for k in HEADERS_MASTER})
 
 
-def write_json(rows: List[Row], path: str) -> None:
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump([asdict(r) for r in rows], f, ensure_ascii=False, indent=2)
+def write_json(out_path: Path, rows: List[Dict[str, str]]) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-# ------------- Main -------------
-def main(argv: Optional[List[str]] = None) -> int:
-    p = argparse.ArgumentParser(description="Fetch M365 Roadmap items from Graph + Public sources")
-    p.add_argument("--config", help="Path to graph_config.json (or use TENANT/CLIENT/PFX_B64 env)")
-    p.add_argument("--since", help="ISO date (YYYY-MM-DD) start of window")
-    p.add_argument("--months", type=int, help="Lookback months (ignored if --since provided)")
-    p.add_argument("--ids", default="", help="Comma-separated Roadmap IDs to force-include")
-    p.add_argument("--tenant-cloud", default="", help="Deprecated single cloud filter")
-    p.add_argument("--cloud", action="append", default=[], help="Repeatable cloud filters (General, GCC, GCC High, DoD)")
-    p.add_argument("--no-graph", action="store_true", help="Disable Graph")
-    p.add_argument("--no-public-scrape", action="store_true", help="Disable public JSON & RSS")
-    p.add_argument("--emit", choices=["csv", "json"], required=True)
-    p.add_argument("--out", required=True, help="Output file path")
-    p.add_argument("--no-window", action="store_true", help="Disable months/since lookback filtering")
-    p.add_argument("--stats-out", help="Write stats JSON to this path")
-    args = p.parse_args(argv)
+# ------------------------------- Main --------------------------------
 
-    clouds: List[str] = []
-    if args.tenant_cloud:
-        clouds.append(args.tenant_cloud)
-    for c in args.cloud:
-        clouds.append("Worldwide (Standard Multi-Tenant)" if c.strip().lower() == "general" else c)
+def months_to_dt_utc_approx(months: int) -> dt.datetime:
+    days = max(1, int(months) * 30)
+    return dt.datetime.utcnow() - dt.timedelta(days=days)
 
-    since: Optional[dt.datetime] = None
-    if args.since:
-        since = _parse_date(args.since)
-    elif args.months:
-        days = int(max(1, args.months) * 30.5)
-        since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
 
-    forced_ids = [s.strip() for s in (args.ids or "").split(",") if s.strip()]
+def main(argv: Optional[Sequence[str]] = None) -> None:
+    args = parse_args(argv)
+    sources: Dict[str, int] = {}
+    errors: List[str] = []
 
-    stats: Dict[str, Any] = {"args": vars(args), "source_counts": {}, "errors": []}
+    # Date window
+    since_dt: Optional[dt.datetime] = None
+    if not args.no_window:
+        if args.months is not None:
+            since_dt = months_to_dt_utc_approx(args.months)
+        if args.since:
+            try:
+                since_dt = dt.datetime.strptime(args.since.strip(), "%Y-%m-%d")
+            except Exception:
+                pass
 
-    graph_msgs: List[Dict[str, Any]] = []
+    # Fetch
+    all_rows: List[Dict[str, str]] = []
+
     if not args.no_graph:
-        graph_msgs = fetch_graph(args.config, since, stats)
-    graph_rows = transform_graph_messages(graph_msgs) if graph_msgs else []
+        all_rows += fetch_graph_rows(args.config, since_dt, sources, errors)
 
-    public_rows: List[Row] = []
-    rss_rows: List[Row] = []
     if not args.no_public_scrape:
-        try:
-            pj = fetch_public_json(stats)
-            public_rows = transform_public_items(pj)
-        except Exception as e:
-            stats.setdefault("errors", []).append(f"public-json-transform: {e}")
-        try:
-            rss = fetch_rss(stats)
-            rss_rows = transform_rss(rss)
-        except Exception as e:
-            stats.setdefault("errors", []).append(f"rss-transform: {e}")
+        all_rows += fetch_rss_rows(since_dt, sources, errors)
 
-    merged = merge_sources(graph_rows, public_rows, rss_rows, forced_ids, clouds, since, stats)
+    # Forced IDs (always include as skeletal rows)
+    forced_ids = [x.strip() for x in (args.ids or "").replace(";", ",").split(",") if x.strip()]
+    for fid in forced_ids:
+        row = {
+            "PublicId": fid,
+            "Title": "",
+            "Source": "forced",
+            "Product_Workload": "",
+            "Status": "",
+            "LastModified": "",
+            "ReleaseDate": "",
+            "Cloud_instance": "",
+            "Official_Roadmap_link": ROADMAP_LINK_TMPL.format(id=fid),
+            "MessageId": "",
+        }
+        all_rows.append(row)
+        sources["forced"] = sources.get("forced", 0) + 1
 
+    # Transform
+    pre_count = len(all_rows)
+    all_rows = dedupe_latest(all_rows)
+    all_rows = filter_by_cloud(all_rows, args.selected_clouds)
+    all_rows = sort_rows(all_rows)
+
+    # Emit
+    out_path = Path(args.out)
     if args.emit == "csv":
-        write_csv(merged, args.out)
+        write_csv(out_path, all_rows)
     else:
-        write_json(merged, args.out)
+        write_json(out_path, all_rows)
 
+    # Stats
     if args.stats_out:
-        os.makedirs(os.path.dirname(args.stats_out) or ".", exist_ok=True)
-        with open(args.stats_out, "w", encoding="utf-8") as f:
-            json.dump(stats, f, ensure_ascii=False, indent=2)
+        stats_path = Path(args.stats_out)
+        stats = {
+            "rows": len(all_rows),
+            "sources": sources,
+            "errors": errors,
+            "selected_clouds": sorted(args.selected_clouds),
+            "window_since": since_dt.isoformat() if since_dt else "",
+            "pre_dedupe": pre_count,
+        }
+        stats_path.parent.mkdir(parents=True, exist_ok=True)
+        stats_path.write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    print(
-        f"Done. rows={len(merged)} sources={stats.get('source_counts')} "
-        f"errors={len(stats.get('errors', []))}"
-    )
-    if stats.get("errors"):
-        for e in stats["errors"]:
-            print("WARN:", e, file=sys.stderr)
-    return 0
+    if errors:
+        for e in errors:
+            print(f"WARN: {e}", file=sys.stderr)
+
+    print(f"Done. rows={len(all_rows)} sources={sources} errors={len(errors)}")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
