@@ -1,34 +1,49 @@
-#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+fetch_messages_graph.py
+Import-safe header so this script works whether called as:
+  - python -m scripts.fetch_messages_graph ...
+  - python scripts/fetch_messages_graph.py ...
+"""
+
 from __future__ import annotations
 
-# Allow running from repo root: `python scripts/fetch_messages_graph.py`
-try:
-    from scripts import _importlib_local  # noqa: F401
-except Exception:
-    pass
-
+# stdlib imports you likely already have below; harmless if duplicated
 import argparse
 import csv
 import datetime as dt
-import html
 import json
+import logging
+import os
 import re
 import sys
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Iterable, Optional
 
-import requests
+# --- import shim: allow both "python -m" and "python scripts/..." styles ---
+REPO_ROOT = Path(__file__).resolve().parents[1]  # repo root
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-# Optional Graph client (only used when --config is provided or env has creds)
 try:
-    from scripts.graph_client import GraphClient, GraphConfig  # type: ignore
-except Exception:  # pragma: no cover - unit tests can run without Graph
-    GraphClient = None  # type: ignore
-    GraphConfig = None  # type: ignore
+    # Preferred when run as a package: python -m scripts.fetch_messages_graph
+    from scripts.report_templates import normalize_clouds, parse_date_soft
+except ImportError:
+    # Fallback when run as a file from the scripts/ directory
+    from report_templates import normalize_clouds, parse_date_soft  # type: ignore[misc]
 
 # Cloud helpers shared with generator/parser
-from scripts.report_templates import normalize_clouds, parse_date_soft
-
+# --- import shim: allow running as "python scripts/foo.py" or "-m scripts.foo"
+import sys
+from pathlib import Path
+ROOT = Path(__file__).resolve().parents[1]  # repo root
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+try:
+    from scripts.report_templates import CLOUD_LABELS, normalize_clouds, parse_date_soft  # adjust names per file needs
+except ImportError:
+    # Fallback if running with sys.path[0] == scripts/
+    from report_templates import CLOUD_LABELS, normalize_clouds, parse_date_soft  # noqa
 
 # ------------------------------- CLI ---------------------------------
 

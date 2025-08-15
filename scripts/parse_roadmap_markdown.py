@@ -1,21 +1,35 @@
-#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+parse_roadmap_markdown.py
+Import-safe header so this script works whether called as:
+  - python -m scripts.parse_roadmap_markdown ...
+  - python scripts/parse_roadmap_markdown.py ...
+"""
+
 from __future__ import annotations
 
-# Allows `python scripts/parse_roadmap_markdown.py` from repo root
-try:
-    from scripts import _importlib_local  # noqa: F401
-except Exception:
-    pass
-
+# stdlib imports you likely already have below; harmless if duplicated
 import argparse
-import csv
 import datetime as dt
 import json
+import logging
 import re
+import sys
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Optional
 
-from scripts.report_templates import CLOUD_LABELS, normalize_clouds, parse_date_soft
+# --- import shim: allow both "python -m" and "python scripts/..." styles ---
+REPO_ROOT = Path(__file__).resolve().parents[1]  # repo root
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+try:
+    # Preferred when run as a package: python -m scripts.parse_roadmap_markdown
+    from scripts.report_templates import CLOUD_LABELS, normalize_clouds, parse_date_soft
+except ImportError:
+    # Fallback when run as a file from the scripts/ directory
+    from report_templates import CLOUD_LABELS, normalize_clouds, parse_date_soft  # type: ignore[misc]
+
 
 
 # Strict markers that must match generator output
