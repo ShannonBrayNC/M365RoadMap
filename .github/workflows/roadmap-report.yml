@@ -104,10 +104,12 @@ jobs:
 
           if [[ -n "${TENANT:-}" && -n "${CLIENT:-}" && -n "${PFX:-}" ]]; then
             # Write graph_config.json safely using argv (avoids env quoting issues)
-            python - "$TENANT" "$CLIENT" "$PFX" "$PFX_PASSWORD_ENV" <<'PY'
+            python - "$TENANT" "$CLIENT" "$PFX" "$PFX_PASSWORD_ENV" <<
+            'PY'
               import json, sys
               tenant, client, pfx_b64, pfx_pwd_env = sys.argv[1:5]
-              cfg = {
+              cfg = 
+              {
                 "tenant_id": tenant,
                 "client_id": client,
                 "pfx_base64": pfx_b64,
