@@ -16,13 +16,13 @@ on:
         required: false
         default: ""
       SINCE:
-        description: ISO date (YYYY-MM-DD) to start from (overrides months; blank for none)
+        description: ISO date (YYYY-MM-DD) to start from (blank for none)
         required: false
         default: ""
       NO_WINDOW:
         type: boolean
         required: false
-        default: false
+        default: true
         description: Ignore months/since (no date filter)
       CLOUD_GENERAL:
         type: boolean
@@ -44,10 +44,6 @@ on:
         required: false
         default: false
         description: Include DoD
-      # CLOUDS:
-      #   description: Comma-separated clouds (e.g. General,GCC High,DoD)
-      #   required: false
-      #   default: General
 
 jobs:
   build:
@@ -65,7 +61,6 @@ jobs:
       CLOUD_GCCH: ${{ github.event.inputs.CLOUD_GCCH }}
       CLOUD_DOD: ${{ github.event.inputs.CLOUD_DOD }}
 
-      # Secrets → env (ensure these are set in repo Settings > Secrets and variables > Actions)
       TENANT: ${{ secrets.GRAPH_TENANT_ID }}
       CLIENT: ${{ secrets.GRAPH_CLIENT_ID }}
       PFX_B64: ${{ secrets.M365_PFX_BASE64 }}
@@ -92,6 +87,7 @@ jobs:
             pip install requests beautifulsoup4 lxml feedparser python-dateutil pandas msal cryptography
           fi
 
+      # ---------- FIXED: no split heredocs ----------
       - name: Prepare Graph config
         id: graphcfg
         shell: bash
@@ -99,23 +95,25 @@ jobs:
           set -euo pipefail
           CFG_PATH="graph_config.json"
           PFX="${PFX_B64:-}"
+
+          # If PFX secret missing but a config file exists, read pfx_base64 from it using a one-liner
           if [[ -z "${PFX}" && -f "${CFG_PATH}" ]]; then
             echo "Reading pfx_base64 from ${CFG_PATH}"
-              PFX="$(python - <<'PY'
-                import json;print(json.load(open("graph_config.json","r",encoding="utf-8")).get("pfx_base64",""))
-              PY
-            )"
+            PFX="$(python -c 'import json,sys; print(json.load(open(sys.argv[1],\"r\",encoding=\"utf-8\")).get(\"pfx_base64\",\"\"))' "${CFG_PATH}")"
           fi
+
           if [[ -n "${TENANT:-}" && -n "${CLIENT:-}" && -n "${PFX:-}" ]]; then
-            python - <<'PY'
-              import os, json
+            # Write graph_config.json safely using argv (avoids env quoting issues)
+            python - "$TENANT" "$CLIENT" "$PFX" "$PFX_PASSWORD_ENV" <<'PY'
+              import json, sys
+              tenant, client, pfx_b64, pfx_pwd_env = sys.argv[1:5]
               cfg = {
-                "tenant_id": os.environ.get("TENANT",""),
-                "client_id": os.environ.get("CLIENT",""),
-                "pfx_base64": os.environ.get("PFX_B64",""),
-                "pfx_password_env": os.environ.get("PFX_PASSWORD_ENV","M365_PFX_PASSWORD"),
+                "tenant_id": tenant,
+                "client_id": client,
+                "pfx_base64": pfx_b64,
+                "pfx_password_env": pfx_pwd_env or "M365_PFX_PASSWORD",
                 "graph_base": "https://graph.microsoft.com/v1.0",
-                "authority_base": "https://login.microsoftonline.com"
+                "authority_base": "https://login.microsoftonline.com",
               }
               open("graph_config.json","w",encoding="utf-8").write(json.dumps(cfg, ensure_ascii=False))
               print("graph_config.json written.")
@@ -126,7 +124,7 @@ jobs:
             echo "graph_cfg=${CFG_PATH}" >> "$GITHUB_OUTPUT"
           else
             echo "graph_cfg=" >> "$GITHUB_OUTPUT"
-            echo "::warning::No Graph config available; Graph calls will be skipped if --no-graph is set."
+            echo "::warning::No Graph config available; Graph calls will fail unless you set secrets."
           fi
 
       - name: Build cloud args (checkboxes)
@@ -151,7 +149,7 @@ jobs:
           echo "NO_WINDOW=${NO_WINDOW}"
           echo "CLOUDS: GEN=${CLOUD_GENERAL} GCC=${CLOUD_GCC} GCCH=${CLOUD_GCCH} DOD=${CLOUD_DOD}"
 
-      - name: Fetch master data (Graph/Public/RSS)
+      - name: Fetch master data
         id: fetch
         shell: bash
         run: |
@@ -172,7 +170,6 @@ jobs:
             fi
           fi
 
-          # Expand the clouds from previous step (space-separated)
           CLOUDS_EXPANDED=${{ steps.clouds.outputs.clouds }}
           # shellcheck disable=SC2206
           CLOUDS_ARR=(${CLOUDS_EXPANDED})
@@ -183,7 +180,6 @@ jobs:
           fi
 
           echo "Running fetch_messages_graph.py with: ${CFG_ARG[*]} ${DATE_FLAGS[*]} ${CLOUDS_ARR[*]}"
-
           python scripts/fetch_messages_graph.py \
             "${CFG_ARG[@]}" \
             "${DATE_FLAGS[@]}" \
