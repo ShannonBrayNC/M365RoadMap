@@ -36,7 +36,7 @@ except Exception:
 PUBLIC_ROADMAP_JSON = "https://www.microsoft.com/releasecommunications/api/v1/m365"
 PUBLIC_ROADMAP_RSS = "https://www.microsoft.com/releasecommunications/api/v2/m365/rss"
 
-p.add_argument("--no-window", action="store_true", help="Disable months/since lookback filtering")
+
 
 
 def _session_with_retries() -> requests.Session:
@@ -428,6 +428,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--no-public-scrape", action="store_true", help="Disable public JSON & RSS")
     p.add_argument("--emit", choices=["csv", "json"], required=True)
     p.add_argument("--out", required=True, help="Output file path")
+    p.add_argument("--no-window", action="store_true", help="Disable months/since lookback filtering")
     p.add_argument("--stats-out", help="Write stats JSON to this path")
     args = p.parse_args(argv)
 

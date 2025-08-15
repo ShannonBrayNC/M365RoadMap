@@ -101,15 +101,13 @@ jobs:
           PFX="${PFX_B64:-}"
           if [[ -z "${PFX}" && -f "${CFG_PATH}" ]]; then
             echo "Reading pfx_base64 from ${CFG_PATH}"
-              PFX="$(python - <<
-              'PY'
+              PFX="$(python - <<'PY'
                 import json;print(json.load(open("graph_config.json","r",encoding="utf-8")).get("pfx_base64",""))
               PY
             )"
           fi
           if [[ -n "${TENANT:-}" && -n "${CLIENT:-}" && -n "${PFX:-}" ]]; then
-            python - <<
-            'PY'
+            python - <<'PY'
               import os, json
               cfg = {
                 "tenant_id": os.environ.get("TENANT",""),

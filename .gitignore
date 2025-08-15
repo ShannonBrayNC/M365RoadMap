@@ -1,30 +1,22 @@
-__pycache__/
-*.py[cod]
-*.so
-*.egg-info/
+# Virtual envs, caches, build outputs
 .venv/
 venv/
 env/
+__pycache__/
+.pytest_cache/
 dist/
 build/
-.coverage
-coverage.xml
-htmlcov/
-.pytest_cache/
-.ipynb_checkpoints/
-*.log
-*.tmp
+output/*
+!output/.gitkeep
+
+# OS/editor junk
 .DS_Store
 Thumbs.db
 .vscode/
 .idea/
-*.code-workspace
 
-# Project
-/output/*
-!/output/.gitkeep
-.env
-.env.*
+# Secrets/keys
+.env*
 secrets.*
 *.pfx
 *.p12
@@ -33,12 +25,8 @@ secrets.*
 *.key
 *pfx.b64
 
+# Graph configs (track examples only)
 graph_config.json
 graph_config.inline.json
 !graph_config.example.json
 !graph_config.inline.example.json
-
-scripts/*.bak
-prompts/*.bak
-.pre-commit-config.yaml
-Fetch-MessageGraph.ps1
