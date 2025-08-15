@@ -193,9 +193,19 @@ jobs:
           MASTER="${{ steps.fetch.outputs.csv }}"
           OUT_MD="output/${TITLE}.md"
           echo "Generating Markdown from ${MASTER} -> ${OUT_MD}"
-          python -m scripts.generate_report --title "${TITLE}" --master "${MASTER}" --out "${OUT_MD}"
+          python -m scripts.generate_report \
+            --title "${TITLE}" \
+            --master "${MASTER}" \
+            --out "${OUT_MD}" \
+            $([[ "${NO_WINDOW}" == "true" ]] && echo --no-window || true) \
+            $([[ -n "${SINCE}" ]] && echo --since "${SINCE}" || true) \
+            $([[ -n "${MONTHS}" ]] && echo --months "${MONTHS}" || true) \
+            $([[ "${CLOUD_GENERAL,,}" == "true" ]] && echo --cloud "Worldwide (Standard Multi-Tenant)" || true) \
+            $([[ "${CLOUD_GCC,,}" == "true" ]] && echo --cloud "GCC" || true) \
+            $([[ "${CLOUD_GCCH,,}" == "true" ]] && echo --cloud "GCC High" || true) \
+            $([[ "${CLOUD_DOD,,}" == "true" ]] && echo --cloud "DoD" || true) \
+            --forced-ids "${PUBLIC_IDS}"
           echo "md=${OUT_MD}" >> "$GITHUB_OUTPUT"
-
 
 
       - name: Upload artifacts
