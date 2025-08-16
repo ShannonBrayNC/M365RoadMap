@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
 Fetch Microsoft 365 roadmap/message-center content into a master CSV/JSON.
 
@@ -24,6 +25,7 @@ import re
 import sys
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, Iterable, List, Match, Optional, Sequence, Set, Tuple, Union
+
 
 # Optional imports — keep soft so mypy/tests don’t explode in CI
 try:
@@ -523,35 +525,26 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+# DEBUG: print config keys and presence of expected fields (optional)
+def _debug_cfg(cfg: dict) -> None:
+    print("Config keys:", sorted(cfg.keys()))
+    print("tenant present:", bool(cfg.get("tenant")))
+    print("client present:", bool(cfg.get("client")))
+    print("pfx_b64 present:", bool(cfg.get("pfx_b64")))
+    print("using password env:", cfg.get("pfx_password_env"))
+
 def main(argv: Optional[Sequence[str]] = None) -> None:
     args = parse_args(argv)
     cfg = _load_cfg(args.config)
+
+    # Only dump debug if requested (avoid leaking secrets in normal runs)
+    if os.environ.get("DEBUG_CFG", "").lower() in ("1", "true", "yes"):
+        _debug_cfg(cfg)
 
     # Auto-fallback guard if Graph secrets are missing/invalid
     if not args.no_graph and not _has_valid_graph_config(cfg):
         print("INFO: Graph credentials missing/invalid → using public fallback only (as if --no-graph).")
         args.no_graph = True
-
-    # Compute selected cloud set (canonical)
-    selected: Set[str] = set()
-    for c in args.cloud or []:
-        selected |= normalize_clouds(c)
-
-    all_rows: List[Row] = []
-    stats: Dict[str, Any] = {
-        "sources": {"graph": 0, "public-json": 0, "rss": 0, "seed": 0},
-        "errors": 0,
-    }
-
-    # Try Graph first (unless disabled)
-    if not args.no_graph:
-        try:
-            g_rows = fetch_from_graph(cfg, args.since, args.months)
-            stats["sources"]["graph"] = len(g_rows)
-            all_rows.extend(g_rows)
-        except Exception as e:  # pragma: no cover (depends on env)
-            stats["errors"] = stats.get("errors", 0) + 1
-            print(f"WARN: graph-fetch failed: {e}")
 
     # Always try public sources
     pub_rows = fetch_public_sources(cfg, args.since, args.months)
