@@ -4,49 +4,58 @@ on:
   workflow_dispatch:
     inputs:
       title:
-        description: Output base name (no extension)
-        required: false
+        description: Report title / basename for outputs
+        required: true
         default: roadmap_report
+        type: string
       since:
-        description: ISO date (YYYY-MM-DD) to include items since
+        description: Only include items last modified on/after (YYYY-MM-DD)
         required: false
-        default: ""
+        type: string
       months:
-        description: Limit to the last N months (number)
+        description: Or include items within the last N months
         required: false
-        default: ""
+        type: string
       cloud_general:
         description: Include Worldwide (Standard Multi-Tenant)
-        type: boolean
-        required: false
+        required: true
         default: true
+        type: boolean
       cloud_gcc:
         description: Include GCC
-        type: boolean
-        required: false
+        required: true
         default: false
+        type: boolean
       cloud_gcch:
         description: Include GCC High
-        type: boolean
-        required: false
+        required: true
         default: false
+        type: boolean
       cloud_dod:
         description: Include DoD
-        type: boolean
-        required: false
+        required: true
         default: false
+        type: boolean
       products:
-        description: Comma/pipe/space-separated product keywords (blank = all)
+        description: Comma/pipe/semicolon-separated product/workload filter (blank=all)
         required: false
-        default: ""
+        type: string
       public_ids:
-        description: Comma/space-separated exact IDs to force-include (keeps order)
+        description: Comma/space-separated Roadmap IDs to force include (exact order)
         required: false
-        default: ""
+        type: string
+      no_graph:
+        description: Skip Graph and use fallback only
+        required: true
+        default: false
+        type: boolean
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
     env:
       TITLE: ${{ inputs.title }}
       SINCE: ${{ inputs.since }}
@@ -57,12 +66,15 @@ jobs:
       CLOUD_DOD: ${{ inputs.cloud_dod }}
       PRODUCTS: ${{ inputs.products }}
       PUBLIC_IDS: ${{ inputs.public_ids }}
-      # Graph cert secrets (set these in repo Settings > Secrets and variables > Actions)
-      TENANT: ${{ secrets.TENANT_ID }}
-      CLIENT: ${{ secrets.CLIENT_ID }}
-      PFX_B64: ${{ secrets.PFX_B64 }}
-      M365_PFX_PASSWORD: ${{ secrets.PFX_PASSWORD }}
+      NO_GRAPH: ${{ inputs.no_graph }}
+
+      # Graph secrets (configure these in repo/org secrets)
+      TENANT: ${{ secrets.M365_TENANT_ID }}
+      CLIENT: ${{ secrets.M365_CLIENT_ID }}
+      PFX_B64: ${{ secrets.M365_PFX_BASE64 }}
+      M365_PFX_PASSWORD: ${{ secrets.M365_PFX_PASSWORD }}
       PFX_PASSWORD_ENV: M365_PFX_PASSWORD
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -74,12 +86,8 @@ jobs:
 
       - name: Install deps
         run: |
-          python -m pip install -U pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            pip install pandas requests msal cryptography beautifulsoup4 lxml feedparser tqdm Markdown
-          fi
+          python -m pip install --upgrade pip
+          pip install msal cryptography requests pandas Markdown beautifulsoup4 feedparser lxml
 
       - name: Write graph_config.json
         shell: bash
@@ -97,12 +105,12 @@ jobs:
           print("graph_config.json written.")
           PY
 
-      - name: Fetch master CSV/JSON via Graph + fallbacks
+      - name: Fetch messages (master CSV/JSON)
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p output
-
+          
           CSV_OUT="output/${TITLE}_master.csv"
           JSON_OUT="output/${TITLE}_master.json"
           STATS_OUT="output/${TITLE}_fetch_stats.json"
@@ -110,38 +118,38 @@ jobs:
           CFG=(--config "graph_config.json")
 
           DATE_FLAGS=()
-          [ -n "${SINCE}" ] && DATE_FLAGS+=(--since "${SINCE}")
-          [ -n "${MONTHS}" ] && DATE_FLAGS+=(--months "${MONTHS}")
+          [[ -n "${SINCE}" ]] && DATE_FLAGS+=(--since "${SINCE}")
+          [[ -n "${MONTHS}" ]] && DATE_FLAGS+=(--months "${MONTHS}")
 
           CLOUD_FLAGS=()
-          [ "${CLOUD_GENERAL,,}" = "true" ] && CLOUD_FLAGS+=(--cloud "Worldwide (Standard Multi-Tenant)")
-          [ "${CLOUD_GCC,,}" = "true" ] && CLOUD_FLAGS+=(--cloud "GCC")
-          [ "${CLOUD_GCCH,,}" = "true" ] && CLOUD_FLAGS+=(--cloud "GCC High")
-          [ "${CLOUD_DOD,,}" = "true" ] && CLOUD_FLAGS+=(--cloud "DoD")
+          [[ "${CLOUD_GENERAL,,}" == "true" ]] && CLOUD_FLAGS+=(--cloud "Worldwide (Standard Multi-Tenant)")
+          [[ "${CLOUD_GCC,,}" == "true" ]] && CLOUD_FLAGS+=(--cloud "GCC")
+          [[ "${CLOUD_GCCH,,}" == "true" ]] && CLOUD_FLAGS+=(--cloud "GCC High")
+          [[ "${CLOUD_DOD,,}" == "true" ]] && CLOUD_FLAGS+=(--cloud "DoD")
 
-          echo "Running fetch_messages_graph.py with: ${CFG[*]} ${DATE_FLAGS[*]} ${CLOUD_FLAGS[*]}"
+          NOGRAPH_FLAG=()
+          [[ "${NO_GRAPH,,}" == "true" ]] && NOGRAPH_FLAG+=(--no-graph)
+
+          echo "Running fetch_messages_graph.py with: ${CFG[*]} ${DATE_FLAGS[*]} ${CLOUD_FLAGS[*]} ${NOGRAPH_FLAG[*]}"
           python scripts/fetch_messages_graph.py \
-            "${CFG[@]}" "${DATE_FLAGS[@]}" "${CLOUD_FLAGS[@]}" \
+            "${CFG[@]}" "${DATE_FLAGS[@]}" "${CLOUD_FLAGS[@]}" "${NOGRAPH_FLAG[@]}" \
             --emit csv --out "${CSV_OUT}" --stats-out "${STATS_OUT}"
 
           python scripts/fetch_messages_graph.py \
-            "${CFG[@]}" "${DATE_FLAGS[@]}" "${CLOUD_FLAGS[@]}" \
+            "${CFG[@]}" "${DATE_FLAGS[@]}" "${CLOUD_FLAGS[@]}" "${NOGRAPH_FLAG[@]}" \
             --emit json --out "${JSON_OUT}"
 
           echo "csv=${CSV_OUT}"     >> "$GITHUB_OUTPUT"
           echo "json=${JSON_OUT}"   >> "$GITHUB_OUTPUT"
           echo "stats=${STATS_OUT}" >> "$GITHUB_OUTPUT"
 
-
       - name: Show fetch stats
         if: always()
         run: |
           echo "---- fetch stats ----"
-          cat "output/${TITLE}_fetch_stats.json" || true
-                
+          cat "output/${{ env.TITLE }}_fetch_stats.json" || true
 
-
-      - name: Generate Markdown report
+      - name: Generate report (MD)
         shell: bash
         run: |
           set -euo pipefail
@@ -149,18 +157,20 @@ jobs:
           OUT_MD="output/${TITLE}.md"
 
           DATE_FLAGS=()
-          [ -n "${SINCE}" ] && DATE_FLAGS+=(--since "${SINCE}")
-          [ -n "${MONTHS}" ] && DATE_FLAGS+=(--months "${MONTHS}")
+          [[ -n "${SINCE}" ]] && DATE_FLAGS+=(--since "${SINCE}")
+          [[ -n "${MONTHS}" ]] && DATE_FLAGS+=(--months "${MONTHS}")
 
           CLOUD_FLAGS=()
-          [ "${CLOUD_GENERAL,,}" = "true" ] && CLOUD_FLAGS+=(--cloud "Worldwide (Standard Multi-Tenant)")
-          [ "${CLOUD_GCC,,}" = "true" ] && CLOUD_FLAGS+=(--cloud "GCC")
-          [ "${CLOUD_GCCH,,}" = "true" ] && CLOUD_FLAGS+=(--cloud "GCC High")
-          [ "${CLOUD_DOD,,}" = "true" ] && CLOUD_FLAGS+=(--cloud "DoD")
+          [[ "${CLOUD_GENERAL,,}" == "true" ]] && CLOUD_FLAGS+=(--cloud "Worldwide (Standard Multi-Tenant)")
+          [[ "${CLOUD_GCC,,}" == "true" ]] && CLOUD_FLAGS+=(--cloud "GCC")
+          [[ "${CLOUD_GCCH,,}" == "true" ]] && CLOUD_FLAGS+=(--cloud "GCC High")
+          [[ "${CLOUD_DOD,,}" == "true" ]] && CLOUD_FLAGS+=(--cloud "DoD")
 
           FORCED_ARGS=()
-          # Only add --forced-ids if non-empty (avoids argparse errors if an older runner ever picked up)
-          [ -n "${PUBLIC_IDS}" ] && FORCED_ARGS+=(--forced-ids "${PUBLIC_IDS}")
+          [[ -n "${PUBLIC_IDS}" ]] && FORCED_ARGS+=(--forced-ids "${PUBLIC_IDS}")
+
+          PROD_ARG=()
+          [[ -n "${PRODUCTS}" ]] && PROD_ARG+=(--products "${PRODUCTS}")
 
           python scripts/generate_report.py \
             --title "${TITLE}" \
@@ -168,31 +178,22 @@ jobs:
             --out "${OUT_MD}" \
             "${DATE_FLAGS[@]}" \
             "${CLOUD_FLAGS[@]}" \
-            --products "${PRODUCTS}" \
+            "${PROD_ARG[@]}" \
             "${FORCED_ARGS[@]}"
 
           echo "md=${OUT_MD}" >> "$GITHUB_OUTPUT"
 
-      - name: Parse MD to CSV/JSON
-        run: |
-          python scripts/parse_roadmap_markdown.py \
-            --input "output/${TITLE}.md" \
-            --csv   "output/${TITLE}.csv" \
-            --json  "output/${TITLE}.json"
-
       - name: Render HTML
         run: |
-          python scripts/md_to_html.py "output/${TITLE}.md" "output/${TITLE}.html"
+          python scripts/md_to_html.py "output/${{ env.TITLE }}.md" "output/${{ env.TITLE }}.html"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ inputs.title }}-bundle
+          name: roadmap-report-${{ env.TITLE }}
           path: |
-            output/${{ inputs.title }}.md
-            output/${{ inputs.title }}.csv
-            output/${{ inputs.title }}.json
-            output/${{ inputs.title }}.html
-            output/${{ inputs.title }}_master.csv
-            output/${{ inputs.title }}_master.json
-            output/${{ inputs.title }}_fetch_stats.json
+            output/${{ env.TITLE }}_master.csv
+            output/${{ env.TITLE }}_master.json
+            output/${{ env.TITLE }}_fetch_stats.json
+            output/${{ env.TITLE }}.md
+            output/${{ env.TITLE }}.html
