@@ -1,119 +1,84 @@
-rom __future__ import annotations
-import json
-import pathlib
-from datetime import date
-from dateutil import parser as dtparser
-
+import json, time, pathlib
 import pandas as pd
 import streamlit as st
+import altair as alt
 
-DATA_PATH = pathlib.Path("data/M365RoadMap_Test.json")
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+DATA = ROOT / "output" / "enriched.json"
 
-st.set_page_config(page_title="M365 Roadmap", page_icon="📊", layout="wide")
-st.title("M365 Roadmap")
+st.set_page_config(page_title="M365 Roadmap", layout="wide")
 
-@st.cache_data(show_spinner=False)
-def load_items() -> pd.DataFrame:
-    if DATA_PATH.exists():
-        raw = json.loads(DATA_PATH.read_text(encoding="utf-8"))
+st.title("📊 Microsoft 365 Roadmap — Enriched")
+st.caption("Roadmap → Message Center → Web (links in chips)")
+
+colA, colB = st.columns([1,4])
+with colA:
+    if st.button("🔄 Refresh"):
+        st.cache_data.clear()  # clear cached loader
+        st.rerun()
+
+@st.cache_data(ttl=10)
+def load_data() -> pd.DataFrame:
+    if DATA.exists():
+        j = json.loads(DATA.read_text(encoding="utf-8"))
     else:
-        raw = []
-    # Handle either array or {items: []}
-    items = raw if isinstance(raw, list) else raw.get("items", [])
-    df = pd.json_normalize(items)
-    # Normalize expected columns
-    for col in [
-        "id","title","description","status","workload","category",
-        "tags","releasePhase","releaseDate","lastUpdated","link",
-    ]:
-        if col not in df.columns:
-            df[col] = None
-    # Ensure types
-    df["id"] = df["id"].astype(str)
-    df["tags"] = df["tags"].apply(lambda x: x if isinstance(x, list) else ([] if pd.isna(x) else [str(x)]))
-    # Parse dates if present
-    def parse_date(x):
-        if pd.isna(x) or not str(x).strip():
-            return pd.NaT
-        try:
-            return pd.to_datetime(dtparser.parse(str(x)).date())
-        except Exception:
-            return pd.NaT
-    df["releaseDate_dt"] = df["releaseDate"].apply(parse_date)
-    df["lastUpdated_dt"] = df["lastUpdated"].apply(parse_date)
-    return df
+        j = []
+    # flatten for DataFrame
+    rows = []
+    for e in j:
+        rows.append({
+            "id": e.get("id"),
+            "title": e.get("title"),
+            "product": e.get("product"),
+            "status": e.get("status"),
+            "severity": e.get("severity"),
+            "isMajor": e.get("isMajor"),
+            "confidence": e.get("confidence", 0),
+            "links": e.get("links", []),
+            "services": ", ".join(e.get("services", [])),
+            "summary": e.get("summary",""),
+        })
+    return pd.DataFrame(rows)
 
-_df = load_items()
+df = load_data()
 
-# ---------- Sidebar filters ----------
-st.sidebar.header("Filters")
-q = st.sidebar.text_input("Search", placeholder="Title or description…")
-status = st.sidebar.multiselect("Status", sorted(x for x in _df["status"].dropna().unique()))
-workload = st.sidebar.multiselect("Workload", sorted(x for x in _df["workload"].dropna().unique()))
-category = st.sidebar.multiselect("Category", sorted(x for x in _df["category"].dropna().unique()))
-all_tags = sorted({t for ts in _df["tags"] for t in (ts or [])})
-tags = st.sidebar.multiselect("Tags", all_tags)
+# ----- Filters
+with colA:
+    products = sorted([p for p in df["product"].dropna().unique().tolist() if p])
+    sel_products = st.multiselect("Product", products)
+    min_conf = st.slider("Min Confidence", 0, 100, 0, 5)
 
-col1, col2 = st.sidebar.columns(2)
-with col1:
-    from_date = st.date_input("Release from", value=None)
-with col2:
-    to_date = st.date_input("Release to", value=None)
+with colB:
+    q = st.text_input("Search title contains…", "")
 
-# ---------- Apply filters ----------
-filtered = _df.copy()
+flt = df.copy()
+if sel_products:
+    flt = flt[flt["product"].isin(sel_products)]
 if q:
-    ql = q.lower()
-    filtered = filtered[ (
-        filtered["title"].fillna("").str.lower().str.contains(ql)
-        | filtered["description"].fillna("").str.lower().str.contains(ql)
-    ) ]
-if status:
-    filtered = filtered[filtered["status"].isin(status)]
-if workload:
-    filtered = filtered[filtered["workload"].isin(workload)]
-if category:
-    filtered = filtered[filtered["category"].isin(category)]
-if tags:
-    filtered = filtered[filtered["tags"].apply(lambda ts: bool(set(tags) & set(ts or [])))]
-if isinstance(from_date, date):
-    filtered = filtered[(filtered["releaseDate_dt"].notna()) & (filtered["releaseDate_dt"] >= pd.to_datetime(from_date))]
-if isinstance(to_date, date):
-    filtered = filtered[(filtered["releaseDate_dt"].notna()) & (filtered["releaseDate_dt"] <= pd.to_datetime(to_date))]
+    flt = flt[flt["title"].str.contains(q, case=False, na=False)]
+flt = flt[flt["confidence"] >= min_conf]
 
-# ---------- Table ----------
-show_cols = ["id","title","status","workload","category","releaseDate","lastUpdated"]
-st.dataframe(
-    filtered[show_cols].sort_values(by=["releaseDate","lastUpdated"], ascending=[False, False]),
-    use_container_width=True,
-    hide_index=True,
-)
+# ----- Bubble chart (title length → size; confidence → color)
+if not flt.empty:
+    bsrc = flt.assign(size=flt["title"].str.len())
+    chart = alt.Chart(bsrc).mark_circle().encode(
+        x=alt.X("product:N", title="Product"),
+        y=alt.Y("confidence:Q", title="Confidence"),
+        size=alt.Size("size:Q", title="Title length", scale=alt.Scale(range=[50, 1500])),
+        color=alt.Color("severity:N", title="Severity"),
+        tooltip=["title","product","confidence","severity"]
+    ).properties(height=300)
+    st.altair_chart(chart, use_container_width=True)
 
-# ---------- Details panel ----------
-with st.expander("Show details for filtered items"):
-    for _, row in filtered.iterrows():
-        st.markdown(f"### {row['title']}  `#{row['id']}`")
-        st.write(row.get("description") or "")
-        m = st.columns(3)
-        m[0].write(f"**Status:** {row.get('status') or '-'}")
-        m[1].write(f"**Workload:** {row.get('workload') or '-'}")
-        m[2].write(f"**Category:** {row.get('category') or '-'}")
-        m = st.columns(3)
-        m[0].write(f"**Release:** {row.get('releaseDate') or '-'}")
-        m[1].write(f"**Phase:** {row.get('releasePhase') or '-'}")
-        m[2].write(f"**Updated:** {row.get('lastUpdated') or '-'}")
-        if row.get("tags"):
-            st.write("**Tags:** ", ", ".join(row["tags"]))
-        if row.get("link"):
-            st.write(f"[Learn more]({row['link']})")
-        st.divider()
+st.subheader("Results")
+for _, row in flt.sort_values(["product","confidence"], ascending=[True, False]).iterrows():
+    with st.expander(f"{row['title']}  •  {row['product']}  •  conf {int(row['confidence'])}"):
+        st.write(row["summary"] or "_No summary_")
+        # Link chips
+        chips = []
+        for l in row["links"]:
+            chips.append(f"[{l.get('label','Link')}]({l.get('url','#')})")
+        st.markdown(" ".join(chips))
+        st.caption(f"Services: {row['services']}  •  Severity: {row['severity']}  •  Major: {row['isMajor']}")
 
-# ---------- Export ----------
-exp_col1, exp_col2 = st.columns(2)
-with exp_col1:
-    csv = filtered.to_csv(index=False)
-    st.download_button("Download CSV", csv, file_name="m365_roadmap_filtered.csv", mime="text/csv")
-with exp_col2:
-    st.download_button("Download JSON", filtered.to_json(orient="records"), file_name="m365_roadmap_filtered.json", mime="application/json")
-
-st.caption("Data source: local JSON (M365RoadMap_Test.json). Replace with your fetcher when ready.")
+st.caption("Tip: Run `python -m scripts.cli.generate_report --mode auto` to refresh data.")
