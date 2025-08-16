@@ -35,6 +35,43 @@ CSV_HEADERS = [
 ]
 
 
+import re
+from typing import Sequence
+
+# Ensure we can import normalize_clouds from report_templates whether the file is
+# run as a script or via module. Also provide a tiny fallback if import fails.
+try:
+    from report_templates import normalize_clouds
+except ModuleNotFoundError:
+    import os, sys
+    sys.path.append(os.path.dirname(__file__))
+    try:
+        from report_templates import normalize_clouds  # type: ignore
+    except Exception:
+
+
+        # Very small local fallback – recognizes the 4 canonical clouds and "General"
+        def normalize_clouds(values: list[str] | str) -> set[str]:  # type: ignore[override]
+            if isinstance(values, str):
+                vals = [values]
+            else:
+                vals = values or []
+            canon_map = {
+                "general": "General",
+                "worldwide (standard multi-tenant)": "General",
+                "gcc": "GCC",
+                "gcc high": "GCC High",
+                "dod": "DoD",
+            }
+            out: set[str] = set()
+            for v in vals:
+                k = (v or "").strip().lower()
+                out.add(canon_map.get(k, (v or "").strip()))
+            return out
+
+
+
+
 def _row_to_feature(row: dict[str, str]) -> FeatureRecord:
     """
     Convert a CSV row (with headers like PublicId, Product_Workload, Cloud_instance, etc.)
@@ -138,7 +175,7 @@ def _cloud_display_from_args(clouds: Optional[Sequence[str]]) -> str:
 def _filter_by_cloud(rows: list[FeatureRecord], clouds: Sequence[str] | None) -> list[FeatureRecord]:
     """
     Filter FeatureRecord objects by cloud. Prefers the pre-parsed FeatureRecord.clouds (list[str]).
-    Falls back to parsing a Cloud_instance string if present (for mixed inputs).
+    Falls back to parsing a Cloud_instance string if present (for legacy/mixed inputs).
     """
     if not clouds:
         return rows
@@ -151,29 +188,33 @@ def _filter_by_cloud(rows: list[FeatureRecord], clouds: Sequence[str] | None) ->
         try:
             canon = normalize_clouds([c])  # modern signature returns set[str]
         except TypeError:
-            canon = normalize_clouds(c)    # older signature might accept str
+            canon = normalize_clouds(c)    # tolerate older signature
         if isinstance(canon, set):
             include |= {s.strip() for s in canon if s.strip()}
         elif isinstance(canon, str):
-            include.add(canon.strip())
+            if canon.strip():
+                include.add(canon.strip())
 
     if not include:
         return rows
 
     def row_clouds(r: FeatureRecord) -> set[str]:
-        # Preferred: FeatureRecord.clouds
+        # Preferred: FeatureRecord.clouds already normalized upstream
         cl = getattr(r, "clouds", None)
         if cl:
             return set(cl)
 
-        # Fallback: parse a raw Cloud_instance value if present (for legacy/mixed rows)
+        # Fallback: parse a raw Cloud_instance if present (legacy rows)
         raw = ""
-        if isinstance(r, dict):
+        if isinstance(r, dict):  # super defensive if any dict sneaks in
             raw = str(r.get("Cloud_instance", "")).strip()
         else:
             raw = str(getattr(r, "Cloud_instance", "") or "").strip()
+
         if not raw:
             return set()
+
+        # Split common separators and normalize
         parts = [p.strip() for p in re.split(r"[|,;/]+", raw) if p.strip()]
         try:
             return set(normalize_clouds(parts))  # type: ignore[arg-type]
@@ -181,6 +222,7 @@ def _filter_by_cloud(rows: list[FeatureRecord], clouds: Sequence[str] | None) ->
             return set(parts)
 
     return [r for r in rows if row_clouds(r) & include]
+
 
 
 
