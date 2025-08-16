@@ -149,6 +149,7 @@ jobs:
           cat "output/${{ inputs.title }}_fetch_stats.json" || true
 
       - name: Generate markdown report
+        run: bash scripts/run_generate_report.sh
         env:
           TITLE: ${{ inputs.title }}
           SINCE: ${{ inputs.since }}
@@ -159,34 +160,7 @@ jobs:
           CLOUD_DOD: ${{ inputs.cloud_dod }}
           PRODUCTS: ${{ inputs.products }}
           PUBLIC_IDS: ${{ inputs.public_ids }}
-        run: |
-          set -euo pipefail
-          IN_CSV="output/${TITLE}_master.csv"
-          OUT_MD="output/${TITLE}.md"
 
-          DATE_FLAGS=()
-          [[ -n "${SINCE}"  ]] && DATE_FLAGS+=(--since  "${SINCE"})
-          [[ -n "${MONTHS}" ]] && DATE_FLAGS+=(--months "${MONTHS}")
-
-          CLOUD_FLAGS=()
-          [[ "${CLOUD_GENERAL,,}" == "true" ]] && CLOUD_FLAGS+=(--cloud "Worldwide (Standard Multi-Tenant)")
-          [[ "${CLOUD_GCC,,}"     == "true" ]] && CLOUD_FLAGS+=(--cloud "GCC")
-          [[ "${CLOUD_GCCH,,}"    == "true" ]] && CLOUD_FLAGS+=(--cloud "GCC High")
-          [[ "${CLOUD_DOD,,}"     == "true" ]] && CLOUD_FLAGS+=(--cloud "DoD")
-
-          FORCED_ARGS=()
-          [[ -n "${PUBLIC_IDS}" ]] && FORCED_ARGS+=(--forced-ids "${PUBLIC_IDS}")
-
-          python scripts/generate_report.py \
-            --title "${TITLE}" \
-            --master "${IN_CSV}" \
-            --out "${OUT_MD}" \
-            "${DATE_FLAGS[@]}" \
-            "${CLOUD_FLAGS[@]}" \
-            --products "${PRODUCTS}" \
-            "${FORCED_ARGS[@]}"
-
-          echo "md=${OUT_MD}" >> "$GITHUB_OUTPUT"
 
       - name: Convert MD -> HTML
         run: |
