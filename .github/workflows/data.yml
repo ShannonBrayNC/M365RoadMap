@@ -1,52 +1,59 @@
-name: Build data and publish report
 
+name: data
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - "scripts/**"
-      - "app/**"
-      - "requirements.txt"
-      - ".github/workflows/data.yml"
+  schedule:
+    - cron: "0 9 * * *"  # daily 09:00 UTC
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pages: write
-      id-token: write
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-      - name: Install dependencies
+          python-version: "3.13"
+
+      - name: Install requirements
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          # Ensure extras for this patch
-          pip install streamlit pandas altair msal feedparser requests
-      - name: Generate enriched report
+          # minimal extras in case not present
+          pip install requests beautifulsoup4 msal plotly streamlit pandas
+
+      - name: Generate data
         env:
           TENANT_ID: ${{ secrets.TENANT_ID }}
           CLIENT_ID: ${{ secrets.CLIENT_ID }}
           CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
         run: |
-          python -m scripts.cli.generate_report --mode auto --with-web || python -m scripts.cli.generate_report --mode free --with-web
+          python -m scripts.cli.generate_report --mode auto
+
       - name: Upload output artifact
         uses: actions/upload-artifact@v4
         with:
-          name: roadmap-output
-          path: output/**
-      - name: Setup Pages
-        if: vars.PUBLISH_PAGES == 'true'
+          name: output
+          path: output/
+
+      - name: Configure Pages
         uses: actions/configure-pages@v5
-      - name: Upload static report to Pages
-        if: vars.PUBLISH_PAGES == 'true'
+
+      - name: Upload static HTML to Pages
         uses: actions/upload-pages-artifact@v3
         with:
           path: output/roadmap_report.html
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
       - name: Deploy to Pages
-        if: vars.PUBLISH_PAGES == 'true'
+        id: deployment
         uses: actions/deploy-pages@v4

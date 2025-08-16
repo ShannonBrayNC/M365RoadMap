@@ -1,5 +1,6 @@
+
 from __future__ import annotations
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, field, asdict
 from typing import List, Optional, Dict, Any
 
 @dataclass
@@ -14,17 +15,35 @@ class WebRef:
     snippet: Optional[str] = None
 
 @dataclass
-class EnrichedSources:
-    roadmap: Optional[Dict[str, Any]] = None
-    messageCenter: Optional[Dict[str, Any]] = None
-    web: List[WebRef] = field(default_factory=list)
+class RoadmapItem:
+    id: Optional[str]
+    title: str
+    product: str = ""
+    category: Optional[str] = None
+    status: Optional[str] = None
+    url: str = ""
+    services: List[str] = field(default_factory=list)
+    summary: Optional[str] = None
+
+@dataclass
+class MCItem:
+    id: str
+    title: str
+    description: Optional[str] = None
+    services: List[str] = field(default_factory=list)
+    classification: Optional[str] = None
+    severity: Optional[str] = None
+    isMajorChange: Optional[bool] = None
+    lastModifiedDateTime: Optional[str] = None
+    startDateTime: Optional[str] = None
+    endDateTime: Optional[str] = None
 
 @dataclass
 class EnrichedItem:
     id: str
     title: str
-    product: str
-    services: List[str]
+    product: str = ""
+    services: List[str] = field(default_factory=list)
     status: Optional[str] = None
     category: Optional[str] = None
     isMajor: Optional[bool] = None
@@ -35,16 +54,14 @@ class EnrichedItem:
     summary: Optional[str] = None
     confidence: int = 0
     links: List[SourceLink] = field(default_factory=list)
-    sources: EnrichedSources = field(default_factory=EnrichedSources)
+    sources: Dict[str, Any] = field(default_factory=dict)
 
     def to_json(self) -> Dict[str, Any]:
-        def _coerce(obj):
-            if hasattr(obj, "__dict__"):
-                return asdict(obj)
+        # dataclasses are nested; this ensures all nested dataclasses are converted
+        def _convert(obj):
             if isinstance(obj, list):
-                return [ _coerce(x) for x in obj ]
+                return [_convert(x) for x in obj]
+            if hasattr(obj, "__dataclass_fields__"):
+                return {k: _convert(v) for k, v in asdict(obj).items()}
             return obj
-        return _coerce(self)
-
-def dump_enriched(items: List[EnrichedItem]) -> List[Dict[str, Any]]:
-    return [item.to_json() for item in items]
+        return _convert(self)
