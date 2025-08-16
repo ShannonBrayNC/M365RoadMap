@@ -334,7 +334,7 @@ def main() -> None:
 
     generated = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     cloud_label = ", ".join(sorted(normalize_clouds(args.cloud))) if args.cloud else ""
-    parts: list[str] = [render_header(title=args.title, generated_utc=generated, cloud_label=cloud_label)]
+    parts: list[str] = [render_header(title=args.title, generated_utc=generated, cloud_display=cloud_label)]
 
     count = 0
     for r in rows:
