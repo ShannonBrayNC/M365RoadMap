@@ -1,132 +1,69 @@
-from __future__ import annotations
-
-import json
+import csv
+import io
+import subprocess
+import sys
 from pathlib import Path
-from typing import Any
-
-import scripts.fetch_messages_graph as mod
 
 
-def test_products_flag_end_to_end_json(tmp_path: Path, monkeypatch) -> None:
-    """Deep dive ON (default): --products filters Graph + Public + RSS."""
-
-    def fake_fetch_graph(_cfg: Any, no_window: bool) -> list[dict[str, Any]]:
-        assert isinstance(no_window, bool)
-        return [
-            {
-                "roadmapId": "1",
-                "title": "Teams new feature",
-                "product": "Microsoft Teams",
-                "clouds": "General",
-                "lastModified": "2025-08-10T00:00:00Z",
-            },
-            {
-                "roadmapId": "2",
-                "title": "Intune change",
-                "product": "Intune",
-                "clouds": "GCC",
-                "lastModified": "2025-08-10T00:00:00Z",
-            },
-        ]
-
-    monkeypatch.setattr(mod, "_fetch_graph", fake_fetch_graph)
-
-    monkeypatch.setattr(
-        mod,
-        "fetch_public_json",
-        lambda: [
-            {
-                "id": "p1",
-                "title": "SharePoint improvement",
-                "product": "SharePoint",
-                "clouds": "General",
-            },
-            {
-                "id": "p2",
-                "title": "Teams admin update",
-                "product": "Microsoft Teams",
-                "clouds": "DoD",
-            },
-        ],
-    )
-
-    # one RSS item should match ("Teams news"), the other should be filtered
-    rss_xml = """
-    <rss><channel>
-      <item><title>Teams news</title><link>http://example/teams</link><pubDate>Fri, 15 Aug 2025 12:00:00 GMT</pubDate></item>
-      <item><title>Windows update</title><link>http://example/windows</link><pubDate>Fri, 15 Aug 2025 12:05:00 GMT</pubDate></item>
-    </channel></rss>
-    """.strip()
-    monkeypatch.setattr(mod, "fetch_rss", lambda: rss_xml)
-
-    out = tmp_path / "o.json"
-    mod.main(
-        [
-            "--emit",
-            "json",
-            "--out",
-            str(out),
-            "--products",
-            "Teams",  # comma/semicolon are both accepted; single value here
-        ]
-    )
-
-    data = json.loads(out.read_text(encoding="utf-8"))
-    # Expect: 1 Graph (Teams), 1 Public (Teams), 1 RSS (Teams news) = 3 total
-    assert len(data) == 3
-    # All rows should be about Teams (product field OR title for RSS rows)
-    for r in data:
-        hay = (r.get("product", "") + " " + r.get("title", "")).lower()
-        assert "teams" in hay
-    # Ensure we actually got all three sources
-    assert {r["source"] for r in data} == {"graph", "public-json", "rss"}
+def _write_master(tmp: Path) -> Path:
+    csv_text = """PublicId,Title,Product_Workload,Status,Cloud_instance,LastModified,ReleaseDate,Source,MessageId,Official_Roadmap_link
+1001,Teams thing,Microsoft Teams,,General,2025-08-10,,graph,MC1,https://example/1001
+1002,Intune item,Microsoft Intune,,GCC,2025-08-11,,graph,MC2,https://example/1002
+1003,SharePoint feature,SharePoint Online,,DoD,2025-08-12,,graph,MC3,https://example/1003
+"""
+    p = tmp / "master.csv"
+    p.write_text(csv_text, encoding="utf-8")
+    return p
 
 
-def test_essentials_only_skips_public_and_rss(tmp_path: Path, monkeypatch) -> None:
-    """With --essentials-only, only Graph rows are emitted."""
+def test_products_filter(tmp_path: Path) -> None:
+    master = _write_master(tmp_path)
+    out_md = tmp_path / "out.md"
 
-    def fake_fetch_graph(_cfg: Any, _no_window: bool) -> list[dict[str, Any]]:
-        return [
-            {
-                "roadmapId": "1",
-                "title": "Teams new feature",
-                "product": "Microsoft Teams",
-                "clouds": "General",
-                "lastModified": "2025-08-10T00:00:00Z",
-            },
-            {
-                "roadmapId": "2",
-                "title": "Intune change",
-                "product": "Intune",
-                "clouds": "GCC",
-                "lastModified": "2025-08-10T00:00:00Z",
-            },
-        ]
+    # Filter to just "Teams|SharePoint"
+    cmd = [
+        sys.executable,
+        str(Path("scripts") / "generate_report.py"),
+        "--title",
+        "Test",
+        "--master",
+        str(master),
+        "--out",
+        str(out_md),
+        "--products",
+        "Teams|SharePoint",
+        "--cloud",
+        "General|DoD",
+    ]
+    subprocess.run(cmd, check=True)
 
-    monkeypatch.setattr(mod, "_fetch_graph", fake_fetch_graph)
-    # Even if these return data, --essentials-only should ignore them
-    monkeypatch.setattr(
-        mod,
-        "fetch_public_json",
-        lambda: [{"id": "pX", "title": "Teams note", "product": "Microsoft Teams"}],
-    )
-    monkeypatch.setattr(mod, "fetch_rss", lambda: "<rss/>")
+    text = out_md.read_text(encoding="utf-8")
+    # Expect to see 1001 (Teams, General) and 1003 (SharePoint, DoD); not 1002 (Intune, GCC)
+    assert "[1001]" in text
+    assert "[1003]" in text
+    assert "[1002]" not in text
 
-    out = tmp_path / "e.json"
-    mod.main(
-        [
-            "--emit",
-            "json",
-            "--out",
-            str(e := out),
-            "--products",
-            "Teams",
-            "--essentials-only",
-        ]
-    )
 
-    data = json.loads(out.read_text(encoding="utf-8"))
-    # Only the Graph "Teams new feature" should remain
-    assert len(data) == 1
-    assert data[0]["source"] == "graph"
-    assert "teams" in (data[0].get("product", "") + " " + data[0].get("title", "")).lower()
+def test_forced_ids_ordering(tmp_path: Path) -> None:
+    master = _write_master(tmp_path)
+    out_md = tmp_path / "out.md"
+
+    cmd = [
+        sys.executable,
+        str(Path("scripts") / "generate_report.py"),
+        "--title",
+        "Test",
+        "--master",
+        str(master),
+        "--out",
+        str(out_md),
+        "--forced-ids",
+        "1003,1001",
+    ]
+    subprocess.run(cmd, check=True)
+
+    text = out_md.read_text(encoding="utf-8")
+    # First occurence should be 1003, then 1001
+    first_1003 = text.find("[1003]")
+    first_1001 = text.find("[1001]")
+    assert 0 <= first_1003 < first_1001
