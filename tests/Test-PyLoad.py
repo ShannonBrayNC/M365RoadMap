@@ -10,6 +10,5 @@ def test_scripts_package_importable() -> None:
     import scripts  # noqa: F401
     import scripts.graph_client  # noqa: F401
 
-    # Sanity: ensure package dir looks valid
     pkg_file = Path(scripts.__file__).resolve()
     assert pkg_file.exists(), f"scripts package not found at {pkg_file}"

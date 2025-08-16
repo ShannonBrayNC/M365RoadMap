@@ -32,7 +32,6 @@ def test_products_filter(tmp_path: Path) -> None:
            "--products", "Teams, SharePoint"]
     subprocess.check_call(cmd)
     txt = _read_text(out_md)
-    # should include Teams and SharePoint, but not Exchange
     assert "Teams: Something" in txt
     assert "SharePoint: Thing" in txt
     assert "Exchange: Other" not in txt
@@ -40,7 +39,6 @@ def test_products_filter(tmp_path: Path) -> None:
 def test_forced_ids_ordering(tmp_path: Path) -> None:
     master = _write_master(tmp_path)
     out_md = tmp_path / "out.md"
-    # Force 1003 then 1001 first
     cmd = [sys.executable, "scripts/generate_report.py",
            "--title", "Test",
            "--master", str(master),
@@ -48,7 +46,6 @@ def test_forced_ids_ordering(tmp_path: Path) -> None:
            "--forced-ids", "1003,1001"]
     subprocess.check_call(cmd)
     txt = _read_text(out_md)
-    # extract first two bullet lines
     lines = [ln for ln in txt.splitlines() if ln.startswith("- **[")][:2]
     assert "1003" in lines[0], textwrap.dedent(f"Expected 1003 first, got:\n{lines}")
     assert "1001" in lines[1], textwrap.dedent(f"Expected 1001 second, got:\n{lines}")
