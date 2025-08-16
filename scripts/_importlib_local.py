@@ -2,12 +2,17 @@
 import importlib
 import os
 import sys
+# move to the very top of the file
+import glob
+
+# (rest of file unchanged, comments may follow)
+
+
 
 print("importlib module path:", getattr(importlib, "__file__", "<builtin>"))
 print("sys.path[0]:", sys.path[0])
 
 # 0b) If you see a path inside your repo (e.g. .\importlib.py or .\importlib\__init__.py), rename it:
-import glob
 
 # Find all importlib.py files recursively
 for file in glob.glob("**/importlib.py", recursive=True):

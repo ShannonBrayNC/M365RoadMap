@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import argparse
-import datetime as dt
-from pathlib import Path
+import sys
+import markdown
 
 
 #!/usr/bin/env python3
-import sys, pathlib, markdown
+import pathlib
 
 def main() -> None:
     if len(sys.argv) != 3:

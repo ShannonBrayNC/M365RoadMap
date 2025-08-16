@@ -1,6 +1,11 @@
-import os, sys, pathlib
+import os
+import sys
+import pathlib
 def main():
-    os.environ.setdefault("M365_ROADMAP_JSON", str(pathlib.Path.cwd() / "data" / "M365RoadMap_Test.json"))
+    os.environ.setdefault("" \
+        "M365_ROADMAP_JSON",
+         str(pathlib.Path.cwd() / "data" / "M365RoadMap_Test.json"),
+         )
     app_path = pathlib.Path(__file__).parent / "app" / "streamlit_app.py"
     try:
         from streamlit.web import cli as stcli

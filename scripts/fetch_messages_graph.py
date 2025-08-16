@@ -9,11 +9,10 @@ import csv
 import json
 import os
 import re
-import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # External deps expected in the runner (as in your workflow):
 #   msal, requests, cryptography
@@ -21,7 +20,6 @@ import requests
 import msal
 from cryptography.hazmat.primitives.serialization import Encoding, NoEncryption, PrivateFormat
 from cryptography.hazmat.primitives import hashes
-from cryptography import x509
 from cryptography.hazmat.primitives.serialization.pkcs12 import load_key_and_certificates
 
 

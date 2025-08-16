@@ -14,7 +14,7 @@ def _truthy(s: str | None) -> bool:
 
 
 def main() -> None:
-    title = os.environ.get("TITLE")  # optional convenience, but we pass via CLI below
+    #title = os.environ.get("TITLE")  # optional convenience, but we pass via CLI below
     # required via CLI args from action:
     #   --title, --master, --out
     # We just forward those; we only add optional flags from env.

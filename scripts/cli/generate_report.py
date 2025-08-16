@@ -24,7 +24,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass, asdict, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import  Dict, List, Optional, Tuple
 
 # Third‑party
 import requests
@@ -89,7 +89,7 @@ class EnrichedItem:
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
-        d["links"] = [asdict(l) for l in self.links]
+        d["links"] = [asdict(link) for link in self.links]
         return d
 
 # -----------------------------
@@ -155,7 +155,7 @@ def fetch_roadmap(seed_url: str = "https://www.microsoft.com/en-us/microsoft-365
                     "services": services,
                     "summary": summary or None
                 })
-        except Exception as e:
+        except Exception:
             # Skip card if anything unexpected
             continue
 
@@ -226,7 +226,7 @@ def fetch_release_comms_rss() -> List[Dict[str, Any]]:
         print(f"[rss] fetch error: {e}", file=sys.stderr)
         return []
 
-    ns = {"atom": "http://www.w3.org/2005/Atom", "rss": "http://purl.org/rss/1.0/"}
+    n#s = {"atom": "http://www.w3.org/2005/Atom", "rss": "http://purl.org/rss/1.0/"}
     items: List[Dict[str, Any]] = []
     # Try generic RSS 2.0
     for it in root.findall(".//item"):
@@ -345,12 +345,12 @@ def write_simple_html(items: List[EnrichedItem], path: str) -> None:
     rows = []
     for it in items:
         chips = " ".join(
-            f'<a class="chip" href="{l.url}" target="_blank" rel="noreferrer">{l.label}</a>'
-            for l in it.links if l.url
-        )
+                f'<a class="chip" href="{link.url}" target="_blank" rel="noreferrer">{link.label}</a>'
+                for link in it.links if link.url
+            )
         rows.append(f"""
 <tr>
-  <td>{it.id}</td>
+  <td>{it.id}</td>    
   <td>{it.title}</td>
   <td>{it.product}</td>
   <td>{", ".join(it.services)}</td>

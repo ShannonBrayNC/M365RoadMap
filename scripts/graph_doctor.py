@@ -22,7 +22,7 @@ import argparse
 import base64
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import  timezone
 from typing import Dict, Any, Tuple, Optional
 
 import requests

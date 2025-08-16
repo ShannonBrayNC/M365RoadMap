@@ -52,7 +52,7 @@ def acquire_token(cfg: dict[str, Any]) -> str:
     tenant = cast(str, cfg.get("tenant") or cfg.get("TENANT") or "")
     client_id = cast(str, cfg.get("client_id") or cfg.get("CLIENT") or "")
     pfx_b64 = cast(str, cfg.get("pfx_base64") or cfg.get("PFX_B64") or "")
-    pwd = get_pfx_password(cfg)
+    _pwd = get_pfx_password(cfg)
 
     if not (tenant and client_id and pfx_b64):
         raise RuntimeError("Missing tenant/client_id/pfx_base64 in config")
