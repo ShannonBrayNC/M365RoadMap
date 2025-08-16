@@ -6,22 +6,11 @@ Fetch Microsoft 365 roadmap/message-center content into a master CSV/JSON.
 Key behaviors:
 - Tries real Microsoft Graph first (if config/secrets look valid).
 - If Graph is missing or fails, automatically falls back to public sources.
+- If both produce 0 rows, seed from --seed-ids / PUBLIC_IDS env or discovered_ids CSVs.
 - Treats blank/empty Cloud_instance as "General".
 - Supports --cloud filters, --since/--months, and emits CSV/JSON.
 - Writes and prints fetch stats for easy debugging.
 - Accepts list *or* set for cloud selection helpers (keeps tests happy).
-
-This module keeps function names used by existing tests:
-- Row (dataclass)
-- normalize_clouds
-- include_by_cloud
-- transform_graph_messages
-- transform_public_items
-- transform_rss
-- merge_sources
-
-NOTE: Public-source functions here are intentionally simple. Wire them to your
-project’s actual public RSS/JSON endpoints if needed.
 """
 
 from __future__ import annotations
@@ -44,10 +33,10 @@ except Exception:  # pragma: no cover
 
 # Try to import your Graph client. If unavailable on runner, we’ll fall back.
 try:
-    from scripts.graph_client import (
-        GraphClient,  # type: ignore[import-not-found]
-        GraphConfig,  # type: ignore[import-not-found]
-        acquire_token,  # type: ignore[import-not-found]
+    from scripts.graph_client import (  # type: ignore[import-not-found]
+        GraphClient,
+        GraphConfig,
+        acquire_token,
     )
 except Exception:  # pragma: no cover
     GraphClient = None  # type: ignore[assignment]
@@ -60,7 +49,7 @@ except Exception:  # pragma: no cover
 # ------------------------------
 
 # Roadmap ID can be numeric or alphanumeric; keep broad but constrained.
-_RE_ROADMAP_ID: re.Pattern[str] = re.compile(r"\[([0-9A-Za-z\-]+)\]")
+_RE_ROADMAP_ID: re.Pattern[str] = re.compile(r"\[?([0-9A-Za-z\-]+)\]?")
 
 # Canonical cloud labels used throughout the repo
 CLOUD_LABELS: Dict[str, str] = {
@@ -87,7 +76,7 @@ WORLDWIDE_ALIASES: Tuple[str, ...] = (
 class Row:
     PublicId: str
     Title: str
-    Source: str  # "graph", "rss", "public-json", etc.
+    Source: str  # "graph", "rss", "public-json", "seed"
     Product_Workload: str
     Status: str
     LastModified: str
@@ -136,15 +125,20 @@ def parse_date_soft(s: Optional[str]) -> Optional[str]:
     s = s.strip()
     if not s:
         return None
-    # Try several formats commonly seen in feeds or Graph
-    fmts = ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S", "%m/%d/%Y")
+    fmts = (
+        "%Y-%m-%d",
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%dT%H:%M:%S.%f%z",
+        "%Y-%m-%dT%H:%M:%S",
+        "%m/%d/%Y",
+        "%a, %d %b %Y %H:%M:%S %Z",  # common RSS pubDate
+    )
     for f in fmts:
         try:
             d = dt.datetime.strptime(s, f)
             return d.date().isoformat()
         except Exception:
             continue
-    # As a last resort, return original string
     return s
 
 
@@ -163,7 +157,6 @@ def normalize_clouds(value: str | None) -> Set[str]:
     if lower in WORLDWIDE_ALIASES:
         return {CLOUD_LABELS["GENERAL"]}
 
-    # Split on common separators and normalize tokens
     tokens = re.split(r"[;,/|]+", lower)
     out: Set[str] = set()
     for t in tokens:
@@ -179,7 +172,6 @@ def normalize_clouds(value: str | None) -> Set[str]:
         elif t in ("dod", "us dod"):
             out.add(CLOUD_LABELS["DOD"])
         else:
-            # Unknown => keep verbatim capitalized
             out.add(t.title())
 
     if not out:
@@ -295,7 +287,7 @@ def transform_rss(items: List[Dict[str, Any]]) -> List[Row]:
         title = str(it.get("title") or "").strip()
         m: Optional[Match[str]] = _RE_ROADMAP_ID.search(title)
         rid = m.group(1) if m else ""
-        lm = parse_date_soft(it.get("updated") or it.get("published"))
+        lm = parse_date_soft(it.get("updated") or it.get("published") or it.get("pubDate"))
         link = str(it.get("link") or "").strip()
 
         out.append(
@@ -316,15 +308,12 @@ def transform_rss(items: List[Dict[str, Any]]) -> List[Row]:
 
 
 def merge_sources(rows: List[Row]) -> List[Row]:
-    """
-    De-duplicate by PublicId, preferring Graph over others.
-    """
+    """De-duplicate by PublicId, preferring Graph over others."""
     by_id: Dict[str, Row] = {}
-    priority = {"graph": 3, "public-json": 2, "rss": 1}
+    priority = {"graph": 3, "public-json": 2, "rss": 1, "seed": 0}
     for r in rows:
         key = r.PublicId or r.MessageId or r.Title
         if not key:
-            # fall back to unique-ish
             key = f"{r.Source}:{r.Title}"
         existing = by_id.get(key)
         if not existing or priority.get(r.Source, 0) > priority.get(existing.Source, 0):
@@ -344,7 +333,7 @@ def fetch_from_graph(cfg: Dict[str, Any], since: Optional[str], months: Optional
     if GraphClient is None or GraphConfig is None or acquire_token is None:
         raise RuntimeError("Graph client not available on this runner")
 
-    # Minimal example — your repo likely has richer logic:
+    # Example placeholder — replace with your real calls
     gcfg = GraphConfig(
         tenant=cfg["tenant"],
         client_id=cfg["client_id"],
@@ -353,8 +342,6 @@ def fetch_from_graph(cfg: Dict[str, Any], since: Optional[str], months: Optional
     )
     token = acquire_token(gcfg)
     client = GraphClient(token)
-
-    # Example endpoint; replace with your actual
     # items = client.list_roadmap_updates(since=since, months=months)
     items: List[Dict[str, Any]] = []  # TODO: integrate your real call
     return transform_graph_messages(items)
@@ -370,7 +357,6 @@ def _fetch_public_json(url: Optional[str]) -> List[Dict[str, Any]]:
         if isinstance(data, list):
             return data
         if isinstance(data, dict):
-            # Allow a top-level "items" array
             items = data.get("items")
             return items if isinstance(items, list) else []
         return []
@@ -380,57 +366,123 @@ def _fetch_public_json(url: Optional[str]) -> List[Dict[str, Any]]:
 
 def _fetch_public_rss(url: Optional[str]) -> List[Dict[str, Any]]:
     """
-    Very light RSS fetcher. If you have feedparser in requirements you can
-    replace this with a proper parse to pull fields you care about.
+    Very light RSS fetcher: if you install feedparser, swap this for a richer parse.
     """
     if not url or requests is None:
         return []
     try:
         r = requests.get(url, timeout=30)
         r.raise_for_status()
-        # Minimal parse: just split items by <item> boundaries
         text = r.text
         parts = re.split(r"<item\b", text, flags=re.I)
         out: List[Dict[str, Any]] = []
         for p in parts[1:]:
-            # naive title/link extraction
             m_title = re.search(r"<title>(.*?)</title>", p, flags=re.I | re.S)
             m_link = re.search(r"<link>(.*?)</link>", p, flags=re.I | re.S)
-            m_date = re.search(r"<pubDate>(.*?)</pubDate>", p, flags=re.I | re.S)
+            m_pub = re.search(r"<pubDate>(.*?)</pubDate>", p, flags=re.I | re.S)
             title = (m_title.group(1) if m_title else "").strip()
             link = (m_link.group(1) if m_link else "").strip()
-            updated = (m_date.group(1) if m_date else "").strip()
-            out.append({"title": title, "link": link, "updated": updated})
+            updated = (m_pub.group(1) if m_pub else "").strip()
+            out.append({"title": title, "link": link, "pubDate": updated})
         return out
     except Exception:
         return []
 
 
-def fetch_public_sources(
-    cfg: Dict[str, Any],
-    since: Optional[str],
-    months: Optional[int],
-) -> List[Row]:
+def fetch_public_sources(cfg: Dict[str, Any], since: Optional[str], months: Optional[int]) -> List[Row]:
     """
-    Fetch from public JSON+RSS if configured. This keeps placeholders so the
-    script produces output even when Graph is unavailable.
+    Fetch from public JSON+RSS if configured.
     """
     public_json_url = cfg.get("public_json_url")  # Optional
     public_rss_url = cfg.get("public_rss_url")    # Optional
 
     rows: List[Row] = []
 
-    # Public JSON (if provided)
     json_items = _fetch_public_json(public_json_url)
     if json_items:
         rows.extend(transform_public_items(json_items))
 
-    # Public RSS (if provided)
     rss_items = _fetch_public_rss(public_rss_url)
     if rss_items:
         rows.extend(transform_rss(rss_items))
 
     return rows
+
+
+# ------------------------------
+# Seeding fallback
+# ------------------------------
+
+def _parse_seed_ids(raw: Optional[str]) -> List[str]:
+    if not raw:
+        return []
+    # split on comma, pipe, whitespace
+    parts = re.split(r"[,\|\s]+", raw.strip())
+    return [p for p in (x.strip() for x in parts) if p]
+
+
+def _seed_rows_from_ids(ids: List[str]) -> List[Row]:
+    out: List[Row] = []
+    for rid in ids:
+        out.append(
+            Row(
+                PublicId=rid,
+                Title=f"[{rid}]",
+                Source="seed",
+                Product_Workload="",
+                Status="",
+                LastModified="",
+                ReleaseDate="",
+                Cloud_instance="",  # blank → General in downstream filters
+                Official_Roadmap_link=f"https://www.microsoft.com/microsoft-365/roadmap?filters=&searchterms={rid}",
+                MessageId="",
+            )
+        )
+    return out
+
+
+def _discover_ids_from_output_dir() -> List[str]:
+    """
+    Best-effort discovery: read first column or 'PublicId' column from any
+    output/discovered_ids*.csv if they exist.
+    """
+    out_dir = "output"
+    patterns = ("discovered_ids.csv", "discovered_ids_gcc.csv", "discovered_ids_loose.csv")
+    found: List[str] = []
+    for name in patterns:
+        path = os.path.join(out_dir, name)
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8", newline="") as f:
+                r = csv.reader(f)
+                header: Optional[List[str]] = None
+                for i, row in enumerate(r):
+                    if not row:
+                        continue
+                    if i == 0:
+                        header = [h.strip().lower() for h in row]
+                        # If header looks like IDs, skip to next row
+                        if any(h in ("publicid", "id") for h in header):
+                            continue
+                    # If we had a header, try to locate 'publicid'/'id' column
+                    if header and any(h in ("publicid", "id") for h in header):
+                        idx = header.index("publicid") if "publicid" in header else header.index("id")
+                        val = row[idx].strip() if idx < len(row) else ""
+                    else:
+                        val = row[0].strip()
+                    if val:
+                        found.append(val)
+        except Exception:
+            continue
+    # de-dup while preserving order
+    seen: Set[str] = set()
+    uniq: List[str] = []
+    for x in found:
+        if x not in seen:
+            seen.add(x)
+            uniq.append(x)
+    return uniq
 
 
 # ------------------------------
@@ -464,6 +516,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help='Cloud filter(s). Examples: "Worldwide (Standard Multi-Tenant)", "GCC", "GCC High", "DoD". Can be repeated.',
     )
     p.add_argument("--no-graph", action="store_true", help="Skip Graph entirely; use public fallbacks only.")
+    p.add_argument("--seed-ids", help="Comma/pipe/space separated PublicIds to seed output if fetch returns 0.", default=None)
     p.add_argument("--emit", choices=("csv", "json"), required=True, help="Output format.")
     p.add_argument("--out", required=True, help="Output file path.")
     p.add_argument("--stats-out", help="Optional JSON stats output path.")
@@ -485,7 +538,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         selected |= normalize_clouds(c)
 
     all_rows: List[Row] = []
-    stats: Dict[str, Any] = {"sources": {"graph": 0, "public-json": 0, "rss": 0}, "errors": 0}
+    stats: Dict[str, Any] = {
+        "sources": {"graph": 0, "public-json": 0, "rss": 0, "seed": 0},
+        "errors": 0,
+    }
 
     # Try Graph first (unless disabled)
     if not args.no_graph:
@@ -499,13 +555,25 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     # Always try public sources
     pub_rows = fetch_public_sources(cfg, args.since, args.months)
-    # Record counts by their Source as mapped in transforms
     stats["sources"]["public-json"] = sum(1 for r in pub_rows if r.Source == "public-json")
     stats["sources"]["rss"] = sum(1 for r in pub_rows if r.Source == "rss")
     all_rows.extend(pub_rows)
 
-    # Dedupe
+    # If still empty, seed from inputs / discovered files
     merged = merge_sources(all_rows)
+    if not merged:
+        # 1) --seed-ids or PUBLIC_IDS env
+        raw_ids = args.seed_ids or os.environ.get("PUBLIC_IDS") or ""
+        ids = _parse_seed_ids(raw_ids)
+
+        # 2) discovered_ids*.csv
+        if not ids:
+            ids = _discover_ids_from_output_dir()
+
+        if ids:
+            seed_rows = _seed_rows_from_ids(ids)
+            stats["sources"]["seed"] = len(seed_rows)
+            merged = merge_sources(merged + seed_rows)
 
     # Cloud filter (treat blank/None as General)
     if selected:
@@ -519,11 +587,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         except Exception:
             pass
 
-    # Months filter: items modified within last N months
     if args.months:
         try:
             today = dt.date.today()
-            # Very simple months -> days approximation (30d each); refine if needed
             delta_days = args.months * 30
             cutoff2 = (today - dt.timedelta(days=delta_days)).isoformat()
             merged = [r for r in merged if (parse_date_soft(r.LastModified) or "") >= cutoff2]
@@ -546,10 +612,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         except Exception:
             print("WARN: failed to write stats_out")
 
-    # Always show top of output dir for debugging if running in CI
+    # Debug directory listing
     try:
         out_dir = os.path.dirname(args.out) or "."
-        head = _safe_head(sorted(os.listdir(out_dir)), 5)
+        head = _safe_head(sorted(os.listdir(out_dir)), 10)
         print(f"DEBUG: files in {out_dir}: {head}")
     except Exception:
         pass

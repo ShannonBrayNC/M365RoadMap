@@ -62,7 +62,6 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          # Use requirements if present; else install minimal libs
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
@@ -84,13 +83,11 @@ jobs:
           }
           JSON
           echo "graph_config.json written."
-          # Export password only if provided, keeps the script simple
           if [ -n "${{ secrets.M365_PFX_PASSWORD }}" ]; then
-            echo "M365_PFX_PASSWORD present."
             echo "M365_PFX_PASSWORD=${{ secrets.M365_PFX_PASSWORD }}" >> $GITHUB_ENV
           fi
 
-      - name: Fetch messages (Graph → fallback)
+      - name: Fetch messages (Graph → fallback → seed)
         shell: bash
         env:
           TITLE: ${{ inputs.title }}
@@ -101,6 +98,7 @@ jobs:
           CLOUD_GCCH: ${{ inputs.cloud_gcch }}
           CLOUD_DOD: ${{ inputs.cloud_dod }}
           NO_GRAPH: ${{ inputs.no_graph }}
+          PUBLIC_IDS: ${{ inputs.public_ids }}
         run: |
           set -euo pipefail
           mkdir -p output
@@ -124,14 +122,17 @@ jobs:
           NOGRAPH=()
           [ "${NO_GRAPH,,}" = "true" ] && NOGRAPH+=(--no-graph)
 
-          echo "Running fetch_messages_graph.py with: ${CFG[*]} ${DATE_FLAGS[*]} ${CLOUD_FLAGS[*]} ${NOGRAPH[*]}"
+          SEED_ARGS=()
+          [ -n "${PUBLIC_IDS}" ] && SEED_ARGS+=(--seed-ids "${PUBLIC_IDS}")
+
+          echo "Running fetch_messages_graph.py with: ${CFG[*]} ${DATE_FLAGS[*]} ${CLOUD_FLAGS[*]} ${NOGRAPH[*]} ${SEED_ARGS[*]}"
 
           python scripts/fetch_messages_graph.py \
-            "${CFG[@]}" "${DATE_FLAGS[@]}" "${CLOUD_FLAGS[@]}" "${NOGRAPH[@]}" \
+            "${CFG[@]}" "${DATE_FLAGS[@]}" "${CLOUD_FLAGS[@]}" "${NOGRAPH[@]}" "${SEED_ARGS[@]}" \
             --emit csv --out "${CSV_OUT}" --stats-out "${STATS_OUT}"
 
           python scripts/fetch_messages_graph.py \
-            "${CFG[@]}" "${DATE_FLAGS[@]}" "${CLOUD_FLAGS[@]}" "${NOGRAPH[@]}" \
+            "${CFG[@]}" "${DATE_FLAGS[@]}" "${CLOUD_FLAGS[@]}" "${NOGRAPH[@]}" "${SEED_ARGS[@]}" \
             --emit json --out "${JSON_OUT}"
 
           echo "csv=${CSV_OUT}"     >> "$GITHUB_OUTPUT"
@@ -144,7 +145,7 @@ jobs:
           echo "---- output dir ----"
           ls -l output || true
           echo "---- head master.csv ----"
-          head -n 5 "output/${{ inputs.title }}_master.csv" || true
+          head -n 10 "output/${{ inputs.title }}_master.csv" || true
           echo "---- fetch stats ----"
           cat "output/${{ inputs.title }}_fetch_stats.json" || true
 
