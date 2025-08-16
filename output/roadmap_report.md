@@ -1,37 +1,63 @@
-Roadmap Report
-Generated 2025-08-16 11:20 UTC
+# Roadmap Report
+_Generated 2025-08-16 15:07 UTC_
 
-Roadmap Report Generated 2025-08-16 11:20 UTC Cloud filter: General
+**Cloud filter:** General
+
+---
+
+## Table of Contents
+- [[497910]](#id-497910)
+- [[4710]](#id-4710)
+- [[5000]](#id-5000)
 
 
-Total features: 3
+### <a id="id-497910"></a> **[497910]**
+[Roadmap](https://www.microsoft.com/microsoft-365/roadmap?filters=&searchterms=497910)
 
-[497910] [497910] Product/Workload: — Status: — Cloud(s): — Last Modified: — Release Date: — Source: seed Message ID: — Official Roadmap: https://www.microsoft.com/microsoft-365/roadmap?filters=&searchterms=497910
+**Summary**
+> (summary pending)
 
-Microsoft 365: [497910]. Status: —. Clouds: —. Last modified: —; planned release: —. Source: seed.
+**What’s changing**
+> (details pending)
 
-This is a feature/update tracked in the Microsoft 365 roadmap.
+**Impact and rollout**
+> (impact pending)
 
-Assess change management needs and adjust communications if end-user experience changes.
+**Action items**
+> (actions pending)
 
-Track rollout via the official roadmap link and any related Message center posts. Prepare short end-user and helpdesk notes for awareness.
+---
 
-[4710] [4710] Product/Workload: — Status: — Cloud(s): — Last Modified: — Release Date: — Source: seed Message ID: — Official Roadmap: https://www.microsoft.com/microsoft-365/roadmap?filters=&searchterms=4710
+### <a id="id-4710"></a> **[4710]**
+[Roadmap](https://www.microsoft.com/microsoft-365/roadmap?filters=&searchterms=4710)
 
-Microsoft 365: [4710]. Status: —. Clouds: —. Last modified: —; planned release: —. Source: seed.
+**Summary**
+> (summary pending)
 
-This is a feature/update tracked in the Microsoft 365 roadmap.
+**What’s changing**
+> (details pending)
 
-Assess change management needs and adjust communications if end-user experience changes.
+**Impact and rollout**
+> (impact pending)
 
-Track rollout via the official roadmap link and any related Message center posts. Prepare short end-user and helpdesk notes for awareness.
+**Action items**
+> (actions pending)
 
-[5000] [5000] Product/Workload: — Status: — Cloud(s): — Last Modified: — Release Date: — Source: seed Message ID: — Official Roadmap: https://www.microsoft.com/microsoft-365/roadmap?filters=&searchterms=5000
+---
 
-Microsoft 365: [5000]. Status: —. Clouds: —. Last modified: —; planned release: —. Source: seed.
+### <a id="id-5000"></a> **[5000]**
+[Roadmap](https://www.microsoft.com/microsoft-365/roadmap?filters=&searchterms=5000)
 
-This is a feature/update tracked in the Microsoft 365 roadmap.
+**Summary**
+> (summary pending)
 
-Assess change management needs and adjust communications if end-user experience changes.
+**What’s changing**
+> (details pending)
 
-Track rollout via the official roadmap link and any related Message center posts. Prepare short end-user and helpdesk notes for awareness.
+**Impact and rollout**
+> (impact pending)
+
+**Action items**
+> (actions pending)
+
+---
