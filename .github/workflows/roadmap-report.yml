@@ -68,24 +68,29 @@ jobs:
             pip install requests markdown
           fi
 
-      - name: Prepare graph_config.json (optional creds)
+      - name: Prepare graph_config.json (Graph creds)
         shell: bash
         run: |
           set -euo pipefail
+
+          # Export the password secret to an env var for the run
+          if [ -n "${{ secrets.M365_PFX_PASSWORD }}" ]; then
+            echo "M365_PFX_PASSWORD=${{ secrets.M365_PFX_PASSWORD }}" >> "$GITHUB_ENV"
+          fi
+
+          # Write config with the field names fetch_messages_graph.py expects
           cat > graph_config.json <<'JSON'
           {
-            "TENANT":   "${{ secrets.M365_TENANT_ID || '' }}",
-            "CLIENT":"${{ secrets.M365_CLIENT_ID  || '' }}",
-            "PFX_B64":"${{ secrets.M365_PFX_BASE64 || '' }}",
-            "M365_PFX_PASSWORD":"M365_PFX_PASSWORD",
-            "public_json_url": "",
-            "public_rss_url": ""
+            "tenant":            ${{ toJSON(secrets.M365_TENANT_ID) }},
+            "client":            ${{ toJSON(secrets.M365_CLIENT_ID) }},
+            "pfx_b64":           ${{ toJSON(secrets.M365_PFX_BASE64) }},
+            "pfx_password_env":  "M365_PFX_PASSWORD",
+            "graph_base":        "https://graph.microsoft.com"
           }
           JSON
-          echo "graph_config.json written."
-          if [ -n "${{ secrets.M365_PFX_PASSWORD }}" ]; then
-            echo "M365_PFX_PASSWORD=${{ secrets.M365_PFX_PASSWORD }}" >> $GITHUB_ENV
-          fi
+
+          echo "graph_config.json written:"
+          cat graph_config.json | sed 's/"pfx_b64":.*/"pfx_b64":"***redacted***",/'
 
       - name: Fetch messages (Graph → fallback → seed)
         shell: bash
