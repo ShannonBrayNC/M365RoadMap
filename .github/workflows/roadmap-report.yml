@@ -3,71 +3,66 @@ name: Roadmap Report
 on:
   workflow_dispatch:
     inputs:
-      TITLE:
-        description: Base name for output files (no extension)
+      title:
+        description: Output base name (no extension)
         required: false
         default: roadmap_report
-      PUBLIC_IDS:
-        description: Comma-separated Roadmap IDs to force include
+      since:
+        description: ISO date (YYYY-MM-DD) to include items since
         required: false
         default: ""
-      MONTHS:
-        description: Lookback window in months (leave blank for none)
+      months:
+        description: Limit to the last N months (number)
         required: false
         default: ""
-      SINCE:
-        description: ISO date (YYYY-MM-DD) to start from (overrides months; blank for none)
-        required: false
-        default: ""
-      CLOUD_GENERAL:
-        description: Include Worldwide (General)
-        required: false
-        default: "true"
-      CLOUD_GCC:
-        description: Include GCC
-        required: false
-        default: "false"
-      CLOUD_GCCH:
-        description: Include GCC High
-        required: false
-        default: "false"
-      CLOUD_DOD:
-        description: Include DoD
-        required: false
-        default: "false"
-      products:
-        description: "Products/workloads to include (CSV or ; separated: e.g., Teams, Intune, SharePoint). Leave blank for all."
-        required: false
-        type: string
-      deep_dive:
-        description: "Include AI deep dive (RSS/public) sources"
+      cloud_general:
+        description: Include Worldwide (Standard Multi-Tenant)
+        type: boolean
         required: false
         default: true
+      cloud_gcc:
+        description: Include GCC
         type: boolean
+        required: false
+        default: false
+      cloud_gcch:
+        description: Include GCC High
+        type: boolean
+        required: false
+        default: false
+      cloud_dod:
+        description: Include DoD
+        type: boolean
+        required: false
+        default: false
+      products:
+        description: Comma/pipe/space-separated product keywords (blank = all)
+        required: false
+        default: ""
+      public_ids:
+        description: Comma/space-separated exact IDs to force-include (keeps order)
+        required: false
+        default: ""
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
     env:
-      # Inputs
-      TITLE: ${{ inputs.TITLE }}
-      PUBLIC_IDS: ${{ inputs.PUBLIC_IDS }}
-      MONTHS: ${{ inputs.MONTHS }}
-      SINCE: ${{ inputs.SINCE }}
-      NO_WINDOW: ${{ inputs.NO_WINDOW }}
-      CLOUD_GENERAL: ${{ inputs.CLOUD_GENERAL }}
-      CLOUD_GCC: ${{ inputs.CLOUD_GCC }}
-      CLOUD_GCCH: ${{ inputs.CLOUD_GCCH }}
-      CLOUD_DOD: ${{ inputs.CLOUD_DOD }}
-
-      # Graph secrets
-      TENANT: ${{ secrets.GRAPH_TENANT_ID }}
-      CLIENT: ${{ secrets.GRAPH_CLIENT_ID }}
-      PFX_B64: ${{ secrets.M365_PFX_BASE64 }}
-      M365_PFX_PASSWORD: ${{ secrets.M365_PFX_PASSWORD }}
+      TITLE: ${{ inputs.title }}
+      SINCE: ${{ inputs.since }}
+      MONTHS: ${{ inputs.months }}
+      CLOUD_GENERAL: ${{ inputs.cloud_general }}
+      CLOUD_GCC: ${{ inputs.cloud_gcc }}
+      CLOUD_GCCH: ${{ inputs.cloud_gcch }}
+      CLOUD_DOD: ${{ inputs.cloud_dod }}
+      PRODUCTS: ${{ inputs.products }}
+      PUBLIC_IDS: ${{ inputs.public_ids }}
+      # Graph cert secrets (set these in repo Settings > Secrets and variables > Actions)
+      TENANT: ${{ secrets.TENANT_ID }}
+      CLIENT: ${{ secrets.CLIENT_ID }}
+      PFX_B64: ${{ secrets.PFX_B64 }}
+      M365_PFX_PASSWORD: ${{ secrets.PFX_PASSWORD }}
       PFX_PASSWORD_ENV: M365_PFX_PASSWORD
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -77,43 +72,37 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
-          set -euo pipefail
-          python -m pip install --upgrade pip
+          python -m pip install -U pip
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
-            # ensure the markdown renderer is present even if not in requirements.txt
-            pip install Markdown
           else
-            pip install requests beautifulsoup4 lxml msal cryptography pandas Markdown
+            pip install pandas requests msal cryptography beautifulsoup4 lxml feedparser tqdm Markdown
           fi
 
-
-      - name: Prepare graph_config.json (no heredocs)
-        id: graphcfg
+      - name: Write graph_config.json (from secrets)
         run: |
-          set -euo pipefail
-          # Writes graph_config.json if secrets are present; harmless no-op otherwise
-          python scripts/ci_write_graph_config.py --out graph_config.json || true
-          if [ -f graph_config.json ]; then
-            echo "graph_cfg=graph_config.json" >> "$GITHUB_OUTPUT"
-          else
-            echo "graph_cfg=" >> "$GITHUB_OUTPUT"
-          fi
+          cat > graph_config.json <<'JSON'
+          {
+            "tenant": "${TENANT}",
+            "client_id": "${CLIENT}",
+            "pfx_base64": "${PFX_B64}"
+          }
+          JSON
+          echo "graph_config.json written."
 
-      - name: Fetch master data (Graph/Public/RSS)
-        id: fetch
+      - name: Fetch master CSV/JSON via Graph + fallbacks
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p output
+
           CSV_OUT="output/${TITLE}_master.csv"
           JSON_OUT="output/${TITLE}_master.json"
           STATS_OUT="output/${TITLE}_fetch_stats.json"
 
-          CFG=()
-          [ -n "${{ steps.graphcfg.outputs.graph_cfg }}" ] && CFG=(--config "${{ steps.graphcfg.outputs.graph_cfg }}")
+          CFG=(--config "graph_config.json")
 
           DATE_FLAGS=()
           [ -n "${SINCE}" ] && DATE_FLAGS+=(--since "${SINCE}")
@@ -125,29 +114,24 @@ jobs:
           [ "${CLOUD_GCCH,,}" = "true" ] && CLOUD_FLAGS+=(--cloud "GCC High")
           [ "${CLOUD_DOD,,}" = "true" ] && CLOUD_FLAGS+=(--cloud "DoD")
 
-          NOWINDOW_FLAG=()
-          [ "${NO_WINDOW,,}" = "true" ] && NOWINDOW_FLAG=(--no-window)
-
-          echo "Running fetch_messages_graph.py with: ${CFG[*]} ${DATE_FLAGS[*]} ${CLOUD_FLAGS[*]} ${NOWINDOW_FLAG[*]}"
-
+          echo "Running fetch_messages_graph.py with: ${CFG[*]} ${DATE_FLAGS[*]} ${CLOUD_FLAGS[*]}"
           python scripts/fetch_messages_graph.py \
-            "${CFG[@]}" "${DATE_FLAGS[@]}" "${CLOUD_FLAGS[@]}" "${NOWINDOW_FLAG[@]}" \
+            "${CFG[@]}" "${DATE_FLAGS[@]}" "${CLOUD_FLAGS[@]}" \
             --emit csv --out "${CSV_OUT}" --stats-out "${STATS_OUT}"
 
           python scripts/fetch_messages_graph.py \
-            "${CFG[@]}" "${DATE_FLAGS[@]}" "${CLOUD_FLAGS[@]}" "${NOWINDOW_FLAG[@]}" \
+            "${CFG[@]}" "${DATE_FLAGS[@]}" "${CLOUD_FLAGS[@]}" \
             --emit json --out "${JSON_OUT}"
 
           echo "csv=${CSV_OUT}"     >> "$GITHUB_OUTPUT"
           echo "json=${JSON_OUT}"   >> "$GITHUB_OUTPUT"
           echo "stats=${STATS_OUT}" >> "$GITHUB_OUTPUT"
 
-      - name: Generate Markdown report (scaffolded per-feature)
-        id: gen
+      - name: Generate Markdown report
         shell: bash
         run: |
           set -euo pipefail
-          IN_CSV="${{ steps.fetch.outputs.csv }}"
+          IN_CSV="output/${TITLE}_master.csv"
           OUT_MD="output/${TITLE}.md"
 
           DATE_FLAGS=()
@@ -160,74 +144,41 @@ jobs:
           [ "${CLOUD_GCCH,,}" = "true" ] && CLOUD_FLAGS+=(--cloud "GCC High")
           [ "${CLOUD_DOD,,}" = "true" ] && CLOUD_FLAGS+=(--cloud "DoD")
 
-          NOWINDOW_FLAG=()
-          [ "${NO_WINDOW,,}" = "true" ] && NOWINDOW_FLAG=(--no-window)
+          FORCED_ARGS=()
+          # Only add --forced-ids if non-empty (avoids argparse errors if an older runner ever picked up)
+          [ -n "${PUBLIC_IDS}" ] && FORCED_ARGS+=(--forced-ids "${PUBLIC_IDS}")
 
           python scripts/generate_report.py \
             --title "${TITLE}" \
             --master "${IN_CSV}" \
             --out "${OUT_MD}" \
-            "${DATE_FLAGS[@]}" "${CLOUD_FLAGS[@]}" "${NOWINDOW_FLAG[@]}" \
-            --forced-ids "${PUBLIC_IDS}"
+            "${DATE_FLAGS[@]}" \
+            "${CLOUD_FLAGS[@]}" \
+            --products "${PRODUCTS}" \
+            "${FORCED_ARGS[@]}"
 
           echo "md=${OUT_MD}" >> "$GITHUB_OUTPUT"
 
-      - name: Convert Markdown → CSV/JSON
-        if: always()
-        shell: bash
+      - name: Parse MD to CSV/JSON
         run: |
-          set -euo pipefail
-          IN_MD="output/${TITLE}.md"
-          [ -f "${IN_MD}" ] || exit 0
-          OUT_CSV="output/${TITLE}.csv"
-          OUT_JSON="output/${TITLE}.json"
-
-          DATE_FLAGS=()
-          [ -n "${SINCE}" ] && DATE_FLAGS+=(--since "${SINCE}")
-          [ -n "${MONTHS}" ] && DATE_FLAGS+=(--months "${MONTHS}")
-
           python scripts/parse_roadmap_markdown.py \
-            --input "${IN_MD}" \
-            --csv   "${OUT_CSV}" \
-            --json  "${OUT_JSON}" \
-            "${DATE_FLAGS[@]}"
+            --input "output/${TITLE}.md" \
+            --csv   "output/${TITLE}.csv" \
+            --json  "output/${TITLE}.json"
 
-
-      - name: Markdown → HTML
-        shell: bash
+      - name: Render HTML
         run: |
-          set -euo pipefail
-          IN_MD="output/${TITLE}.md"
-          [ -f "${IN_MD}" ] || exit 0
           python scripts/md_to_html.py "output/${TITLE}.md" "output/${TITLE}.html"
-
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ inputs.TITLE }}
-          if-no-files-found: warn
+          name: ${{ inputs.title }}-bundle
           path: |
-            output/${{ inputs.TITLE }}.md
-            output/${{ inputs.TITLE }}.csv
-            output/${{ inputs.TITLE }}.json
-            output/${{ inputs.TITLE }}.html
-            output/${{ inputs.TITLE }}_master.csv
-            output/${{ inputs.TITLE }}_master.json
-            output/${{ inputs.TITLE }}_fetch_stats.json
-            output/*
-
-      - name: Write fetch stats to job summary
-        if: always()
-        env:
-          STATS: ${{ steps.fetch.outputs.stats }}
-        run: |
-          set -euo pipefail
-          {
-            echo "## Fetch Stats"
-            if [[ -n "${STATS:-}" && -f "$STATS" ]]; then
-              python scripts/write_fetch_stats_summary.py "$STATS"
-            else
-              echo "_No stats file produced._"
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
+            output/${{ inputs.title }}.md
+            output/${{ inputs.title }}.csv
+            output/${{ inputs.title }}.json
+            output/${{ inputs.title }}.html
+            output/${{ inputs.title }}_master.csv
+            output/${{ inputs.title }}_master.json
+            output/${{ inputs.title }}_fetch_stats.json
