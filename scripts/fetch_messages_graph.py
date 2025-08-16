@@ -57,18 +57,11 @@ _CLOUD_MAP = {
     "dod": "DoD",
 }
 
+
 def _load_msal_client_credential_from_pfx_b64(pfx_b64: str, pfx_password: str | None) -> dict[str, str]:
-    """
-    Convert a base64-encoded PFX + password into the MSAL client_credential dict:
-      {
-        "private_key": "<PEM string>",
-        "thumbprint": "<sha1 hex>",
-        "public_certificate": "<PEM string>"
-      }
-    """
+    """Convert base64 PFX + password into MSAL client_credential dict."""
     if not pfx_b64:
         raise ValueError("No PFX_B64 provided")
-
     try:
         pfx_bytes = base64.b64decode(pfx_b64)
     except Exception as e:
@@ -81,13 +74,12 @@ def _load_msal_client_credential_from_pfx_b64(pfx_b64: str, pfx_password: str | 
         if key is None or cert is None:
             raise RuntimeError("PFX contained no private key or certificate")
 
-        thumb_hex = cert.fingerprint(hashes.SHA1()).hex()  # MSAL wants hex string
+        thumb_hex = cert.fingerprint(hashes.SHA1()).hex()
         private_pem = key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()).decode("ascii")
         public_pem = cert.public_bytes(Encoding.PEM).decode("ascii")
         return {"private_key": private_pem, "thumbprint": thumb_hex, "public_certificate": public_pem}
     except Exception as e:
         raise RuntimeError(f"PFX load failed: {e}") from e
-
 
 
 
@@ -223,7 +215,58 @@ def include_by_cloud(cloud_field: str, selected: set[str]) -> bool:
 # ---------- Data sources ----------
 
 
+
 def _try_fetch_graph(cfg: dict, clouds: set[str], since: str | None, months: str | None) -> tuple[list[Row], str | None]:
+    """
+    Attempt Graph fetch using certificate creds from cfg.
+    On any error, return ([], <error message>).
+    """
+    try:
+        tenant = cfg.get("TENANT") or cfg.get("tenant_id") or cfg.get("tenant")
+        client_id = cfg.get("CLIENT") or cfg.get("client_id") or cfg.get("client")
+        pfx_b64 = cfg.get("PFX_B64") or cfg.get("pfx_base64") or os.environ.get("M365_PFX_BASE64")
+
+        # The workflow often writes a literal env var key into cfg (e.g. "M365_PFX_PASSWORD")
+        pwd_env_key = cfg.get("M365_PFX_PASSWORD") or "M365_PFX_PASSWORD"
+        pfx_password = os.environ.get(pwd_env_key)
+
+        if not tenant or not client_id or not pfx_b64:
+            return [], "Graph client not available on this runner"
+
+        client_cred = _load_msal_client_credential_from_pfx_b64(pfx_b64, pfx_password)
+
+        authority_base = cfg.get("authority") or cfg.get("authority_base") or "https://login.microsoftonline.com"
+        authority = f"{authority_base.rstrip('/')}/{tenant}"
+        graph_base = (cfg.get("graph_base") or "https://graph.microsoft.com").rstrip("/")
+
+        app = msal.ConfidentialClientApplication(
+            client_id=client_id,
+            authority=authority,
+            client_credential=client_cred,
+        )
+
+        token = app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
+        if "access_token" not in token:
+            short = token.get("error_description") or token.get("error") or "token acquisition failed"
+            return [], f"PFX/token error: {short}"
+
+        headers = {"Authorization": f"Bearer {token['access_token']}"}
+
+        # Message center messages; adjust if you have a different endpoint.
+        url = f"{graph_base}/v1.0/admin/serviceAnnouncement/messages?$top=200"
+        resp = requests.get(url, headers=headers, timeout=30)
+        if resp.status_code != 200:
+            return [], f"Graph HTTP {resp.status_code}: {resp.text}"
+
+        payload = resp.json()
+        items = payload.get("value", [])
+        rows = transform_graph_messages(items, clouds=clouds, since=since, months=months)
+        return rows, None
+
+    except Exception as e:
+        return [], f"graph-fetch failed: {e}"
+
+
     """
     Attempt Graph fetch using certificate creds. On any error, return ([], <error>).
     """
@@ -359,16 +402,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         pfx_pass = os.environ.get(cfg.get("PFX_PASS_ENV", "M365_PFX_PASSWORD"), "")
         graph_base = cfg.get("GRAPH_BASE", "https://graph.microsoft.com")
 
-        g_rows, graph_err = _try_fetch_graph(
-            tenant=tenant,
-            client_id=client,
-            pfx_b64=pfx_b64,
-            pfx_pass=pfx_pass or "",
-            start_date=since_str or None,
-            months=months,
-            clouds=selected_clouds,
-            graph_base=graph_base or "https://graph.microsoft.com",
-        )
+        g_rows, graph_err = _try_fetch_graph(cfg, selected, args.since, args.months)
+
         if graph_err:
             print(f"WARN: graph-fetch failed: {graph_err}", file=sys.stderr)
             stats["errors"] = stats.get("errors", 0) + 1
