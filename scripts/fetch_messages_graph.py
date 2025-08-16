@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-from __future__ import annotations
-
 import argparse
 import base64
 import csv
@@ -187,7 +185,7 @@ def _extract_roadmap_ids(*texts: str) -> set[str]:
                 ids.add(m.group(1))
     return ids
 
-def _graph_token_from_pfx(cfg: dict[str, Any]) -> tuple[str, str] | tuple[None, str]:
+def _graph_token_from_pfx(cfg: dict[str, Any]) -> tuple[Optional[str], str]:
     if msal is None or pkcs12 is None or Encoding is None or hashes is None:
         return (None, "Graph client not available on this runner (missing msal/cryptography).")
     tenant = (cfg.get("TENANT") or cfg.get("tenant") or "").strip()
@@ -237,7 +235,7 @@ def _fetch_graph_messages(cfg: dict[str, Any], selected_clouds: set[str], debug:
     try:
         resp = requests.get(url, headers=headers, timeout=30)
         if resp.status_code == 403:
-            print(f"WARN: Graph call forbidden (403). Check that your app has ServiceMessage.Read.All (app) with admin consent.")
+            print("WARN: Graph call forbidden (403). Ensure app permission 'ServiceMessage.Read.All' (application) has admin consent.")
             return []
         resp.raise_for_status()
         payload = resp.json()
