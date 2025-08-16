@@ -4,6 +4,7 @@
 # 2) Build master (fetch)
 $env:PFX_PASSWORD_ENV="M365_PFX_PASSWORD"
 $env:M365_PFX_PASSWORD="M365_PFX_PASSWORD"
+
 python scripts/fetch_messages_graph.py --emit csv --out output/roadmap_report_master.csv
 
 # 3) Generate final tailored report (no AI)

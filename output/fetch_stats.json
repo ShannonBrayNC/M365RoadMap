@@ -1,13 +1,10 @@
 {
-  "rows": 148,
   "sources": {
-    "graph-raw": 100,
-    "graph": 250
+    "graph": 0,
+    "public-json": 0,
+    "rss": 0,
+    "seed": 468
   },
-  "errors": [],
-  "selected_clouds": [
-    "General"
-  ],
-  "window_since": "",
-  "pre_dedupe": 250
+  "errors": 0,
+  "final": 468
 }
