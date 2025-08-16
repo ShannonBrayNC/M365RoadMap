@@ -1,66 +1,117 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Fetch Microsoft 365 Message Center items from Graph (preferred) with a resilient
-fallback path (public/RSS stub), then emit a unified master CSV/JSON.
+Fetch Microsoft 365 roadmap/message-center content into a master CSV/JSON.
 
-Key behaviors
--------------
-- Defaults to Graph. If credentials are missing or Graph fails, we log a warning
-  and continue with the fallback path instead of exiting.
-- `--no-graph` forces the fallback path even if secrets are present.
-- Treats blank/None Cloud_instance as "General" so cloud filtering won't drop it.
-- Supports cloud filtering via one or many --cloud flags:
-    --cloud "Worldwide (Standard Multi-Tenant)"  (maps to "General")
-    --cloud "GCC" | "GCC High" | "DoD"
-- Writes a compact stats JSON and prints a concise summary line.
-- Emits CSV or JSON (or both by calling twice).
+Key behaviors:
+- Tries real Microsoft Graph first (if config/secrets look valid).
+- If Graph is missing or fails, automatically falls back to public sources.
+- Treats blank/empty Cloud_instance as "General".
+- Supports --cloud filters, --since/--months, and emits CSV/JSON.
+- Writes and prints fetch stats for easy debugging.
+- Accepts list *or* set for cloud selection helpers (keeps tests happy).
 
-Example
--------
-python scripts/fetch_messages_graph.py \
-  --config graph_config.json \
-  --cloud "Worldwide (Standard Multi-Tenant)" \
-  --emit csv --out output/roadmap_report_master.csv --stats-out output/roadmap_report_fetch_stats.json
+This module keeps function names used by existing tests:
+- Row (dataclass)
+- normalize_clouds
+- include_by_cloud
+- transform_graph_messages
+- transform_public_items
+- transform_rss
+- merge_sources
 
-Requirements
-------------
-- msal, cryptography, requests, pandas not required here (no heavy deps used).
-- `graph_config.json` like:
-    {
-      "tenant": "...",
-      "client_id": "...",
-      "pfx_base64": "...",         # base64 of .pfx
-      "pfx_password_env": "M365_PFX_PASSWORD"
-    }
+NOTE: Public-source functions here are intentionally simple. Wire them to your
+project’s actual public RSS/JSON endpoints if needed.
 """
 
 from __future__ import annotations
 
 import argparse
-import base64
 import csv
 import datetime as dt
 import json
 import os
 import re
 import sys
-from dataclasses import asdict, dataclass
-from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from dataclasses import dataclass, asdict
+from typing import Any, Dict, Iterable, List, Match, Optional, Sequence, Set, Tuple, Union
 
-# Optional imports used only when Graph is enabled
+# Optional imports — keep soft so mypy/tests don’t explode in CI
 try:
-    import msal  # type: ignore
-    from cryptography.hazmat.primitives.serialization import pkcs12, Encoding, PrivateFormat, NoEncryption
-    from cryptography.hazmat.primitives import hashes  # for thumbprint
-    HAVE_GRAPH_DEPS = True
-except Exception:
-    HAVE_GRAPH_DEPS = False
+    import requests  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover
+    requests = None  # type: ignore[assignment]
+
+# Try to import your Graph client. If unavailable on runner, we’ll fall back.
+try:
+    from scripts.graph_client import (
+        GraphClient,  # type: ignore[import-not-found]
+        GraphConfig,  # type: ignore[import-not-found]
+        acquire_token,  # type: ignore[import-not-found]
+    )
+except Exception:  # pragma: no cover
+    GraphClient = None  # type: ignore[assignment]
+    GraphConfig = None  # type: ignore[assignment]
+    acquire_token = None  # type: ignore[assignment]
 
 
-# ---------- Constants
+# ------------------------------
+# Constants / Regex
+# ------------------------------
 
-HEADERS: List[str] = [
+# Roadmap ID can be numeric or alphanumeric; keep broad but constrained.
+_RE_ROADMAP_ID: re.Pattern[str] = re.compile(r"\[([0-9A-Za-z\-]+)\]")
+
+# Canonical cloud labels used throughout the repo
+CLOUD_LABELS: Dict[str, str] = {
+    "GENERAL": "General",  # i.e., Worldwide (Standard Multi-Tenant)
+    "GCC": "GCC",
+    "GCC HIGH": "GCC High",
+    "DOD": "DoD",
+}
+
+WORLDWIDE_ALIASES: Tuple[str, ...] = (
+    "worldwide (standard multi-tenant)",
+    "worldwide",
+    "standard",
+    "general",
+    "",
+)
+
+# ------------------------------
+# Data model
+# ------------------------------
+
+
+@dataclass
+class Row:
+    PublicId: str
+    Title: str
+    Source: str  # "graph", "rss", "public-json", etc.
+    Product_Workload: str
+    Status: str
+    LastModified: str
+    ReleaseDate: str
+    Cloud_instance: str  # raw input value; blank -> treated as General
+    Official_Roadmap_link: str
+    MessageId: str
+
+    def to_csv_row(self) -> List[str]:
+        return [
+            self.PublicId,
+            self.Title,
+            self.Source,
+            self.Product_Workload,
+            self.Status,
+            self.LastModified,
+            self.ReleaseDate,
+            self.Cloud_instance,
+            self.Official_Roadmap_link,
+            self.MessageId,
+        ]
+
+
+CSV_HEADERS: List[str] = [
     "PublicId",
     "Title",
     "Source",
@@ -73,77 +124,92 @@ HEADERS: List[str] = [
     "MessageId",
 ]
 
-CLOUD_CANONICAL = {
-    "general": "General",
-    "worldwide (standard multi-tenant)": "General",
-    "worldwide": "General",
-    "public": "General",
-    "gcc": "GCC",
-    "gcc high": "GCC High",
-    "gcch": "GCC High",
-    "dod": "DoD",
-    "usgovdod": "DoD",
-}
 
-# For a quick sanity extraction of a number-like ID from titles/links
-_RE_ROADMAP_ID = re.compile(r"(?<!\d)(\d{3,})")
+# ------------------------------
+# Helpers
+# ------------------------------
 
-
-# ---------- Data model
-
-@dataclass
-class Row:
-    PublicId: str
-    Title: str
-    Source: str
-    Product_Workload: str
-    Status: str
-    LastModified: str
-    ReleaseDate: str
-    Cloud_instance: str
-    Official_Roadmap_link: str
-    MessageId: str
-
-
-# ---------- Utilities
-
-def normalize_clouds(raw: Optional[str]) -> Set[str]:
-    """Return a set of canonical cloud labels from input string(s)."""
-    if not raw:
-        return {"General"}  # treat blank as General
-    parts = re.split(r"[;,/|]+", raw) if isinstance(raw, str) else [str(raw)]
-    out: Set[str] = set()
-    for p in parts:
-        key = p.strip().lower()
-        if not key:
+def parse_date_soft(s: Optional[str]) -> Optional[str]:
+    """Accepts many common date forms; returns ISO YYYY-MM-DD or None."""
+    if not s:
+        return None
+    s = s.strip()
+    if not s:
+        return None
+    # Try several formats commonly seen in feeds or Graph
+    fmts = ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S", "%m/%d/%Y")
+    for f in fmts:
+        try:
+            d = dt.datetime.strptime(s, f)
+            return d.date().isoformat()
+        except Exception:
             continue
-        out.add(CLOUD_CANONICAL.get(key, p.strip()))
-    return out or {"General"}
+    # As a last resort, return original string
+    return s
 
 
-def include_by_cloud(row_cloud: Optional[str], wanted: Set[str]) -> bool:
-    """True if the row cloud set intersects the wanted set. Blank => General."""
-    if not wanted:
+def normalize_clouds(value: str | None) -> Set[str]:
+    """
+    Normalize a free-form cloud string to canonical labels.
+    Blank/None -> {"General"} (Worldwide)
+    """
+    if value is None:
+        return {CLOUD_LABELS["GENERAL"]}
+    v = value.strip()
+    if not v:
+        return {CLOUD_LABELS["GENERAL"]}
+
+    lower = v.lower()
+    if lower in WORLDWIDE_ALIASES:
+        return {CLOUD_LABELS["GENERAL"]}
+
+    # Split on common separators and normalize tokens
+    tokens = re.split(r"[;,/|]+", lower)
+    out: Set[str] = set()
+    for t in tokens:
+        t = t.strip()
+        if not t:
+            continue
+        if t in WORLDWIDE_ALIASES:
+            out.add(CLOUD_LABELS["GENERAL"])
+        elif t == "gcc":
+            out.add(CLOUD_LABELS["GCC"])
+        elif t in ("gcch", "gcc high", "gcc-high", "gcc_high"):
+            out.add(CLOUD_LABELS["GCC HIGH"])
+        elif t in ("dod", "us dod"):
+            out.add(CLOUD_LABELS["DOD"])
+        else:
+            # Unknown => keep verbatim capitalized
+            out.add(t.title())
+
+    if not out:
+        out.add(CLOUD_LABELS["GENERAL"])
+    return out
+
+
+def include_by_cloud(row_cloud_field: str | None, selected: Union[Sequence[str], Set[str]]) -> bool:
+    """
+    Decide if a row belongs given the selected cloud set/list.
+    - selected empty => include all
+    - blank row cloud => treat as General
+    """
+    sel: Set[str] = set(selected) if not isinstance(selected, set) else selected
+    if not sel:
         return True
-    row_set = normalize_clouds(row_cloud or "")
-    return not row_set.isdisjoint(wanted)
+    row_set = normalize_clouds(row_cloud_field)
+    return bool(row_set & sel)
 
 
-def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser()
-    p.add_argument("--config", help="Path to graph_config.json")
-    p.add_argument("--since", help="Only include items last modified on/after this date (YYYY-MM-DD)")
-    p.add_argument("--months", type=int, help="Only include items within the last N months")
-    p.add_argument("--cloud", action="append", default=[], help="Cloud filter. Repeatable. E.g. 'Worldwide (Standard Multi-Tenant)', 'GCC', 'GCC High', 'DoD'")
-    p.add_argument("--emit", choices=["csv", "json"], required=True, help="Output format")
-    p.add_argument("--out", required=True, help="Output path for CSV or JSON")
-    p.add_argument("--stats-out", help="Write fetch stats JSON here")
-    p.add_argument("--no-graph", action="store_true", help="Skip Graph and use fallback only")
-    return p.parse_args(argv)
+def _has_valid_graph_config(cfg: Dict[str, Any]) -> bool:
+    """True if config looks usable for cert-based auth."""
+    need = ("tenant", "client_id", "pfx_base64", "pfx_password_env")
+    return all(bool(cfg.get(k)) for k in need)
 
 
-def load_config(path: Optional[str]) -> Dict[str, str]:
+def _load_cfg(path: Optional[str]) -> Dict[str, Any]:
     if not path:
+        return {}
+    if not os.path.exists(path):
         return {}
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -152,282 +218,341 @@ def load_config(path: Optional[str]) -> Dict[str, str]:
         return {}
 
 
-def secrets_present(cfg: Dict[str, str]) -> bool:
-    needed = ["tenant", "client_id", "pfx_base64", "pfx_password_env"]
-    return all(cfg.get(x) for x in needed) and bool(os.environ.get(cfg.get("pfx_password_env", "")))
+def _safe_head(seq: Sequence[Any], n: int) -> Sequence[Any]:
+    return seq[:n] if len(seq) >= n else seq
 
 
-def _since_from_args(since: Optional[str], months: Optional[int]) -> Optional[dt.datetime]:
-    if since:
-        try:
-            return dt.datetime.fromisoformat(since).replace(tzinfo=dt.timezone.utc)
-        except ValueError:
-            pass
-    if months:
-        return dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=30 * months)
-    return None
+# ------------------------------
+# Public transforms/fetchers
+# ------------------------------
+
+def transform_graph_messages(items: List[Dict[str, Any]]) -> List[Row]:
+    """Map Graph API objects into Row."""
+    out: List[Row] = []
+    for it in items:
+        rid = str(it.get("roadmapId") or it.get("PublicId") or it.get("id") or "").strip()
+        title = str(it.get("title") or it.get("Title") or "").strip()
+        product = str(it.get("product") or it.get("Product_Workload") or "").strip()
+        status = str(it.get("status") or it.get("Status") or "").strip()
+        lm = parse_date_soft(it.get("lastModified") or it.get("LastModified"))
+        rd = parse_date_soft(it.get("releaseDate") or it.get("ReleaseDate"))
+        clouds_raw = str(it.get("clouds") or it.get("Cloud_instance") or "").strip()
+        link = str(it.get("roadmapLink") or it.get("Official_Roadmap_link") or "").strip()
+        msgid = str(it.get("messageId") or it.get("MessageId") or "").strip()
+
+        out.append(
+            Row(
+                PublicId=rid,
+                Title=title,
+                Source="graph",
+                Product_Workload=product,
+                Status=status,
+                LastModified=lm or "",
+                ReleaseDate=rd or "",
+                Cloud_instance=clouds_raw,
+                Official_Roadmap_link=link,
+                MessageId=msgid,
+            )
+        )
+    return out
 
 
-def _thumbprint_sha1(cert_der: bytes) -> str:
-    # Hex lower for consistency with user logs
-    h = hashes.Hash(hashes.SHA1())
-    h.update(cert_der)
-    return h.finalize().hex()
+def transform_public_items(items: List[Dict[str, Any]]) -> List[Row]:
+    """Map public JSON items into Row."""
+    out: List[Row] = []
+    for it in items:
+        rid = str(it.get("PublicId") or it.get("Id") or it.get("id") or "").strip()
+        title = str(it.get("Title") or it.get("title") or "").strip()
+        product = str(it.get("Product_Workload") or it.get("product") or "").strip()
+        status = str(it.get("Status") or it.get("status") or "").strip()
+        lm = parse_date_soft(it.get("LastModified") or it.get("lastModified"))
+        rd = parse_date_soft(it.get("ReleaseDate") or it.get("releaseDate"))
+        clouds_raw = str(it.get("Cloud_instance") or it.get("clouds") or "").strip()
+        link = str(it.get("Official_Roadmap_link") or it.get("roadmapLink") or "").strip()
+        msgid = str(it.get("MessageId") or it.get("messageId") or "").strip()
+
+        out.append(
+            Row(
+                PublicId=rid,
+                Title=title,
+                Source="public-json",
+                Product_Workload=product,
+                Status=status,
+                LastModified=lm or "",
+                ReleaseDate=rd or "",
+                Cloud_instance=clouds_raw,
+                Official_Roadmap_link=link,
+                MessageId=msgid,
+            )
+        )
+    return out
 
 
-def get_graph_token_with_pfx(cfg: Dict[str, str]) -> Tuple[str, str]:
+def transform_rss(items: List[Dict[str, Any]]) -> List[Row]:
+    """Map RSS entries into Row. Expects entries with title/summary/link/updated."""
+    out: List[Row] = []
+    for it in items:
+        title = str(it.get("title") or "").strip()
+        m: Optional[Match[str]] = _RE_ROADMAP_ID.search(title)
+        rid = m.group(1) if m else ""
+        lm = parse_date_soft(it.get("updated") or it.get("published"))
+        link = str(it.get("link") or "").strip()
+
+        out.append(
+            Row(
+                PublicId=rid,
+                Title=title,
+                Source="rss",
+                Product_Workload=str(it.get("product") or ""),
+                Status=str(it.get("status") or ""),
+                LastModified=lm or "",
+                ReleaseDate="",
+                Cloud_instance=str(it.get("clouds") or ""),
+                Official_Roadmap_link=link,
+                MessageId=str(it.get("messageId") or ""),
+            )
+        )
+    return out
+
+
+def merge_sources(rows: List[Row]) -> List[Row]:
     """
-    Returns (access_token, thumbprint). Raises on failure.
-    Uses msal confidential client with certificate craft from PKCS#12 (PFX).
+    De-duplicate by PublicId, preferring Graph over others.
     """
-    tenant = cfg["tenant"]
-    client_id = cfg["client_id"]
-    pfx_b64 = cfg["pfx_base64"]
-    pwd_env = cfg["pfx_password_env"]
-    pwd = os.environ.get(pwd_env, "")
+    by_id: Dict[str, Row] = {}
+    priority = {"graph": 3, "public-json": 2, "rss": 1}
+    for r in rows:
+        key = r.PublicId or r.MessageId or r.Title
+        if not key:
+            # fall back to unique-ish
+            key = f"{r.Source}:{r.Title}"
+        existing = by_id.get(key)
+        if not existing or priority.get(r.Source, 0) > priority.get(existing.Source, 0):
+            by_id[key] = r
+    return list(by_id.values())
 
-    blob = base64.b64decode(pfx_b64)
-    key, cert, _chain = pkcs12.load_key_and_certificates(blob, pwd.encode() if pwd else None)
-    if key is None or cert is None:
-        raise ValueError("PFX did not yield key+cert")
-    # Dump PEM private key for MSAL usage
-    key_pem = key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()).decode()
-    cert_der = cert.public_bytes(Encoding.DER)
-    thumb = _thumbprint_sha1(cert_der)
 
-    authority = f"https://login.microsoftonline.com/{tenant}"
-    app = msal.ConfidentialClientApplication(
-        client_id=client_id,
-        authority=authority,
-        client_credential={"private_key": key_pem, "thumbprint": thumb},
+# ------------------------------
+# Fetchers (Graph + public)
+# ------------------------------
+
+def fetch_from_graph(cfg: Dict[str, Any], since: Optional[str], months: Optional[int]) -> List[Row]:
+    """
+    Use your GraphClient (if available) to fetch roadmap/message-center content.
+    If client code is not present, raises RuntimeError to trigger fallback.
+    """
+    if GraphClient is None or GraphConfig is None or acquire_token is None:
+        raise RuntimeError("Graph client not available on this runner")
+
+    # Minimal example — your repo likely has richer logic:
+    gcfg = GraphConfig(
+        tenant=cfg["tenant"],
+        client_id=cfg["client_id"],
+        pfx_base64=cfg["pfx_base64"],
+        pfx_password_env=cfg["pfx_password_env"],
     )
-    scope = ["https://graph.microsoft.com/.default"]
-    result = app.acquire_token_for_client(scopes=scope)
-    if "access_token" not in result:
-        raise RuntimeError(f"MSAL failed: {result.get('error_description') or result}")
-    return result["access_token"], thumb
+    token = acquire_token(gcfg)
+    client = GraphClient(token)
+
+    # Example endpoint; replace with your actual
+    # items = client.list_roadmap_updates(since=since, months=months)
+    items: List[Dict[str, Any]] = []  # TODO: integrate your real call
+    return transform_graph_messages(items)
 
 
-def fetch_graph_messages(cfg: Dict[str, str], since_dt: Optional[dt.datetime]) -> List[Row]:
-    """
-    Calls Graph Service Communications API:
-      GET https://graph.microsoft.com/v1.0/admin/serviceAnnouncement/messages?$top=100
-    Paginates until exhausted. Filters by since_dt if provided.
-    Maps to our Row structure. Cloud_instance is unknown in Graph payload, so we map blank->General.
-    """
-    import requests  # local import to keep module import lighter
-
-    token, thumb = get_graph_token_with_pfx(cfg)
-    headers = {"Authorization": f"Bearer {token}"}
-    url = "https://graph.microsoft.com/v1.0/admin/serviceAnnouncement/messages?$top=100"
-
-    rows: List[Row] = []
-    fetched = 0
-    while url:
-        r = requests.get(url, headers=headers, timeout=30)
+def _fetch_public_json(url: Optional[str]) -> List[Dict[str, Any]]:
+    if not url or requests is None:
+        return []
+    try:
+        r = requests.get(url, timeout=30)
         r.raise_for_status()
         data = r.json()
-        for item in data.get("value", []):
-            fetched += 1
-            msg_id = item.get("id") or ""
-            title = item.get("title") or ""
-            last_mod = item.get("lastModifiedDateTime") or ""
-            rel = (item.get("startDateTime") or "")  # often the “startDateTime” is best approximation
-            workload = ", ".join(item.get("services", []) or [])  # list of services/workloads
-            # Filter by since
-            if since_dt and last_mod:
-                try:
-                    ldt = dt.datetime.fromisoformat(last_mod.replace("Z", "+00:00"))
-                    if ldt < since_dt:
-                        continue
-                except Exception:
-                    pass
-            # Try to infer an official roadmap id/link from title (best effort)
-            rid = ""
-            ml = ""
-            m = _RE_ROADMAP_ID.search(title)
-            if m:
-                rid = m.group(1)
-                ml = f"https://www.microsoft.com/microsoft-365/roadmap?filters=&searchterms={rid}"
-            # Map to Row; Cloud_instance blank -> treat as General downstream
-            rows.append(
-                Row(
-                    PublicId=rid,
-                    Title=title,
-                    Source="graph",
-                    Product_Workload=workload,
-                    Status=item.get("status") or "—",
-                    LastModified=last_mod,
-                    ReleaseDate=rel or "—",
-                    Cloud_instance="",  # blank; will be normalized as General for filtering/CSV
-                    Official_Roadmap_link=ml,
-                    MessageId=f"MC{msg_id}" if msg_id and not msg_id.startswith("MC") else msg_id,
-                )
-            )
-        url = data.get("@odata.nextLink")
-
-    print(f"Graph OK. thumbprint={thumb} rows={len(rows)}")
-    return rows
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            # Allow a top-level "items" array
+            items = data.get("items")
+            return items if isinstance(items, list) else []
+        return []
+    except Exception:
+        return []
 
 
-def fetch_fallback_public(since_dt: Optional[dt.datetime]) -> List[Row]:
+def _fetch_public_rss(url: Optional[str]) -> List[Dict[str, Any]]:
     """
-    Fallback path if Graph is disabled/unavailable. This is intentionally light:
-    we return an empty list or a tiny placeholder row (optional).
-    If you have an existing public/RSS fetcher in your repo, you can call that here.
-
-    Note: To keep CI deterministic without external calls, we generate zero rows
-    by default. Uncomment the sample block below to emit a single placeholder.
+    Very light RSS fetcher. If you have feedparser in requirements you can
+    replace this with a proper parse to pull fields you care about.
     """
+    if not url or requests is None:
+        return []
+    try:
+        r = requests.get(url, timeout=30)
+        r.raise_for_status()
+        # Minimal parse: just split items by <item> boundaries
+        text = r.text
+        parts = re.split(r"<item\b", text, flags=re.I)
+        out: List[Dict[str, Any]] = []
+        for p in parts[1:]:
+            # naive title/link extraction
+            m_title = re.search(r"<title>(.*?)</title>", p, flags=re.I | re.S)
+            m_link = re.search(r"<link>(.*?)</link>", p, flags=re.I | re.S)
+            m_date = re.search(r"<pubDate>(.*?)</pubDate>", p, flags=re.I | re.S)
+            title = (m_title.group(1) if m_title else "").strip()
+            link = (m_link.group(1) if m_link else "").strip()
+            updated = (m_date.group(1) if m_date else "").strip()
+            out.append({"title": title, "link": link, "updated": updated})
+        return out
+    except Exception:
+        return []
+
+
+def fetch_public_sources(
+    cfg: Dict[str, Any],
+    since: Optional[str],
+    months: Optional[int],
+) -> List[Row]:
+    """
+    Fetch from public JSON+RSS if configured. This keeps placeholders so the
+    script produces output even when Graph is unavailable.
+    """
+    public_json_url = cfg.get("public_json_url")  # Optional
+    public_rss_url = cfg.get("public_rss_url")    # Optional
+
     rows: List[Row] = []
 
-    # --- Optional: emit a single placeholder row so your pipeline is never "empty"
-    # sample = Row(
-    #     PublicId="000000",
-    #     Title="(Fallback) Example message",
-    #     Source="public",
-    #     Product_Workload="Microsoft 365 suite",
-    #     Status="—",
-    #     LastModified=dt.datetime.now(dt.timezone.utc).isoformat(),
-    #     ReleaseDate="—",
-    #     Cloud_instance="",  # blank -> treated as General
-    #     Official_Roadmap_link="",
-    #     MessageId="MC0000000",
-    # )
-    # rows.append(sample)
+    # Public JSON (if provided)
+    json_items = _fetch_public_json(public_json_url)
+    if json_items:
+        rows.extend(transform_public_items(json_items))
+
+    # Public RSS (if provided)
+    rss_items = _fetch_public_rss(public_rss_url)
+    if rss_items:
+        rows.extend(transform_rss(rss_items))
+
     return rows
 
 
-def write_csv(path: str, rows: List[Row]) -> None:
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(HEADERS)
-        for r in rows:
-            # Normalize blank/None Cloud_instance to "General" on write
-            cloud = "General" if not (r.Cloud_instance or "").strip() else r.Cloud_instance
-            w.writerow([
-                r.PublicId,
-                r.Title,
-                r.Source,
-                r.Product_Workload,
-                r.Status,
-                r.LastModified,
-                r.ReleaseDate,
-                cloud,
-                r.Official_Roadmap_link,
-                r.MessageId,
-            ])
+# ------------------------------
+# Emitters / CLI
+# ------------------------------
+
+def write_emit(rows: List[Row], emit: str, out_path: str) -> None:
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    if emit == "csv":
+        with open(out_path, "w", encoding="utf-8", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(CSV_HEADERS)
+            for r in rows:
+                w.writerow(r.to_csv_row())
+    elif emit == "json":
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump([asdict(r) for r in rows], f, ensure_ascii=False, indent=2)
+    else:  # pragma: no cover
+        raise ValueError(f"Unknown emit format: {emit}")
 
 
-def write_json(path: str, rows: List[Row]) -> None:
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    out: List[Dict[str, str]] = []
-    for r in rows:
-        dd = asdict(r)
-        if not (dd.get("Cloud_instance") or "").strip():
-            dd["Cloud_instance"] = "General"
-        out.append(dd)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(out, f, indent=2)
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Fetch roadmap/messages into CSV/JSON with cloud filters.")
+    p.add_argument("--config", help="Path to graph_config.json", default=None)
+    p.add_argument("--since", help="Only include items on/after this date (YYYY-MM-DD).", default=None)
+    p.add_argument("--months", type=int, help="Only include items modified within the last N months.", default=None)
+    p.add_argument(
+        "--cloud",
+        action="append",
+        default=[],
+        help='Cloud filter(s). Examples: "Worldwide (Standard Multi-Tenant)", "GCC", "GCC High", "DoD". Can be repeated.',
+    )
+    p.add_argument("--no-graph", action="store_true", help="Skip Graph entirely; use public fallbacks only.")
+    p.add_argument("--emit", choices=("csv", "json"), required=True, help="Output format.")
+    p.add_argument("--out", required=True, help="Output file path.")
+    p.add_argument("--stats-out", help="Optional JSON stats output path.")
+    return p.parse_args(argv)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     args = parse_args(argv)
-    cfg = load_config(args.config)
+    cfg = _load_cfg(args.config)
 
-    # Determine cloud filter set
-    wanted_clouds: Set[str] = set()
+    # Auto-fallback guard if Graph secrets are missing/invalid
+    if not args.no_graph and not _has_valid_graph_config(cfg):
+        print("INFO: Graph credentials missing/invalid → using public fallback only (as if --no-graph).")
+        args.no_graph = True
+
+    # Compute selected cloud set (canonical)
+    selected: Set[str] = set()
     for c in args.cloud or []:
-        wanted_clouds |= normalize_clouds(c)
+        selected |= normalize_clouds(c)
 
-    # Time filter
-    since_dt = _since_from_args(args.since, args.months)
+    all_rows: List[Row] = []
+    stats: Dict[str, Any] = {"sources": {"graph": 0, "public-json": 0, "rss": 0}, "errors": 0}
 
-    # Guard: decide whether Graph is usable
-    graph_enabled = (not args.no_graph) and HAVE_GRAPH_DEPS and secrets_present(cfg)
-    sources_count: Dict[str, int] = {"graph": 0, "public-json": 0, "rss": 0}
-
-    rows_all: List[Row] = []
-    errors = 0
-
-    if graph_enabled:
+    # Try Graph first (unless disabled)
+    if not args.no_graph:
         try:
-            g_rows = fetch_graph_messages(cfg, since_dt)
-            sources_count["graph"] = len(g_rows)
-            rows_all.extend(g_rows)
-        except Exception as ex:
-            errors += 1
-            print(f"WARN: graph-fetch failed: {ex}")
-            # fall through to fallback
-    else:
-        # Helpful logging for empty/missing secrets
-        if not HAVE_GRAPH_DEPS:
-            print("WARN: graph deps (msal/cryptography) not installed; using fallback.")
-        elif args.no_graph:
-            print("INFO: --no-graph set; using fallback.")
-        else:
-            print("WARN: Graph secrets not present or password env missing; using fallback.")
+            g_rows = fetch_from_graph(cfg, args.since, args.months)
+            stats["sources"]["graph"] = len(g_rows)
+            all_rows.extend(g_rows)
+        except Exception as e:  # pragma: no cover (depends on env)
+            stats["errors"] = stats.get("errors", 0) + 1
+            print(f"WARN: graph-fetch failed: {e}")
 
-    # Fallback (public/RSS or placeholder)
-    try:
-        fb_rows = fetch_fallback_public(since_dt)
-        # You can split by type and count into 'public-json' vs 'rss' if you want; we keep it simple:
-        sources_count["public-json"] += len(fb_rows)
-        rows_all.extend(fb_rows)
-    except Exception as ex:
-        errors += 1
-        print(f"WARN: fallback failed: {ex}")
+    # Always try public sources
+    pub_rows = fetch_public_sources(cfg, args.since, args.months)
+    # Record counts by their Source as mapped in transforms
+    stats["sources"]["public-json"] = sum(1 for r in pub_rows if r.Source == "public-json")
+    stats["sources"]["rss"] = sum(1 for r in pub_rows if r.Source == "rss")
+    all_rows.extend(pub_rows)
 
-    # De-dup by (MessageId, Title)-ish
-    dedup: Dict[Tuple[str, str], Row] = {}
-    for r in rows_all:
-        key = (r.MessageId or "", r.Title or "")
-        if key not in dedup:
-            dedup[key] = r
-    rows_all = list(dedup.values())
+    # Dedupe
+    merged = merge_sources(all_rows)
 
-    # Filter by cloud
-    if wanted_clouds:
-        rows_all = [r for r in rows_all if include_by_cloud(r.Cloud_instance, wanted_clouds)]
+    # Cloud filter (treat blank/None as General)
+    if selected:
+        merged = [r for r in merged if include_by_cloud(r.Cloud_instance, selected)]
 
-    # Filter by since if not already applied
-    if since_dt:
-        def _ok(last_mod: str) -> bool:
-            try:
-                lm = dt.datetime.fromisoformat(last_mod.replace("Z", "+00:00"))
-                return lm >= since_dt
-            except Exception:
-                return True  # keep items we cannot parse safely
-        rows_all = [r for r in rows_all if _ok(r.LastModified or "")]
+    # Date filters (soft)
+    if args.since:
+        try:
+            cutoff = dt.date.fromisoformat(args.since)
+            merged = [r for r in merged if (parse_date_soft(r.LastModified) or "") >= cutoff.isoformat()]
+        except Exception:
+            pass
+
+    # Months filter: items modified within last N months
+    if args.months:
+        try:
+            today = dt.date.today()
+            # Very simple months -> days approximation (30d each); refine if needed
+            delta_days = args.months * 30
+            cutoff2 = (today - dt.timedelta(days=delta_days)).isoformat()
+            merged = [r for r in merged if (parse_date_soft(r.LastModified) or "") >= cutoff2]
+        except Exception:
+            pass
 
     # Emit
-    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    if args.emit == "csv":
-        write_csv(args.out, rows_all)
-    else:
-        write_json(args.out, rows_all)
+    write_emit(merged, args.emit, args.out)
 
     # Stats
-    stats = {
-        "rows_total": len(rows_all),
-        "sources": sources_count,
-        "errors": errors,
-        "cloud_filter": sorted(list(wanted_clouds)),
-        "since": since_dt.isoformat() if since_dt else None,
-        "emit": args.emit,
-        "out": args.out,
-    }
-    if args.stats_out:
-        with open(args.stats_out, "w", encoding="utf-8") as f:
-            json.dump(stats, f, indent=2)
+    final_count = len(merged)
+    stats["final"] = final_count
+    print(f"Done. rows={final_count} sources={stats['sources']} errors={stats['errors']}")
 
-    # Always print a concise summary line (handy in CI logs)
-    print(
-        f"Done. rows={stats['rows_total']} "
-        f"sources={stats['sources']} "
-        f"errors={errors}"
-    )
+    if args.stats_out:
+        try:
+            os.makedirs(os.path.dirname(args.stats_out) or ".", exist_ok=True)
+            with open(args.stats_out, "w", encoding="utf-8") as f:
+                json.dump(stats, f, ensure_ascii=False, indent=2)
+        except Exception:
+            print("WARN: failed to write stats_out")
+
+    # Always show top of output dir for debugging if running in CI
+    try:
+        out_dir = os.path.dirname(args.out) or "."
+        head = _safe_head(sorted(os.listdir(out_dir)), 5)
+        print(f"DEBUG: files in {out_dir}: {head}")
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

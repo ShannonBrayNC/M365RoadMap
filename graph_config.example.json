@@ -4,5 +4,7 @@
   "pfx_base64": "REPLACE_WITH_BASE64_PFX",
   "pfx_password_env": "M365_PFX_PASSWORD",
   "graph_base": "https://graph.microsoft.com/v1.0",
-  "authority_base": "https://login.microsoftonline.com"
+  "authority_base": "https://login.microsoftonline.com",
+  "public_json_url": "",
+  "public_rss_url": ""
 }
