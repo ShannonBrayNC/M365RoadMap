@@ -176,6 +176,13 @@ jobs:
           echo "---- fetch stats ----"
           cat "output/${{ inputs.title }}_fetch_stats.json" || true
 
+
+          echo "---- rows in master ----"
+          wc -l "output/${{ inputs.title }}_master.csv" || true
+          echo "---- head ----"
+          head -n 5 "output/${{ inputs.title }}_master.csv" || true
+
+          
       - name: Generate markdown report
         shell: bash
         env:
