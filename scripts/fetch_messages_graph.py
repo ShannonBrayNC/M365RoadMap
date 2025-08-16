@@ -1,5 +1,6 @@
 # scripts/fetch_messages_graph.py  (top of file)
 
+
 from __future__ import annotations
 
 import argparse
