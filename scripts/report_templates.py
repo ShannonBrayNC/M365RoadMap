@@ -3,140 +3,240 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Iterable, Optional, Set, Dict, List
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
-# Canonical cloud labels we use everywhere in the report
-# "Worldwide (Standard Multi-Tenant)" and related inputs map to "General".
-_CLOUD_SYNONYMS: Dict[str, str] = {
+# ---------- Cloud helpers ----------
+
+_CLOUD_NORMALIZE = {
     "worldwide (standard multi-tenant)": "General",
-    "world wide (standard multi-tenant)": "General",
-    "worldwide": "General",
-    "world wide": "General",
-    "commercial": "General",
     "general": "General",
-
     "gcc": "GCC",
-    "government community cloud": "GCC",
-
     "gcc high": "GCC High",
     "gcch": "GCC High",
-    "government community cloud high": "GCC High",
-
     "dod": "DoD",
     "department of defense": "DoD",
+    "us gov gcc high": "GCC High",
+    "us gov dod": "DoD",
 }
 
-
-def normalize_clouds(values: Iterable[str] | str | None) -> Set[str]:
+def normalize_clouds(values: Iterable[str] | None) -> set[str]:
     """
-    Accept a single string or iterable of strings that might be:
-      - Canonical labels: "General", "GCC", "GCC High", "DoD"
-      - Display strings: "Worldwide (Standard Multi-Tenant)"
-      - Comma/pipe-separated fields (e.g., CSV cell from master)
-    Return a set of canonical labels.
+    Accepts None, a single string, or an iterable of strings and returns a set of
+    canonical labels: {"General","GCC","GCC High","DoD"}.
     """
     if not values:
         return set()
-
+    out: set[str] = set()
     if isinstance(values, str):
-        raw: List[str] = [v.strip() for v in values.replace("|", ",").split(",")]
-    else:
-        raw = []
-        for v in values:
-            if v is None:
-                continue
-            raw.extend([t.strip() for t in str(v).replace("|", ",").split(",")])
-
-    out: Set[str] = set()
-    for v in raw:
+        values = [values]
+    for v in values:
         if not v:
             continue
-        k = v.strip().lower()
-        canon = _CLOUD_SYNONYMS.get(k)
-        if canon:
-            out.add(canon)
-        else:
-            # If already canonical (e.g., "GCC High") keep as-is
-            out.add(v.strip())
+        for piece in str(v).replace(";", ",").split(","):
+            name = piece.strip().lower()
+            if not name:
+                continue
+            out.add(_CLOUD_NORMALIZE.get(name, piece.strip()))
     return out
 
 
+def cloud_display_from(values: Iterable[str] | None) -> str:
+    """
+    Turn a set/list/str of clouds into a friendly display string.
+    """
+    clouds = normalize_clouds(values)
+    if not clouds:
+        return "—"
+    # Keep consistent ordering
+    order = ["General", "GCC", "GCC High", "DoD"]
+    ordered = [c for c in order if c in clouds]
+    # Add any unknowns at the end
+    extras = [c for c in clouds if c not in order]
+    return ", ".join(ordered + extras)
+
+
+# ---------- Data model ----------
+
 @dataclass
 class FeatureRecord:
-    """
-    Unified feature record used by generate_report.py. All fields are snake_case.
-
-    Note: This intentionally diverges from CSV column case. The report generator
-    maps CSV headers like 'PublicId', 'Cloud_instance' into these attributes.
-    """
     public_id: str
     title: str
-    product: str = ""
-    status: str = ""
-    last_modified: str = ""
-    release_date: str = ""
-    clouds: Set[str] = field(default_factory=set)
-    roadmap_link: str = ""
-    message_id: str = ""
-    source: str = ""
+    product: str
+    status: str
+    clouds: List[str]
+    last_modified: str
+    release_date: str
+    source: str
+    message_id: str
+    roadmap_link: str
 
+    # Back-compat aliases (so older code like rec.Title still works)
+    @property
+    def PublicId(self) -> str:  # noqa: N802
+        return self.public_id
+
+    @property
+    def Title(self) -> str:  # noqa: N802
+        return self.title
+
+    @property
+    def Product_Workload(self) -> str:  # noqa: N802
+        return self.product
+
+    @property
+    def Status(self) -> str:  # noqa: N802
+        return self.status
+
+    @property
+    def Cloud_instance(self) -> str:  # noqa: N802
+        return cloud_display_from(self.clouds)
+
+    @property
+    def LastModified(self) -> str:  # noqa: N802
+        return self.last_modified
+
+    @property
+    def ReleaseDate(self) -> str:  # noqa: N802
+        return self.release_date
+
+    @property
+    def Source(self) -> str:  # noqa: N802
+        return self.source
+
+    @property
+    def MessageId(self) -> str:  # noqa: N802
+        return self.message_id
+
+    @property
+    def Official_Roadmap_link(self) -> str:  # noqa: N802
+        return self.roadmap_link
+
+    @classmethod
+    def from_csv_row(cls, row: Mapping[str, Any]) -> "FeatureRecord":
+        """
+        Flexible mapper from your CSV headers. Accepts either the canonical names
+        or your earlier column casing (PublicId, Title, Product_Workload, etc.).
+        """
+        def g(*names: str, default: str = "") -> str:
+            for n in names:
+                if n in row and row[n] is not None:
+                    return str(row[n])
+            return default
+
+        # Clouds may arrive as "Cloud_instance" or "Clouds", comma/semicolon separated
+        raw_clouds = g("Clouds", "Cloud_instance")
+        clouds_list = [p.strip() for p in raw_clouds.replace(";", ",").split(",") if p.strip()] if raw_clouds else []
+
+        return cls(
+            public_id=g("PublicId", "public_id", "Id", "ID"),
+            title=g("Title", "title", default=f"[{g('PublicId', 'public_id', 'Id', 'ID')}]"),
+            product=g("Product_Workload", "Product", "Workload", "product"),
+            status=g("Status", "status"),
+            clouds=list(normalize_clouds(clouds_list)),
+            last_modified=g("LastModified", "Last Modified", "last_modified"),
+            release_date=g("ReleaseDate", "Release Date", "release_date"),
+            source=g("Source", "source"),
+            message_id=g("MessageId", "message_id"),
+            roadmap_link=g("Official_Roadmap_link", "Roadmap", "roadmap_link"),
+        )
+
+
+# ---------- Rendering ----------
+
+# Subtle, readable HTML/CSS for when you convert MD → HTML.
+# Safe inside Markdown as raw HTML; MD viewers just pass it through.
+_STYLES = """<style>
+.rm-wrap { max-width: 980px; margin: 0 auto; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Apple Color Emoji","Segoe UI Emoji","Segoe UI Symbol"; }
+.rm-header h1 { margin: 0.2rem 0 0.1rem 0; font-size: 2rem; }
+.rm-meta { color: #555; font-size: 0.95rem; margin-bottom: 1rem; }
+.rm-card { border: 1px solid #e6e6e6; border-radius: 12px; padding: 14px 16px; margin: 14px 0; box-shadow: 0 1px 3px rgba(0,0,0,.04); }
+.rm-card h3 { margin: 0 0 0.4rem 0; font-size: 1.15rem; line-height: 1.35; }
+.rm-table { width: 100%; border-collapse: collapse; margin: 6px 0 10px 0; }
+.rm-table th, .rm-table td { border: 1px solid #eee; padding: 6px 8px; font-size: .92rem; vertical-align: top; }
+.rm-table th { background: #fafafa; text-align: left; white-space: nowrap; }
+.rm-sect { margin: 8px 0; }
+.rm-sect h4 { margin: 8px 0 4px; font-size: 1rem; }
+.rm-muted { color: #777; font-style: italic; }
+details.rm-collapsible { margin-top: 8px; }
+details.rm-collapsible summary { cursor: pointer; font-weight: 600; }
+</style>"""
 
 def render_header(*, title: str, generated_utc: str, cloud_display: str) -> str:
     """
-    Render the report header. 'cloud_display' should be a human-readable summary
-    such as 'General' or 'General, GCC'.
+    Nice looking report header. Include at the top of your Markdown.
     """
-    return (
-        f"{title}\n"
-        f"Generated {generated_utc}\n\n"
-        f"{title} Generated {generated_utc} Cloud filter: {cloud_display}\n"
-    )
+    return f"""<!-- prettier header -->
+{_STYLES}
+<div class="rm-wrap rm-header">
+  <h1>{title}</h1>
+  <div class="rm-meta">
+    Generated <strong>{generated_utc}</strong> · Cloud filter: <strong>{cloud_display or "All"}</strong>
+  </div>
+</div>
+"""
 
 
-def render_feature_markdown(
-    rec: FeatureRecord,
-    ai_sections: Optional[dict[str, str]] = None,
-) -> str:
+def _fmt(value: str | None) -> str:
+    v = (value or "").strip()
+    return v if v else "—"
+
+
+def render_feature_markdown(feature: FeatureRecord, ai_sections: Optional[Mapping[str, str]] = None) -> str:
     """
-    Render a single feature section. 'ai_sections' can provide four keys:
-    'summary', 'changes', 'impact', 'actions' – we'll fallback to readable
-    defaults if missing.
+    Render a single feature as a compact card with a summary table plus
+    sections for Summary / What’s changing / Impact / Action items.
     """
-    ai_sections = ai_sections or {}
-    summary = ai_sections.get("summary", "Summary (summary pending)")
-    changes = ai_sections.get("changes", "What’s changing (details pending)")
-    impact = ai_sections.get("impact", "Impact and rollout (impact pending)")
-    actions = ai_sections.get("actions", "Action items (actions pending)")
+    fid = _fmt(feature.public_id)
+    title = feature.title or f"[{fid}]"
+    link = feature.roadmap_link.strip()
+    title_line = f"[{title}]({link})" if link else title
 
-    cloud_disp = ", ".join(sorted(rec.clouds)) if rec.clouds else "—"
-    rm = rec.roadmap_link or (
-        f"https://www.microsoft.com/microsoft-365/roadmap?filters=&searchterms={rec.public_id}"
-        if rec.public_id else ""
-    )
+    product = _fmt(feature.product)
+    status = _fmt(feature.status)
+    clouds = cloud_display_from(feature.clouds) or "—"
+    modified = _fmt(feature.last_modified)
+    release = _fmt(feature.release_date)
+    source = _fmt(feature.source)
+    msgid = _fmt(feature.message_id)
 
-    header_line = (
-        f"[{rec.public_id}] {rec.title} "
-        f"Product/Workload: {rec.product or '—'} "
-        f"Status: {rec.status or '—'} "
-        f"Cloud(s): {cloud_disp} "
-        f"Last Modified: {rec.last_modified or '—'} "
-        f"Release Date: {rec.release_date or '—'} "
-        f"Source: {rec.source or '—'} "
-        f"Message ID: {rec.message_id or '—'} "
-        f"Official Roadmap: {rm}"
-    ).strip()
+    # AI sections (optional)
+    ai = ai_sections or {}
+    summary = ai.get("summary") or "*summary pending*"
+    changes = ai.get("changes") or "*details pending*"
+    impact = ai.get("impact") or "*impact pending*"
+    actions = ai.get("actions") or "*actions pending*"
 
-    parts = [
-        header_line,
-        "",
-        summary,
-        "",
-        changes,
-        "",
-        impact,
-        "",
-        actions,
-        "",
-    ]
-    return "\n".join(parts)
+    return f"""<div class="rm-wrap rm-card">
+
+### {title_line}
+
+<table class="rm-table">
+  <tr><th>Roadmap ID</th><td>{fid}</td><th>Product / Workload</th><td>{product}</td></tr>
+  <tr><th>Status</th><td>{status}</td><th>Cloud(s)</th><td>{clouds}</td></tr>
+  <tr><th>Last Modified</th><td>{modified}</td><th>Release Date</th><td>{release}</td></tr>
+  <tr><th>Source</th><td>{source}</td><th>Message ID</th><td>{msgid}</td></tr>
+</table>
+
+<div class="rm-sect">
+  <h4>Summary</h4>
+  <div>{summary}</div>
+</div>
+
+<details class="rm-collapsible">
+  <summary>What’s changing</summary>
+  <div class="rm-sect">{changes}</div>
+</details>
+
+<details class="rm-collapsible">
+  <summary>Impact and rollout</summary>
+  <div class="rm-sect">{impact}</div>
+</details>
+
+<details class="rm-collapsible">
+  <summary>Action items</summary>
+  <div class="rm-sect">{actions}</div>
+</details>
+
+</div>
+"""
