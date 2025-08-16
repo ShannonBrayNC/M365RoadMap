@@ -149,6 +149,7 @@ jobs:
           cat "output/${{ inputs.title }}_fetch_stats.json" || true
 
       - name: Generate markdown report
+        run: bash scripts/run_generate_report.sh
         env:
           TITLE: ${{ inputs.title }}
           SINCE: ${{ inputs.since }}
@@ -159,7 +160,6 @@ jobs:
           CLOUD_DOD: ${{ inputs.cloud_dod }}
           PRODUCTS: ${{ inputs.products }}
           PUBLIC_IDS: ${{ inputs.public_ids }}
-        run: |
           set -euo pipefail
           IN_CSV="output/${TITLE}_master.csv"
           OUT_MD="output/${TITLE}.md"
