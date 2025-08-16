@@ -81,16 +81,21 @@ jobs:
             pip install pandas requests msal cryptography beautifulsoup4 lxml feedparser tqdm Markdown
           fi
 
-      - name: Write graph_config.json (from secrets)
+      - name: Write graph_config.json
+        shell: bash
         run: |
-          cat > graph_config.json <<'JSON'
-          {
-            "tenant": "${TENANT}",
-            "client_id": "${CLIENT}",
-            "pfx_base64": "${PFX_B64}"
+          python - <<'PY'
+          import json, os
+          cfg = {
+            "tenant": os.environ.get("TENANT",""),
+            "client_id": os.environ.get("CLIENT",""),
+            "pfx_base64": os.environ.get("PFX_B64",""),
+            "pfx_password_env": os.environ.get("PFX_PASSWORD_ENV","M365_PFX_PASSWORD"),
           }
-          JSON
-          echo "graph_config.json written."
+          with open("graph_config.json","w",encoding="utf-8") as f:
+              json.dump(cfg,f)
+          print("graph_config.json written.")
+          PY
 
       - name: Fetch master CSV/JSON via Graph + fallbacks
         shell: bash
@@ -126,6 +131,15 @@ jobs:
           echo "csv=${CSV_OUT}"     >> "$GITHUB_OUTPUT"
           echo "json=${JSON_OUT}"   >> "$GITHUB_OUTPUT"
           echo "stats=${STATS_OUT}" >> "$GITHUB_OUTPUT"
+
+
+      - name: Show fetch stats
+        if: always()
+        run: |
+          echo "---- fetch stats ----"
+          cat "output/${TITLE}_fetch_stats.json" || true
+                
+
 
       - name: Generate Markdown report
         shell: bash
