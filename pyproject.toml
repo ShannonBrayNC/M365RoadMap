@@ -1,35 +1,22 @@
-[tool.ruff]
-line-length = 100
-target-version = "py311"
-lint.select = ["E","W","F","I","UP","N","B","A","C4","PT","SIM","ARG","T20","ERA","DTZ"]
-lint.ignore = ["E203"]
-lint.exclude = ["output"]
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
 
-[tool.ruff.format]
-quote-style = "double"
-indent-style = "space"
-docstring-code-format = true
+[project]
+name = "m365roadmap-ui"
+version = "0.1.0"
+description = "Streamlit UI for M365 Roadmap"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{name="Your Name"}]
+dependencies = [
+    "streamlit>=1.37",
+    "pandas>=2.1",
+    "python-dateutil>=2.9"
+]
 
-[tool.mypy]
-python_version = "3.11"
-warn_unused_configs = true
-warn_redundant_casts = true
-warn_unused_ignores = true
-warn_return_any = true
-disallow_untyped_defs = true
-no_implicit_optional = true
-check_untyped_defs = true
-exclude = ["output/"]
+[project.scripts]
+m365roadmap-ui = "m365roadmap_ui.__main__:main"
 
-[tool.pytest.ini_options]
-minversion = "7.0"
-addopts = "-q"
-testpaths = ["tests"]
-
-[tool.coverage.run]
-branch = true
-source = ["."]
-omit = ["*/tests/*", "output/*"]
-
-[tool.bandit]
-skips = ["B101"]
+[tool.setuptools.package-data]
+m365roadmap_ui = ["app/**/*.py"]

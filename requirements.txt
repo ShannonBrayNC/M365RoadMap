@@ -1,15 +1,3 @@
-requests>=2.31
-urllib3>=2.2
-beautifulsoup4>=4.12
-lxml>=5.2
-feedparser>=6.0.11
-python-dateutil>=2.9
-pandas>=2.2
-msal>=1.29.0
-cryptography>=42.0.0
-openai>=1.40.0   # only needed if you enable --use-openai
-pytest>=8.2
-Markdown>=3.4.4
 streamlit>=1.37
 pandas>=2.1
 python-dateutil>=2.9
