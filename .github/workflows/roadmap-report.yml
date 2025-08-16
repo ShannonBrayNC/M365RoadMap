@@ -65,96 +65,32 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install msal cryptography requests markdown feedparser beautifulsoup4 lxml pandas openai  
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install requests markdown pandas msal pyjwt cryptography feedparser lxml beautifulsoup4
+          fi
 
-            - name: Prepare graph_config.json (Graph creds)
-              shell: bash
-              run: |
-                set -euo pipefail
-
-                # Export the password secret to an env var for the run
-                if [ -n "${{ secrets.M365_PFX_PASSWORD }}" ]; then
-                  echo "M365_PFX_PASSWORD=${{ secrets.M365_PFX_PASSWORD }}" >> "$GITHUB_ENV"
-                fi
-
-                # Write config with the field names fetch_messages_graph.py expects
-                cat > graph_config.json <<'JSON'
-                {
-                  "tenant":            ${{ toJSON(secrets.M365_TENANT_ID) }},
-                  "client":            ${{ toJSON(secrets.M365_CLIENT_ID) }},
-                  "pfx_b64":           ${{ toJSON(secrets.M365_PFX_BASE64) }},
-                  "pfx_password_env":  "M365_PFX_PASSWORD",
-                  "graph_base":        "https://graph.microsoft.com"
-                }
-                JSON
-
-                echo "graph_config.json written:"
-                cat graph_config.json | sed 's/"pfx_b64":.*/"pfx_b64":"***redacted***",/'
-
-      - name: Verify Graph deps
-        run: |
-          python - <<'PY'
-          import sys
-          import msal, cryptography
-          print("msal:", msal.__version__)
-          from cryptography.hazmat.primitives.serialization import pkcs12
-          print("cryptography OK")
-          PY
-
-
-      - name: Validate PFX (optional)
-        shell: bash
-        run: |
-          python - <<'PY'
-          import json, os, base64, sys
-          from cryptography.hazmat.primitives.serialization import pkcs12
-          from cryptography.hazmat.backends import default_backend
-          cfg = json.load(open("graph_config.json"))
-          pfx = base64.b64decode(cfg["pfx_b64"])
-          pwd = os.getenv(cfg["pfx_password_env"]) or ""
-          try:
-              key, cert, chain = pkcs12.load_key_and_certificates(pfx, pwd.encode(), default_backend())
-              print("PFX OK. Subject:", cert.subject.rfc4514_string())
-          except Exception as e:
-              print("PFX invalid:", e)
-              sys.exit(1)
-          PY
-
-
-      - name: Prepare graph_config.json (Graph creds + public fallbacks)
-        shell: bash
+      - name: Prepare graph_config.json (optional creds)
         run: |
           set -euo pipefail
           cat > graph_config.json <<'JSON'
           {
-            // lower-case (new loader)
-            "tenant": "${{ secrets.M365_TENANT_ID || '' }}",
-            "client": "${{ secrets.M365_CLIENT_ID  || '' }}",
-            "pfx_base64": "${{ secrets.M365_PFX_BASE64 || '' }}",
-            "pfx_password_env": "M365_PFX_PASSWORD",
-
-            // UPPER-CASE (old loader compatibility)
-            "TENANT": "${{ secrets.M365_TENANT_ID || '' }}",
-            "CLIENT": "${{ secrets.M365_CLIENT_ID  || '' }}",
-            "PFX_B64": "${{ secrets.M365_PFX_BASE64 || '' }}",
+            "TENANT":   "${{ secrets.M365_TENANT_ID || '' }}",
+            "CLIENT":   "${{ secrets.M365_CLIENT_ID  || '' }}",
+            "PFX_B64":  "${{ secrets.M365_PFX_BASE64 || '' }}",
             "M365_PFX_PASSWORD": "M365_PFX_PASSWORD",
-
-            // Optional public sources (RSS will work even if Graph is down)
-            "public_rss_url": "https://www.microsoft.com/en-us/microsoft-365/RoadmapFeatureRSS?filters=&searchterms=",
-            "public_json_url": ""
+            "public_json_url": "",
+            "public_rss_url": ""
           }
           JSON
           echo "graph_config.json written."
-
-          # Export the PFX password so the script can read it by name
           if [ -n "${{ secrets.M365_PFX_PASSWORD }}" ]; then
-            echo "M365_PFX_PASSWORD=${{ secrets.M365_PFX_PASSWORD }}" >> "$GITHUB_ENV"
+            echo "M365_PFX_PASSWORD=${{ secrets.M365_PFX_PASSWORD }}" >> $GITHUB_ENV
           fi
-
 
       - name: Fetch messages (Graph → fallback → seed)
         env:
-          DEBUG: "1"
           TITLE: ${{ inputs.title }}
           SINCE: ${{ inputs.since }}
           MONTHS: ${{ inputs.months }}
@@ -164,7 +100,6 @@ jobs:
           CLOUD_DOD: ${{ inputs.cloud_dod }}
           NO_GRAPH: ${{ inputs.no_graph }}
           PUBLIC_IDS: ${{ inputs.public_ids }}
-        shell: bash
         run: |
           set -euo pipefail
           mkdir -p output
@@ -173,24 +108,24 @@ jobs:
           STATS_OUT="output/${TITLE}_fetch_stats.json"
 
           CFG=(--config "graph_config.json")
-
           DATE_FLAGS=()
-          [ -n "${SINCE}" ] && DATE_FLAGS+=(--since "${SINCE}")
-          [ -n "${MONTHS}" ] && DATE_FLAGS+=(--months "${MONTHS}")
+          [[ -n "${SINCE}"  ]] && DATE_FLAGS+=(--since  "${SINCE}")
+          [[ -n "${MONTHS}" ]] && DATE_FLAGS+=(--months "${MONTHS}")
 
           CLOUD_FLAGS=()
-          [ "${CLOUD_GENERAL,,}" = "true" ] && CLOUD_FLAGS+=(--cloud "Worldwide (Standard Multi-Tenant)")
-          [ "${CLOUD_GCC,,}" = "true" ] && CLOUD_FLAGS+=(--cloud "GCC")
-          [ "${CLOUD_GCCH,,}" = "true" ] && CLOUD_FLAGS+=(--cloud "GCC High")
-          [ "${CLOUD_DOD,,}" = "true" ] && CLOUD_FLAGS+=(--cloud "DoD")
+          [[ "${CLOUD_GENERAL,,}" == "true" ]] && CLOUD_FLAGS+=(--cloud "Worldwide (Standard Multi-Tenant)")
+          [[ "${CLOUD_GCC,,}"     == "true" ]] && CLOUD_FLAGS+=(--cloud "GCC")
+          [[ "${CLOUD_GCCH,,}"    == "true" ]] && CLOUD_FLAGS+=(--cloud "GCC High")
+          [[ "${CLOUD_DOD,,}"     == "true" ]] && CLOUD_FLAGS+=(--cloud "DoD")
 
           NOGRAPH=()
-          [ "${NO_GRAPH,,}" = "true" ] && NOGRAPH+=(--no-graph)
+          [[ "${NO_GRAPH,,}" == "true" ]] && NOGRAPH+=(--no-graph)
 
           SEED_ARGS=()
-          [ -n "${PUBLIC_IDS}" ] && SEED_ARGS+=(--seed-ids "${PUBLIC_IDS}")
+          [[ -n "${PUBLIC_IDS}" ]] && SEED_ARGS+=(--seed-ids "${PUBLIC_IDS}")
 
           echo "Running fetch_messages_graph.py with: ${CFG[*]} ${DATE_FLAGS[*]} ${CLOUD_FLAGS[*]} ${NOGRAPH[*]} ${SEED_ARGS[*]}"
+
           python scripts/fetch_messages_graph.py \
             "${CFG[@]}" "${DATE_FLAGS[@]}" "${CLOUD_FLAGS[@]}" "${NOGRAPH[@]}" "${SEED_ARGS[@]}" \
             --emit csv --out "${CSV_OUT}" --stats-out "${STATS_OUT}"
@@ -203,7 +138,6 @@ jobs:
           echo "json=${JSON_OUT}"   >> "$GITHUB_OUTPUT"
           echo "stats=${STATS_OUT}" >> "$GITHUB_OUTPUT"
 
-
       - name: Debug master outputs
         if: always()
         run: |
@@ -214,17 +148,8 @@ jobs:
           echo "---- fetch stats ----"
           cat "output/${{ inputs.title }}_fetch_stats.json" || true
 
-
-          echo "---- rows in master ----"
-          wc -l "output/${{ inputs.title }}_master.csv" || true
-          echo "---- head ----"
-          head -n 5 "output/${{ inputs.title }}_master.csv" || true
-
-          
       - name: Generate markdown report
-        shell: bash
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           TITLE: ${{ inputs.title }}
           SINCE: ${{ inputs.since }}
           MONTHS: ${{ inputs.months }}
@@ -240,17 +165,17 @@ jobs:
           OUT_MD="output/${TITLE}.md"
 
           DATE_FLAGS=()
-          [ -n "${SINCE}" ] && DATE_FLAGS+=(--since "${SINCE}")
-          [ -n "${MONTHS}" ] && DATE_FLAGS+=(--months "${MONTHS}")
+          [[ -n "${SINCE}"  ]] && DATE_FLAGS+=(--since  "${SINCE"})
+          [[ -n "${MONTHS}" ]] && DATE_FLAGS+=(--months "${MONTHS}")
 
           CLOUD_FLAGS=()
-          [ "${CLOUD_GENERAL,,}" = "true" ] && CLOUD_FLAGS+=(--cloud "Worldwide (Standard Multi-Tenant)")
-          [ "${CLOUD_GCC,,}" = "true" ] && CLOUD_FLAGS+=(--cloud "GCC")
-          [ "${CLOUD_GCCH,,}" = "true" ] && CLOUD_FLAGS+=(--cloud "GCC High")
-          [ "${CLOUD_DOD,,}" = "true" ] && CLOUD_FLAGS+=(--cloud "DoD")
+          [[ "${CLOUD_GENERAL,,}" == "true" ]] && CLOUD_FLAGS+=(--cloud "Worldwide (Standard Multi-Tenant)")
+          [[ "${CLOUD_GCC,,}"     == "true" ]] && CLOUD_FLAGS+=(--cloud "GCC")
+          [[ "${CLOUD_GCCH,,}"    == "true" ]] && CLOUD_FLAGS+=(--cloud "GCC High")
+          [[ "${CLOUD_DOD,,}"     == "true" ]] && CLOUD_FLAGS+=(--cloud "DoD")
 
           FORCED_ARGS=()
-          [ -n "${PUBLIC_IDS}" ] && FORCED_ARGS+=(--forced-ids "${PUBLIC_IDS}")
+          [[ -n "${PUBLIC_IDS}" ]] && FORCED_ARGS+=(--forced-ids "${PUBLIC_IDS}")
 
           python scripts/generate_report.py \
             --title "${TITLE}" \

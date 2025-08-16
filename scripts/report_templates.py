@@ -1,40 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Sequence
+from typing import Iterable
 
-# --- Cloud normalization ---
-
-_CLOUD_MAP = {
-    "worldwide (standard multi-tenant)": "General",
-    "worldwide": "General",
-    "general": "General",
-    "commercial": "General",
-    "gcc": "GCC",
-    "gcc high": "GCC High",
-    "gcch": "GCC High",
-    "dod": "DoD",
-}
-
-
-def normalize_clouds(items: Iterable[str]) -> set[str]:
-    """
-    Normalize cloud display names to canonical labels.
-    Unknown values are preserved as-is (trimmed).
-    """
-    out: set[str] = set()
-    for s in items or []:
-        key = (s or "").strip().lower()
-        if not key:
-            continue
-        out.add(_CLOUD_MAP.get(key, s.strip()))
-    return out
-
-
-# --- Data model (matches your CSV columns via generate_report.py mapping) ---
 
 @dataclass
 class FeatureRecord:
@@ -49,106 +19,111 @@ class FeatureRecord:
     official_roadmap_link: str
     message_id: str
 
-    # Convenience helpers (not serialized)
-    @property
-    def products_list(self) -> list[str]:
-        """
-        Split product_workload into pills. Supports '/', ',' separators.
-        """
-        s = (self.product_workload or "").strip()
-        if not s:
-            return []
-        raw = [p.strip() for part in s.split("/") for p in part.split(",")]
-        return [p for p in raw if p]
+    @classmethod
+    def from_csv_row(cls, row: dict[str, str]) -> "FeatureRecord":
+        # Map expected CSV headers → fields (case-stable from the fetch script)
+        return cls(
+            public_id=(row.get("PublicId") or "").strip(),
+            title=(row.get("Title") or "").strip(),
+            source=(row.get("Source") or "").strip(),
+            product_workload=(row.get("Product_Workload") or "").strip(),
+            status=(row.get("Status") or "").strip(),
+            last_modified=(row.get("LastModified") or "").strip(),
+            release_date=(row.get("ReleaseDate") or "").strip(),
+            cloud_instance=(row.get("Cloud_instance") or "").strip(),
+            official_roadmap_link=(row.get("Official_Roadmap_link") or "").strip(),
+            message_id=(row.get("MessageId") or "").strip(),
+        )
 
-
-# --- Rendering helpers ---
-
-def _pill_row(label: str, items: Sequence[str]) -> str:
-    if not items:
-        return ""
-    pills = " ".join(f"`{p}`" for p in items)
-    return f"**{label}:** {pills}\n\n"
+    def anchor_id(self) -> str:
+        return f"id-{self.public_id}" if self.public_id else "id-unknown"
 
 
 def render_header(*, title: str, generated_utc: str, cloud_display: str) -> str:
-    """
-    Top-of-report header. `cloud_display` is a human string (e.g., 'General' or 'General, GCC').
-    """
     return (
         f"# {title}\n"
         f"_Generated {generated_utc}_\n\n"
         f"**Cloud filter:** {cloud_display}\n\n"
+        "---\n"
     )
+
+
+def make_tag_pills(products_str: str) -> str:
+    if not products_str:
+        return ""
+    # Split on / , ; | and whitespace
+    import re
+    parts = [p for p in re.split(r"[\/,\|\;\s]+", products_str) if p]
+    if not parts:
+        return ""
+    pills = " ".join(f"`{p}`" for p in parts)
+    return f"**Products:** {pills}\n"
+
+
+def render_table_of_contents(rows: Iterable[FeatureRecord]) -> str:
+    items = []
+    for r in rows:
+        title = r.title or f"[{r.public_id}]"
+        items.append(f"- [{title}](#{r.anchor_id()})")
+    if not items:
+        return ""
+    return "## Table of Contents\n" + "\n".join(items) + "\n\n"
+
+
+def _message_center_link(message_id: str) -> str:
+    if not message_id:
+        return ""
+    # Admin portal deep link
+    return f"https://admin.microsoft.com/Adminportal/Home#/messagecenter?id={message_id}"
 
 
 def render_feature_markdown(rec: FeatureRecord) -> str:
-    """
-    Pretty per-feature section.
-    - Bold title
-    - Hyperlink Message Center ID (when present)
-    - Status, Release Date, Clouds
-    - Products tag pills
-    - Summary placeholder blocks
-    """
-    # Title line: [ID] Title (bold)
-    id_bracket = f"[{rec.public_id}]" if rec.public_id else "[—]"
-    title_line = f"**{id_bracket} {rec.title or '(No title)'}**"
-
-    # Facts line
-    clouds = (rec.cloud_instance or "—").strip() or "—"
-    status = (rec.status or "—").strip() or "—"
-    last_mod = (rec.last_modified or "—").strip() or "—"
-    rel = (rec.release_date or "—").strip() or "—"
-
-    # Links: Message Center (ID hyperlink) and Roadmap link
-    mc_part = ""
-    if rec.message_id:
-        mc_url = f"https://admin.microsoft.com/Adminportal/Home#/messagecenter/:/messages/{rec.message_id}"
-        mc_part = f" • Message Center: [{rec.message_id}]({mc_url})"
-    rm_part = ""
+    title = rec.title or f"[{rec.public_id}]"
+    mc_link = _message_center_link(rec.message_id)
+    source_bits = []
     if rec.official_roadmap_link:
-        rm_part = f" • [Official Roadmap]({rec.official_roadmap_link})"
+        source_bits.append(f"[Roadmap]({rec.official_roadmap_link})")
+    if mc_link:
+        source_bits.append(f"[Message Center]({mc_link})")
+    source_line = " · ".join(source_bits) if source_bits else ""
 
-    facts = (
-        f"Product/Workload: {(rec.product_workload or '—')}"
-        f" • Status: {status}"
-        f" • Cloud(s): {clouds}"
-        f" • Last Modified: {last_mod}"
-        f" • Release Date: {rel}"
-        f" • Source: {(rec.source or '—')}"
-        f"{mc_part}{rm_part}"
-    )
+    meta = []
+    if rec.status:
+        meta.append(f"**Status:** {rec.status}")
+    if rec.release_date:
+        meta.append(f"**Release Date:** {rec.release_date}")
+    if rec.cloud_instance:
+        meta.append(f"**Cloud(s):** {rec.cloud_instance}")
+    meta_line = "  \n".join(meta)
 
-    # Products tag pills
-    pills = _pill_row("Products", rec.products_list)
+    products = make_tag_pills(rec.product_workload)
 
-    # AI placeholders / content blocks
-    body = (
-        f"{title_line}\n\n"
-        f"{facts}\n\n"
-        f"{pills}"
-        f"**Summary**  \n"
-        f"(summary pending)\n\n"
-        f"**What’s changing**  \n"
-        f"(details pending)\n\n"
-        f"**Impact and rollout**  \n"
-        f"(impact pending)\n\n"
-        f"**Action items**  \n"
-        f"(actions pending)\n\n"
-    )
-    return body
+    lines = [
+        f"### <a id=\"{rec.anchor_id()}\"></a> **{title}**",
+    ]
+    if source_line:
+        lines.append(source_line)
+    if meta_line:
+        lines.append(meta_line)
+    if products:
+        lines.append(products.rstrip())
 
-
-def render_toc(features: list[FeatureRecord]) -> str:
-    """
-    Mini table of contents with anchors by public_id (falls back to slugified title).
-    """
-    if not features:
-        return ""
-    lines = ["## Table of Contents"]
-    for rec in features:
-        anchor = rec.public_id or (rec.title.lower().strip().replace(" ", "-") if rec.title else "item")
-        label = f"[{rec.public_id}] {rec.title}" if rec.public_id else (rec.title or "(No title)")
-        lines.append(f"- [{label}](#{anchor})")
-    return "\n".join(lines) + "\n\n"
+    # AI placeholder sections (kept minimal/clean)
+    lines += [
+        "",
+        "**Summary**",
+        "> (summary pending)",
+        "",
+        "**What’s changing**",
+        "> (details pending)",
+        "",
+        "**Impact and rollout**",
+        "> (impact pending)",
+        "",
+        "**Action items**",
+        "> (actions pending)",
+        "",
+        "---",
+        "",
+    ]
+    return "\n".join(lines)
