@@ -1,606 +1,437 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+from __future__ import annotations
+
 import argparse
 import csv
-import json
+import datetime as dt
 import os
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from textwrap import dedent
-from typing import Iterable, List, Optional, Sequence
-import re
-from typing import Sequence
 import sys
-
-# normalize_clouds helper (import, with robust fallback)
-try:
-    from report_templates import normalize_clouds
-except Exception:
-    def normalize_clouds(values: list[str] | str) -> set[str]:  # very small fallback
-        if isinstance(values, str):
-            values = [values]
-        canon = {
-            "worldwide (standard multi-tenant)": "General",
-            "general": "General",
-            "gcc": "GCC",
-            "gcc high": "GCC High",
-            "dod": "DoD",
-        }
-        out: set[str] = set()
-        for v in values or []:
-            k = (v or "").strip().lower()
-            out.add(canon.get(k, (v or "").strip()))
-        return out
+from dataclasses import dataclass, field
+from typing import Iterable, List, Optional, Sequence, Set
 
 
-# --- FeatureRecord import (with fallback) ------------------------------------
-try:
-    # Preferred: use the shared model from report_templates if present
-    from report_templates import FeatureRecord  # type: ignore[attr-defined]
-except Exception:
-    # Fallback: lightweight local definition that matches fields used here
-    from dataclasses import dataclass, field
-    from typing import List
+# --- import helpers ---------------------------------------------------------
 
+def _try_import_report_templates():
+    """
+    Try to import report_templates from either scripts.report_templates or
+    report_templates. Return a dict of callables/objects, with graceful fallbacks.
+    """
+    mod = {}
+    # Make sure repo root and scripts dir are on path
+    here = os.path.abspath(os.path.dirname(__file__))
+    repo_root = os.path.abspath(os.path.join(here, ".."))
+    for p in (repo_root, here):
+        if p not in sys.path:
+            sys.path.insert(0, p)
+
+    # Try "scripts.report_templates" first
+    try:
+        from scripts.report_templates import (  # type: ignore
+            FeatureRecord as _FR,
+            render_header as _render_header,
+            render_feature_markdown as _render_feature_markdown,
+            normalize_clouds as _normalize_clouds,
+        )
+        mod["FeatureRecord"] = _FR
+        mod["render_header"] = _render_header
+        mod["render_feature_markdown"] = _render_feature_markdown
+        mod["normalize_clouds"] = _normalize_clouds
+        return mod
+    except Exception:
+        pass
+
+    # Then try local "report_templates"
+    try:
+        from report_templates import (  # type: ignore
+            FeatureRecord as _FR,
+            render_header as _render_header,
+            render_feature_markdown as _render_feature_markdown,
+            normalize_clouds as _normalize_clouds,
+        )
+        mod["FeatureRecord"] = _FR
+        mod["render_header"] = _render_header
+        mod["render_feature_markdown"] = _render_feature_markdown
+        mod["normalize_clouds"] = _normalize_clouds
+        return mod
+    except Exception:
+        pass
+
+    # Fallbacks (minimal local implementations)
     @dataclass
-    class FeatureRecord:
+    class _FR:  # minimal, snake_case
         public_id: str
         title: str
         product: str = ""
         status: str = ""
         last_modified: str = ""
         release_date: str = ""
-        clouds: List[str] = field(default_factory=lambda: ["General"])
+        clouds: Set[str] = field(default_factory=set)
         roadmap_link: str = ""
-        source: str = ""
         message_id: str = ""
-# ---------------------------------------------------------------------------
+        source: str = ""
 
+    def _render_header(*, title: str, generated_utc: str, cloud_display: str) -> str:
+        return (
+            f"{title}\n"
+            f"Generated {generated_utc}\n\n"
+            f"{title} Generated {generated_utc} Cloud filter: {cloud_display}\n"
+        )
 
+    def _render_feature_markdown(rec: _FR, ai_sections: Optional[dict[str, str]] = None) -> str:
+        ai_sections = ai_sections or {}
+        summary = ai_sections.get("summary", "Summary (summary pending)")
+        changes = ai_sections.get("changes", "What’s changing (details pending)")
+        impact = ai_sections.get("impact", "Impact and rollout (impact pending)")
+        actions = ai_sections.get("actions", "Action items (actions pending)")
 
-# --- Rendering helpers import (with fallback) --------------------------------
-try:
-    # Prefer the shared implementations
-    from report_templates import render_header, render_feature_markdown  # type: ignore[attr-defined]
-except Exception:
-    # Minimal fallbacks so the script still runs end-to-end
-    def render_header(*, title: str, generated_utc: str, cloud_display: str) -> str:
-        # Matches the signature used by generate_report.py
-        lines = [
-            "# Roadmap Report",
-            f"Generated {generated_utc}",
+        cloud_disp = ", ".join(sorted(rec.clouds)) if rec.clouds else "—"
+        rm = rec.roadmap_link or (f"https://www.microsoft.com/microsoft-365/roadmap?filters=&searchterms={rec.public_id}" if rec.public_id else "")
+        parts = [
+            f"[{rec.public_id}] {rec.title} "
+            f"Product/Workload: {rec.product or '—'} "
+            f"Status: {rec.status or '—'} "
+            f"Cloud(s): {cloud_disp} "
+            f"Last Modified: {rec.last_modified or '—'} "
+            f"Release Date: {rec.release_date or '—'} "
+            f"Source: {rec.source or '—'} "
+            f"Message ID: {rec.message_id or '—'} "
+            f"Official Roadmap: {rm}".strip(),
             "",
-            f"{title} Generated {generated_utc} Cloud filter: {cloud_display}",
+            summary,
             "",
-        ]
-        return "\n".join(lines)
-
-    def render_feature_markdown(fr) -> str:
-        # Very lightweight rendering; replace with your rich template if desired
-        rid = fr.public_id
-        title = fr.title or f"[{rid}]"
-        product = fr.product or "—"
-        status = fr.status or "—"
-        clouds = ", ".join(fr.clouds) if getattr(fr, "clouds", None) else "—"
-        last_mod = fr.last_modified or "—"
-        rel = fr.release_date or "—"
-        src = fr.source or "—"
-        msg = fr.message_id or "—"
-        link = fr.roadmap_link or f"https://www.microsoft.com/microsoft-365/roadmap?filters=&searchterms={rid}"
-
-        body = [
-            f"[{rid}] {title}",
-            f"Product/Workload: {product}  Status: {status}  Cloud(s): {clouds}  "
-            f"Last Modified: {last_mod}  Release Date: {rel}  Source: {src}  "
-            f"Message ID: {msg}  Official Roadmap: {link}",
+            changes,
             "",
-            "Summary (summary pending)",
+            impact,
             "",
-            "What’s changing (details pending)",
-            "",
-            "Impact and rollout (impact pending)",
-            "",
-            "Action items (actions pending)",
+            actions,
             "",
         ]
-        return "\n".join(body)
-# -----------------------------------------------------------------------------
+        return "\n".join(parts)
+
+    def _normalize_clouds(val: Iterable[str] | str | None) -> Set[str]:
+        CANON = {
+            "worldwide (standard multi-tenant)": "General",
+            "worldwide": "General",
+            "general": "General",
+            "commercial": "General",
+            "gcc": "GCC",
+            "gcc high": "GCC High",
+            "gcch": "GCC High",
+            "dod": "DoD",
+            "department of defense": "DoD",
+        }
+        if not val:
+            return set()
+        if isinstance(val, str):
+            vals = [val]
+        else:
+            vals = list(val)
+        out: Set[str] = set()
+        for v in vals:
+            k = (v or "").strip().lower()
+            if not k:
+                continue
+            out.add(CANON.get(k, v.strip()))
+        return out
+
+    mod["FeatureRecord"] = _FR
+    mod["render_header"] = _render_header
+    mod["render_feature_markdown"] = _render_feature_markdown
+    mod["normalize_clouds"] = _normalize_clouds
+    return mod
 
 
-def _row_to_feature(row: dict[str, str]) -> FeatureRecord:
+_rt = _try_import_report_templates()
+FeatureRecord = _rt["FeatureRecord"]
+render_header = _rt["render_header"]
+render_feature_markdown = _rt["render_feature_markdown"]
+normalize_clouds = _rt["normalize_clouds"]
+
+
+# --- utilities --------------------------------------------------------------
+
+def _split_csv_like(s: str | None) -> list[str]:
+    if not s:
+        return []
+    raw = s.replace("|", ",").replace(";", ",")
+    items = [t.strip() for t in raw.split(",")]
+    return [t for t in items if t]
+
+
+def _parse_date_soft(s: str | None) -> Optional[dt.date]:
+    if not s:
+        return None
+    s = s.strip()
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%Y-%m", "%Y/%m", "%b %d %Y", "%b %Y"):
+        try:
+            d = dt.datetime.strptime(s, fmt)
+            return d.date()
+        except Exception:
+            continue
+    return None
+
+
+def _date_in_window(d: Optional[dt.date], *, since: Optional[dt.date], months: Optional[int]) -> bool:
+    if not since and not months:
+        return True
+    if not d:
+        return False
+    if since and d < since:
+        return False
+    if months:
+        cutoff = dt.date.today() - dt.timedelta(days=months * 30)
+        if d < cutoff:
+            return False
+    return True
+
+
+def _map_row_to_record(row: dict[str, str]) -> FeatureRecord:
     """
-    Convert a CSV row (with headers like PublicId, Product_Workload, Cloud_instance, etc.)
-    into a FeatureRecord. Handles common header variants and normalizes clouds.
+    Map the CSV (which may use Title/PublicId/Cloud_instance/etc.) to our FeatureRecord (snake_case).
+    Be tolerant of missing fields.
     """
-    def g(*names: str) -> str:
-        for n in names:
-            if n in row and row[n] is not None:
-                v = str(row[n]).strip()
-                if v:
-                    return v
-        return ""
+    def g(keys: Sequence[str], default: str = "") -> str:
+        for k in keys:
+            if k in row and row[k] is not None:
+                return row[k]
+        return default
 
-    # Public ID (required-ish; empty rows are skipped by caller)
-    public_id = g("PublicId", "public_id", "Id", "ID")
+    public_id = g(["PublicId", "public_id", "Id", "RoadmapId"]).strip()
+    title = g(["Title", "title"]).strip() or f"[{public_id}]"
+    product = g(["Product_Workload", "product", "Workload"]).strip()
+    status = g(["Status", "status"]).strip()
+    last_modified = g(["LastModified", "last_modified"]).strip()
+    release_date = g(["ReleaseDate", "release_date"]).strip()
+    cloud_raw = g(["Cloud_instance", "cloud", "Clouds"]).strip()
+    roadmap_link = g(["Official_Roadmap_link", "roadmap_link", "RoadmapLink"]).strip()
+    message_id = g(["MessageId", "message_id"]).strip()
+    source = g(["Source", "source"]).strip()
 
-    # Clouds: split on common separators then normalize to canonical short names
-    clouds_raw = g("Cloud_instance", "Clouds", "Cloud", "CloudInstance")
-    cloud_tokens: list[str] = []
-    if clouds_raw:
-        cloud_tokens = [t.strip() for t in re.split(r"[|,;/]+", clouds_raw) if t.strip()]
-    clouds_norm = list(normalize_clouds(cloud_tokens)) if cloud_tokens else []
+    clouds: Set[str] = set()
+    if cloud_raw:
+        clouds = normalize_clouds(cloud_raw)
+
+    # If we have an ID but no roadmap link, synthesize it.
+    if public_id and not roadmap_link:
+        roadmap_link = f"https://www.microsoft.com/microsoft-365/roadmap?filters=&searchterms={public_id}"
 
     return FeatureRecord(
         public_id=public_id,
-        title=g("Title", "title", "Name"),
-        product=g("Product_Workload", "Product", "Workload"),
-        status=g("Status"),
-        clouds=clouds_norm,
-        last_modified=g("LastModified", "Last Modified", "Modified"),
-        release_date=g("ReleaseDate", "Release Date"),
-        source=g("Source"),
-        message_id=g("MessageId", "Message ID", "MC_ID", "MCId"),
-        roadmap_link=g("Official_Roadmap_link", "Roadmap", "RoadmapLink"),
+        title=title,
+        product=product,
+        status=status,
+        last_modified=last_modified,
+        release_date=release_date,
+        clouds=clouds,
+        roadmap_link=roadmap_link,
+        message_id=message_id,
+        source=source,
     )
 
 
 def _read_master_csv(path: str) -> list[FeatureRecord]:
-    def _get(rec: dict[str, str], *names: str) -> str:
-        # try exact keys first
-        for n in names:
-            if n in rec and rec[n] is not None:
-                v = str(rec[n]).strip()
-                if v:
-                    return v
-        # fallback: case-insensitive
-        lower = {k.lower(): k for k in rec.keys()}
-        for n in names:
-            k = lower.get(n.lower())
-            if k:
-                v = str(rec[k] or "").strip()
-                if v:
-                    return v
-        return ""
-
     rows: list[FeatureRecord] = []
-    with open(path, newline="", encoding="utf-8") as f:
-        rdr = csv.DictReader(f)
-        for rec in rdr:
-            public_id = _get(rec, "PublicId", "public_id", "Id")
-            title = _get(rec, "Title", "title") or (f"[{public_id}]" if public_id else "")
-            product = _get(rec, "Product_Workload", "Product", "Workload", "product")
-            status = _get(rec, "Status", "status")
-            last_modified = _get(rec, "LastModified", "last_modified")
-            release_date = _get(rec, "ReleaseDate", "release_date")
-            source = _get(rec, "Source", "source") or "graph"
-            message_id = _get(rec, "MessageId", "message_id")
-            roadmap_link = _get(
-                rec, "Official_Roadmap_link", "official_roadmap_link", "Roadmap", "roadmap_link"
-            )
-
-            clouds_raw = _get(rec, "Cloud_instance", "Clouds")
-            if clouds_raw:
-                parts = [p.strip() for p in re.split(r"[|,;/]+", clouds_raw) if p.strip()]
-                try:
-                    clouds = sorted(normalize_clouds(parts))
-                except Exception:
-                    clouds = parts
-            else:
-                # IMPORTANT: treat blank as General
-                clouds = ["General"]
-
-            rows.append(
-                FeatureRecord(
-                    public_id=public_id,
-                    title=title,
-                    product=product,
-                    status=status,
-                    last_modified=last_modified,
-                    release_date=release_date,
-                    clouds=clouds,
-                    roadmap_link=roadmap_link,
-                    source=source,
-                    message_id=message_id,
-                )
-            )
-
-    # tiny debug breadcrumb
-    print(f"[gen] read={len(rows)} from {path}", file=sys.stderr)
-    return rows
-
-
-
-    rows: List[FeatureRecord] = []
     with open(path, "r", encoding="utf-8", newline="") as f:
         rdr = csv.DictReader(f)
-        for r in rdr:
-            # Be tolerant of missing columns
-            def g(k: str) -> str:
-                v = r.get(k)
-                return (v or "").strip()
-
-            rows.append(
-                FeatureRecord(
-                    PublicId=g("PublicId"),
-                    Title=g("Title"),
-                    Source=g("Source"),
-                    Product_Workload=g("Product_Workload"),
-                    Status=g("Status"),
-                    LastModified=g("LastModified"),
-                    ReleaseDate=g("ReleaseDate"),
-                    Cloud_instance=g("Cloud_instance"),
-                    Official_Roadmap_link=g("Official_Roadmap_link"),
-                    MessageId=g("MessageId"),
-                )
-            )
+        for row in rdr:
+            try:
+                rows.append(_map_row_to_record(row))
+            except Exception:
+                # Skip malformed lines, but don't crash the report
+                continue
+    print(f"[gen] read={len(rows)} from {path}")
     return rows
 
 
-# ----------------------------
-# Filters & helpers
-# ----------------------------
-
-def _cloud_display_from_args(clouds: Optional[Sequence[str]]) -> str:
-    """
-    Produce a compact cloud label for the report header.
-    If blank/None → 'General'. If only Worldwide → 'General'. Else CSV of clouds.
-    """
+def _filter_by_cloud(rows: Sequence[FeatureRecord], clouds: Sequence[str] | None) -> list[FeatureRecord]:
     if not clouds:
-        return "General"
-    # Preserve order, remove dups
-    uniq = list(dict.fromkeys([c for c in clouds if c and c.strip()]))
-    if not uniq:
-        return "General"
-    if len(uniq) == 1 and uniq[0] == "Worldwide (Standard Multi-Tenant)":
-        return "General"
-    return ", ".join(uniq)
-
-
-def _filter_by_cloud(rows: list[FeatureRecord], clouds: Sequence[str] | None) -> list[FeatureRecord]:
-    """
-    Filter FeatureRecord objects by cloud. Prefers the pre-parsed FeatureRecord.clouds (list[str]).
-    Falls back to parsing a Cloud_instance string if present (for legacy/mixed inputs).
-    """
-    if not clouds:
-        return rows
-
-    # Build canonical include set from the requested clouds
-    include: set[str] = set()
-    for c in clouds:
-        if not c:
-            continue
-        try:
-            canon = normalize_clouds([c])  # modern signature returns set[str]
-        except TypeError:
-            canon = normalize_clouds(c)    # tolerate older signature
-        if isinstance(canon, set):
-            include |= {s.strip() for s in canon if s.strip()}
-        elif isinstance(canon, str):
-            if canon.strip():
-                include.add(canon.strip())
-
-    if not include:
-        return rows
-
-    def row_clouds(r: FeatureRecord) -> set[str]:
-        # Preferred: FeatureRecord.clouds already normalized upstream
-        cl = getattr(r, "clouds", None)
-        if cl:
-            return set(cl)
-
-        # Fallback: parse a raw Cloud_instance if present (legacy rows)
-        raw = ""
-        if isinstance(r, dict):  # super defensive if any dict sneaks in
-            raw = str(r.get("Cloud_instance", "")).strip()
-        else:
-            raw = str(getattr(r, "Cloud_instance", "") or "").strip()
-
-        if not raw:
-            return set()
-
-        # Split common separators and normalize
-        parts = [p.strip() for p in re.split(r"[|,;/]+", raw) if p.strip()]
-        try:
-            return set(normalize_clouds(parts))  # type: ignore[arg-type]
-        except Exception:
-            return set(parts)
-
-    return [r for r in rows if row_clouds(r) & include]
-def _filter_by_cloud(rows: list[FeatureRecord], clouds: Sequence[str] | None) -> list[FeatureRecord]:
-    if not clouds:
-        return rows
-
-    include: set[str] = set()
-    for c in clouds:
-        if not c:
-            continue
-        try:
-            canon = normalize_clouds([c])
-        except TypeError:
-            canon = normalize_clouds(c)  # tolerate older signatures
-        if isinstance(canon, set):
-            include |= {s for s in canon if s}
-        elif isinstance(canon, str) and canon.strip():
-            include.add(canon.strip())
-
-    if not include:
-        return rows
-
-    def row_clouds(r: FeatureRecord) -> set[str]:
-        cl = getattr(r, "clouds", None)
-        if cl:
-            return set([s for s in cl if s])
-
-        # ultra-defensive legacy fallback
-        raw = getattr(r, "Cloud_instance", "") or ""
-        if not raw:
-            return {"General"}  # IMPORTANT: blank → General
-        parts = [p.strip() for p in re.split(r"[|,;/]+", raw) if p.strip()]
-        try:
-            return set(normalize_clouds(parts))
-        except Exception:
-            return set(parts)
-
-    out = [r for r in rows if row_clouds(r) & include]
-    print(f"[gen] after cloud filter ({sorted(include)}): {len(out)}", file=sys.stderr)
-    return out
-
-
-
-def _parse_products_arg(products: Optional[str]) -> List[str]:
-    """
-    Accept comma or pipe delimited. Blank → [] (means 'all').
-    """
-    if not products:
-        return []
-    raw = [t.strip() for t in products.replace("|", ",").split(",")]
-    return [t for t in raw if t]
-
-
-def _filter_by_products(rows: list[FeatureRecord], products_csv: str | None) -> list[FeatureRecord]:
-    if not products_csv:
-        return rows
-    wanted = {p.strip().lower() for p in re.split(r"[|,;]+", products_csv) if p.strip()}
-    if not wanted:
-        return rows
-
-    def match(r: FeatureRecord) -> bool:
-        hay = (r.product or "").lower()
-        return any(tok in hay for tok in wanted)
-
-    out = [r for r in rows if match(r)]
-    print(f"[gen] after product filter ({sorted(wanted)}): {len(out)}", file=sys.stderr)
-    return out
-
-
-def _parse_forced_ids(s: Optional[str]) -> List[str]:
-    if not s:
-        return []
-    return [t.strip() for t in s.split(",") if t.strip()]
-
-
-def _synthesize_row(public_id: str) -> FeatureRecord:
-    link = f"https://www.microsoft.com/microsoft-365/roadmap?filters=&searchterms={public_id}"
-    return FeatureRecord(
-        PublicId=public_id,
-        Title=f"[{public_id}]",
-        Source="manual",
-        Product_Workload="",
-        Status="",
-        LastModified="",
-        ReleaseDate="",
-        Cloud_instance="",
-        Official_Roadmap_link=link,
-        MessageId="",
-    )
-
-
-def _apply_forced_ids(rows: Sequence[FeatureRecord], forced_ids: Sequence[str]) -> List[FeatureRecord]:
-    """
-    Order results by forced_ids; synthesize rows for any ID not found in master.
-    If forced_ids is empty, return rows unchanged.
-    """
-    if not forced_ids:
         return list(rows)
-    by_id = {r.PublicId: r for r in rows}
-    ordered: List[FeatureRecord] = []
-    seen = set()
-    for pid in forced_ids:
-        rec = by_id.get(pid)
-        if rec:
-            ordered.append(rec)
-            seen.add(pid)
-        else:
-            ordered.append(_synthesize_row(pid))
-    # Optionally append the rest (not in forced list). Here we keep only the forced set.
-    return ordered
+    selected: Set[str] = normalize_clouds(clouds)
+    if not selected:
+        return list(rows)
+
+    def include(rec: FeatureRecord) -> bool:
+        if not rec.clouds:
+            # Treat items with no cloud stamped as eligible (common in CSV)
+            return True
+        return bool(rec.clouds & selected)
+
+    out = [r for r in rows if include(r)]
+    disp = sorted(selected)
+    print(f"[gen] after cloud filter ({disp}): {len(out)}")
+    return out
 
 
-# ----------------------------
-# AI & deterministic sections
-# ----------------------------
+def _filter_by_products(rows: Sequence[FeatureRecord], products: Sequence[str] | None) -> list[FeatureRecord]:
+    tokens = [t.lower() for t in (products or []) if t.strip()]
+    if not tokens:
+        return list(rows)
 
-def _ai_available(args) -> bool:
-    return (not args.ai_off) and bool(os.getenv("OPENAI_API_KEY"))
+    def matches(r: FeatureRecord) -> bool:
+        hay = f"{r.product} {r.title}".lower()
+        return any(t in hay for t in tokens)
+
+    out = [r for r in rows if matches(r)]
+    print(f"[gen] after product filter ({tokens}): {len(out)}")
+    return out
 
 
-def _rule_based_sections(rec: FeatureRecord) -> tuple[str, str, str, str]:
-    title = rec.Title or f"[{rec.PublicId}]"
-    product = rec.Product_Workload or "Microsoft 365"
-    status = rec.Status or "—"
-    clouds = rec.Cloud_instance or "General"
-    lm = rec.LastModified or "—"
-    rel = rec.ReleaseDate or "—"
+def _filter_by_time(rows: Sequence[FeatureRecord], *, since: Optional[str], months: Optional[int]) -> list[FeatureRecord]:
+    d_since = _parse_date_soft(since) if since else None
+    out: list[FeatureRecord] = []
+    for r in rows:
+        # Prefer LastModified; fallback to ReleaseDate
+        d = _parse_date_soft(r.last_modified) or _parse_date_soft(r.release_date)
+        if _date_in_window(d, since=d_since, months=months):
+            out.append(r)
+    if d_since or months:
+        print(f"[gen] after time filter (since={d_since}, months={months}): {len(out)}")
+    return out
+
+
+def _rule_based_sections(rec: FeatureRecord) -> dict[str, str]:
+    """Readable defaults for AI-like sections."""
+    rid = rec.public_id
+    title = rec.title or f"[{rid}]"
+    product = rec.product or "Microsoft 365"
+    status = rec.status or "—"
+    clouds = ", ".join(sorted(rec.clouds)) if getattr(rec, "clouds", None) else "—"
+    last_mod = rec.last_modified or "—"
+    rel = rec.release_date or "—"
+    source = rec.source or "—"
+
+    updated_hint = "updated" in title.lower()
+    is_teams = "teams" in product.lower()
+    is_sharepoint = ("sharepoint" in product.lower()) or ("onedrive" in product.lower())
+    is_outlook = ("outlook" in product.lower()) or ("exchange" in product.lower())
+    is_purview = "purview" in product.lower()
+    is_viva = "viva" in product.lower()
 
     summary = (
-        f"{product}: **{title}**.\n"
-        f"This roadmap item is tracked under PublicId {rec.PublicId}. "
-        f"Current status: {status}. Cloud: {clouds}. "
-        f"Last modified {lm}; target/release date {rel}."
+        f"{product}: {title}."
+        f"{' (Updated)' if updated_hint else ''} "
+        f"Status: {status}. Clouds: {clouds}. "
+        f"Last modified: {last_mod}; planned release: {rel}. Source: {source}."
+    ).strip()
+
+    changes_bits: list[str] = []
+    if updated_hint:
+        changes_bits.append("This roadmap item has been updated since its original posting.")
+    if is_teams:
+        changes_bits.append("The change affects Microsoft Teams meeting/chat/channel experiences.")
+    if is_sharepoint:
+        changes_bits.append("The change impacts SharePoint/OneDrive content and file experiences.")
+    if is_outlook:
+        changes_bits.append("The change impacts Outlook/Exchange mail and calendar experiences.")
+    if is_purview:
+        changes_bits.append("This concerns compliance, governance, or data security scenarios in Purview.")
+    if is_viva:
+        changes_bits.append("This affects employee experience modules in Microsoft Viva.")
+    if not changes_bits:
+        changes_bits.append("This is a feature/update tracked in the Microsoft 365 roadmap.")
+    changes = " ".join(changes_bits)
+
+    impact_bits: list[str] = []
+    if is_teams:
+        impact_bits.append("Users may notice UI or behavior changes in Teams; update training as needed.")
+    if is_sharepoint:
+        impact_bits.append("Admins/content owners should validate sharing, file handling, and site templates.")
+    if is_outlook:
+        impact_bits.append("Communicate changes to mail/calendar behaviors and consider Outlook policy impacts.")
+    if is_purview:
+        impact_bits.append("Review DLP/retention/sensitivity policies for side effects and required updates.")
+    if not impact_bits:
+        impact_bits.append("Assess change management needs and adjust communications if end-user experience changes.")
+    impact = " ".join(impact_bits)
+
+    actions_bits: list[str] = []
+    actions_bits.append("Track rollout via the official roadmap link and any related Message center posts.")
+    if is_teams or is_sharepoint or is_outlook:
+        actions_bits.append("Validate tenant policies/configuration in a test ring before broad rollout.")
+    if is_purview:
+        actions_bits.append("Evaluate compliance posture and update policies as appropriate.")
+    actions_bits.append("Prepare short end-user and helpdesk notes for awareness.")
+    actions = " ".join(actions_bits)
+
+    return {"summary": summary, "changes": changes, "impact": impact, "actions": actions}
+
+
+def _synthesize_placeholder(fid: str) -> FeatureRecord:
+    return FeatureRecord(
+        public_id=fid,
+        title=f"[{fid}]",
+        product="",
+        status="",
+        last_modified="",
+        release_date="",
+        clouds=set(),
+        roadmap_link=f"https://www.microsoft.com/microsoft-365/roadmap?filters=&searchterms={fid}",
+        message_id="",
+        source="seed",
     )
 
-    changes = (
-        "Feature work is progressing based on roadmap telemetry and message center updates. "
-        "Naming and scope may evolve as Microsoft ships iterative improvements."
-    )
 
-    impact = (
-        "Low operational impact for most tenants during initial rollout. "
-        "Expect gradual enablement via service-side flighting; timelines depend on ring and cloud. "
-        "Admins should validate any policy side-effects in pilot rings."
-    )
-
-    actions = (
-        "• Communicate the change to affected users/stakeholders.\n"
-        "• Validate tenant- or workload-level policies that may influence rollout.\n"
-        "• Update training/runbooks once the feature is observed in your tenant.\n"
-        "• If applicable, monitor the related Message center post by MessageId."
-    )
-    return summary, changes, impact, actions
-
-
-def _ai_sections(args, rec: FeatureRecord) -> Optional[tuple[str, str, str, str]]:
-    if not _ai_available(args):
-        return None
-    try:
-        from openai import OpenAI  # type: ignore[import-not-found]
-        client = OpenAI()
-        prompt = dedent(f"""
-        Summarize this Microsoft 365 Roadmap item for an IT admin audience.
-        Return four short sections titled exactly:
-        Summary, What’s changing, Impact and rollout, Action items.
-
-        PublicId: {rec.PublicId}
-        Title: {rec.Title}
-        Product/Workload: {rec.Product_Workload}
-        Status: {rec.Status}
-        Cloud(s): {rec.Cloud_instance}
-        Last Modified: {rec.LastModified}
-        Release Date: {rec.ReleaseDate}
-        Official Link: {rec.Official_Roadmap_link}
-        Message Center Id: {rec.MessageId}
-
-        Keep each section 1–3 sentences. Avoid marketing fluff.
-        """).strip()
-
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-        )
-        text = (resp.choices[0].message.content or "").strip()
-        if not text:
-            return None
-
-        sections = {"summary": "", "changes": "", "impact": "", "actions": ""}
-        current = None
-        for line in text.splitlines():
-            l = line.strip()
-            key = None
-            if l.lower().startswith("summary"):
-                key = "summary"
-            elif l.lower().startswith("what’s changing") or l.lower().startswith("whats changing") or l.lower().startswith("what's changing"):
-                key = "changes"
-            elif l.lower().startswith("impact and rollout"):
-                key = "impact"
-            elif l.lower().startswith("action items"):
-                key = "actions"
-
-            if key:
-                current = key
-                colon = l.find(":")
-                if colon >= 0 and colon < len(l) - 1:
-                    sections[key] = l[colon + 1 :].strip()
-                else:
-                    sections[key] = ""
-            elif current:
-                sections[current] += ("\n" if sections[current] else "") + l
-
-        if not any(sections.values()):
-            return None
-
-        return (
-            sections.get("summary") or "",
-            sections.get("changes") or "",
-            sections.get("impact") or "",
-            sections.get("actions") or "",
-        )
-    except Exception:
-        return None
-
-
-# ----------------------------
-# CLI
-# ----------------------------
-
-def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser()
-    p.add_argument("--title", required=True)
-    p.add_argument("--master", required=True, help="Path to *_master.csv produced by fetch step")
-    p.add_argument("--out", required=True, help="Output markdown path")
-    p.add_argument("--since")
-    p.add_argument("--months")
-    p.add_argument("--cloud", action="append", help="Repeatable cloud label filter")
-    p.add_argument("--products", help="Comma/pipe separated product/workload filter; blank = all")
-    p.add_argument("--forced-ids", help="Comma-separated exact PublicIds to include/order; will synthesize if missing")
-    p.add_argument("--ai-off", action="store_true", help="Disable AI deep-dive summaries")
-    return p.parse_args()
-
-
-# ----------------------------
-# Main
-# ----------------------------
+# --- main -------------------------------------------------------------------
 
 def main() -> None:
-    args = _parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--title", required=True, help="Report title")
+    ap.add_argument("--master", required=True, help="Input master CSV")
+    ap.add_argument("--out", required=True, help="Output markdown path")
+    ap.add_argument("--since", default="", help="Only include items on/after YYYY-MM-DD")
+    ap.add_argument("--months", type=int, default=None, help="Only include items within last N months")
+    ap.add_argument("--cloud", action="append", help="Cloud display (e.g., 'Worldwide (Standard Multi-Tenant)', 'GCC')", default=None)
+    ap.add_argument("--products", default="", help="Comma/pipe separated product filter (e.g., Teams,SharePoint)")
+    ap.add_argument("--forced-ids", default="", help="Comma-separated PublicId list to force/include (ordered)")
+    args = ap.parse_args()
 
     all_rows = _read_master_csv(args.master)
 
-    # Filter by cloud/products
+    # Time & cloud filters
+    all_rows = _filter_by_time(all_rows, since=args.since or None, months=args.months)
     rows = _filter_by_cloud(all_rows, args.cloud)
-    rows = _filter_by_products(rows, args.products)
 
-    all_rows = _read_master_csv(args.master)
-    rows = _filter_by_cloud(all_rows, args.cloud)
-    rows = _filter_by_products(rows, args.products)
-    print(f"[gen] final row count: {len(rows)}", file=sys.stderr)
+    # Product filter
+    rows = _filter_by_products(rows, _split_csv_like(args.products))
 
+    # Forced IDs: ensure presence and exact ordering
+    forced_list = _split_csv_like(args.forced_ids)
+    forced_set = set(forced_list)
+    if forced_list:
+        # Build index of existing rows
+        by_id = {r.public_id: r for r in rows}
+        synthesized: list[FeatureRecord] = []
+        for fid in forced_list:
+            synthesized.append(by_id.get(fid) or _synthesize_placeholder(fid))
+        # Append the rest (excluding any that are already in forced list)
+        remainder = [r for r in rows if r.public_id not in forced_set]
+        rows = synthesized + remainder
 
-    # Forced IDs ordering/synthesis
-    forced_ids = _parse_forced_ids(args.forced_ids)
-    if forced_ids:
-        rows = _apply_forced_ids(rows, forced_ids)
+    print(f"[gen] final row count: {len(rows)}")
 
-    # Header + body
-    generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    cloud_display = _cloud_display_from_args(args.cloud)
+    # Cloud display for header
+    selected_clouds = normalize_clouds(args.cloud or [])
+    cloud_display = ", ".join(sorted(selected_clouds)) if selected_clouds else "All"
 
-    parts: List[str] = [
-        render_header(title=args.title, generated_utc=generated, cloud_display=cloud_display)
-    ]
+    generated = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
+    # Build markdown
+    parts: list[str] = []
+    parts.append(render_header(title=args.title, generated_utc=generated, cloud_display=cloud_display))
     parts.append(f"\nTotal features: {len(rows)}\n")
 
     for rec in rows:
-        ai = _ai_sections(args, rec)
-        if ai is None:
-            ai = _rule_based_sections(rec)
-        summary, changes, impact, actions = ai
-        parts.append(
-            render_feature_markdown(
-                rec,
-                summary=summary,
-                changes=changes,
-                impact=impact,
-                actions=actions,
-            )
-        )
+        ai = _rule_based_sections(rec)
+        parts.append(render_feature_markdown(rec, ai_sections=ai))
 
-    md = "\n\n".join(parts).rstrip() + "\n"
-    with open(args.out, "w", encoding="utf-8", newline="") as f:
+    md = "\n".join(parts).rstrip() + "\n"
+    os.makedirs(os.path.dirname(args.out), exist_ok=True)
+    with open(args.out, "w", encoding="utf-8") as f:
         f.write(md)
-
-    print(f"Wrote report: {args.out} (features={len(rows)})")
+    print(f"[gen] wrote: {args.out} (features={len(rows)})")
 
 
 if __name__ == "__main__":
