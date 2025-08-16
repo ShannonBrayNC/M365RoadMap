@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from textwrap import dedent
 from typing import Iterable, List, Optional, Sequence
 import re
+from typing import Sequence
 
 # We rely on your shared templates/utilities
 # FeatureRecord is the row model; render_header and render_feature_markdown produce MD
@@ -134,22 +135,53 @@ def _cloud_display_from_args(clouds: Optional[Sequence[str]]) -> str:
     return ", ".join(uniq)
 
 
-def _filter_by_cloud(rows: Sequence[FeatureRecord], selected_clouds: Optional[Sequence[str]]) -> List[FeatureRecord]:
-    if not selected_clouds:
-        return list(rows)
-    selected = set([c.strip() for c in selected_clouds if c and c.strip()])
-    if not selected:
-        return list(rows)
-    out: List[FeatureRecord] = []
-    for r in rows:
-        c = (r.Cloud_instance or "").strip()
+def _filter_by_cloud(rows: list[FeatureRecord], clouds: Sequence[str] | None) -> list[FeatureRecord]:
+    """
+    Filter FeatureRecord objects by cloud. Prefers the pre-parsed FeatureRecord.clouds (list[str]).
+    Falls back to parsing a Cloud_instance string if present (for mixed inputs).
+    """
+    if not clouds:
+        return rows
+
+    # Build canonical include set from the requested clouds
+    include: set[str] = set()
+    for c in clouds:
         if not c:
-            # keep untagged items if Worldwide/General is in the filter
-            if "Worldwide (Standard Multi-Tenant)" in selected:
-                out.append(r)
-        elif c in selected:
-            out.append(r)
-    return out
+            continue
+        try:
+            canon = normalize_clouds([c])  # modern signature returns set[str]
+        except TypeError:
+            canon = normalize_clouds(c)    # older signature might accept str
+        if isinstance(canon, set):
+            include |= {s.strip() for s in canon if s.strip()}
+        elif isinstance(canon, str):
+            include.add(canon.strip())
+
+    if not include:
+        return rows
+
+    def row_clouds(r: FeatureRecord) -> set[str]:
+        # Preferred: FeatureRecord.clouds
+        cl = getattr(r, "clouds", None)
+        if cl:
+            return set(cl)
+
+        # Fallback: parse a raw Cloud_instance value if present (for legacy/mixed rows)
+        raw = ""
+        if isinstance(r, dict):
+            raw = str(r.get("Cloud_instance", "")).strip()
+        else:
+            raw = str(getattr(r, "Cloud_instance", "") or "").strip()
+        if not raw:
+            return set()
+        parts = [p.strip() for p in re.split(r"[|,;/]+", raw) if p.strip()]
+        try:
+            return set(normalize_clouds(parts))  # type: ignore[arg-type]
+        except Exception:
+            return set(parts)
+
+    return [r for r in rows if row_clouds(r) & include]
+
 
 
 def _parse_products_arg(products: Optional[str]) -> List[str]:
