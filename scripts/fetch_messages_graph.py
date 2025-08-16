@@ -6,15 +6,15 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
-import datetime as dt
+import datetime as date, datetime, dt
 import json
 import os
 import re
 import sys
-from dataclasses import dataclass, asdict
+import json
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
-
+from typing import Any, Iterable, Sequence
 import requests
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -343,8 +343,23 @@ def write_csv(path: str | Path, rows: list[Row]) -> None:
 def write_json(path: str | Path, rows: list[Row]) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
+
+    def _serialize(v: Any) -> Any:
+        if v is None:
+            return ""
+        if isinstance(v, (date, datetime)):
+            return v.isoformat()
+        return v
+
+    payload: list[dict[str, Any]] = []
+    for r in rows:
+        # Support both dataclass rows and plain objects
+        raw = asdict(r) if is_dataclass(r) else vars(r)
+        # Emit only the fields in FIELD_ORDER (fill missing with "")
+        payload.append({k: _serialize(raw.get(k, "")) for k in FIELD_ORDER})
+
     with p.open("w", encoding="utf-8") as f:
-        json.dump([{k: asdict(re).get(k, "") for k in FIELD_ORDER}], f, indent=2)
+        json.dump(payload, f, indent=2, ensure_ascii=False)
 
 
 # ---------- MAIN ----------
