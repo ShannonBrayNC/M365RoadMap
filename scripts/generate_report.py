@@ -59,6 +59,53 @@ except Exception:
 
 
 
+# --- Rendering helpers import (with fallback) --------------------------------
+try:
+    # Prefer the shared implementations
+    from report_templates import render_header, render_feature_markdown  # type: ignore[attr-defined]
+except Exception:
+    # Minimal fallbacks so the script still runs end-to-end
+    def render_header(*, title: str, generated_utc: str, cloud_display: str) -> str:
+        # Matches the signature used by generate_report.py
+        lines = [
+            "# Roadmap Report",
+            f"Generated {generated_utc}",
+            "",
+            f"{title} Generated {generated_utc} Cloud filter: {cloud_display}",
+            "",
+        ]
+        return "\n".join(lines)
+
+    def render_feature_markdown(fr) -> str:
+        # Very lightweight rendering; replace with your rich template if desired
+        rid = fr.public_id
+        title = fr.title or f"[{rid}]"
+        product = fr.product or "—"
+        status = fr.status or "—"
+        clouds = ", ".join(fr.clouds) if getattr(fr, "clouds", None) else "—"
+        last_mod = fr.last_modified or "—"
+        rel = fr.release_date or "—"
+        src = fr.source or "—"
+        msg = fr.message_id or "—"
+        link = fr.roadmap_link or f"https://www.microsoft.com/microsoft-365/roadmap?filters=&searchterms={rid}"
+
+        body = [
+            f"[{rid}] {title}",
+            f"Product/Workload: {product}  Status: {status}  Cloud(s): {clouds}  "
+            f"Last Modified: {last_mod}  Release Date: {rel}  Source: {src}  "
+            f"Message ID: {msg}  Official Roadmap: {link}",
+            "",
+            "Summary (summary pending)",
+            "",
+            "What’s changing (details pending)",
+            "",
+            "Impact and rollout (impact pending)",
+            "",
+            "Action items (actions pending)",
+            "",
+        ]
+        return "\n".join(body)
+# -----------------------------------------------------------------------------
 
 
 def _row_to_feature(row: dict[str, str]) -> FeatureRecord:
