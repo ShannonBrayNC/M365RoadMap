@@ -22,7 +22,6 @@ import datetime as dt
 import json
 import os
 import re
-import stats
 import sys
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, Iterable, List, Match, Optional, Sequence, Set, Tuple, Union
@@ -534,85 +533,161 @@ def _debug_cfg(cfg: dict) -> None:
     print("pfx_b64 present:", bool(cfg.get("pfx_b64")))
     print("using password env:", cfg.get("pfx_password_env"))
 
+
+
 def main(argv: Optional[Sequence[str]] = None) -> None:
+    # ---- Parse args & load config -------------------------------------------------
     args = parse_args(argv)
     cfg = _load_cfg(args.config)
 
-    # Only dump debug if requested (avoid leaking secrets in normal runs)
+    # Optional, safe debug of config presence (no secrets printed)
     if os.environ.get("DEBUG_CFG", "").lower() in ("1", "true", "yes"):
-        _debug_cfg(cfg)
+        try:
+            with open(args.config, "r", encoding="utf-8") as _f:
+                _cfg_dbg = json.load(_f)
+            print("DEBUG cfg keys:", sorted(_cfg_dbg.keys()))
+            print(
+                "tenant?", bool(_cfg_dbg.get("tenant")),
+                "client?", bool(_cfg_dbg.get("client")),
+                "pfx_b64?", bool(_cfg_dbg.get("pfx_b64")),
+                "pwd_env?", _cfg_dbg.get("pfx_password_env"),
+            )
+        except Exception as _e:
+            print(f"DEBUG: failed reading cfg for debug: {_e}")
 
-    # Auto-fallback guard if Graph secrets are missing/invalid
+    # ---- Initialize source lists & stats ------------------------------------------
+    graph_rows: list[Row] = []
+    pub_rows:   list[Row] = []
+    rss_rows:   list[Row] = []
+    seed_rows:  list[Row] = []
+
+    stats: dict[str, Any] = {
+        "sources": {"graph": 0, "public-json": 0, "rss": 0, "seed": 0},
+        "errors": 0,
+    }
+
+    # ---- Clouds (canonical set) ---------------------------------------------------
+    selected_clouds: set[str] = set()
+    if args.cloud:
+        # args.cloud may be a list; normalize each and union into a canonical set
+        for c in args.cloud:
+            norm = normalize_clouds(c)  # returns a canonical label or a set of labels
+            if isinstance(norm, str):
+                selected_clouds.add(norm)
+            else:
+                selected_clouds |= set(norm)
+    # If none supplied, leave empty => no cloud filter at fetch stage;
+    # later include_by_cloud() will treat empty filter as "include all".
+
+    # ---- Graph (preferred) with auto-fallback guard --------------------------------
+    use_graph = not args.no_graph and _has_valid_graph_config(cfg)
     if not args.no_graph and not _has_valid_graph_config(cfg):
         print("INFO: Graph credentials missing/invalid → using public fallback only (as if --no-graph).")
         args.no_graph = True
+        use_graph = False
 
-    # Always try public sources
-    pub_rows = fetch_public_sources(cfg, args.since, args.months)
-    stats["sources"]["public-json"] = sum(1 for r in pub_rows if r.Source == "public-json")
-    stats["sources"]["rss"] = sum(1 for r in pub_rows if r.Source == "rss")
-    all_rows.extend(pub_rows)
-
-    # If still empty, seed from inputs / discovered files
-    merged = merge_sources(all_rows)
-    if not merged:
-        # 1) --seed-ids or PUBLIC_IDS env
-        raw_ids = args.seed_ids or os.environ.get("PUBLIC_IDS") or ""
-        ids = _parse_seed_ids(raw_ids)
-
-        # 2) discovered_ids*.csv
-        if not ids:
-            ids = _discover_ids_from_output_dir()
-
-        if ids:
-            seed_rows = _seed_rows_from_ids(ids)
-            stats["sources"]["seed"] = len(seed_rows)
-            merged = merge_sources(merged + seed_rows)
-
-    # Cloud filter (treat blank/None as General)
-    if selected:
-        merged = [r for r in merged if include_by_cloud(r.Cloud_instance, selected)]
-
-    # Date filters (soft)
-    if args.since:
+    if use_graph:
         try:
-            cutoff = dt.date.fromisoformat(args.since)
-            merged = [r for r in merged if (parse_date_soft(r.LastModified) or "") >= cutoff.isoformat()]
-        except Exception:
-            pass
+            # Import lazily so unit tests without Graph deps still run
+            from scripts.graph_client import GraphClient, GraphConfig  # type: ignore[import-not-found]
 
-    if args.months:
-        try:
-            today = dt.date.today()
-            delta_days = args.months * 30
-            cutoff2 = (today - dt.timedelta(days=delta_days)).isoformat()
-            merged = [r for r in merged if (parse_date_soft(r.LastModified) or "") >= cutoff2]
-        except Exception:
-            pass
+            gcfg = GraphConfig(
+                tenant=cfg.get("tenant", ""),
+                client=cfg.get("client", ""),
+                pfx_b64=cfg.get("pfx_b64", ""),
+                pfx_password_env=cfg.get("pfx_password_env", "M365_PFX_PASSWORD"),
+                authority_base=cfg.get("authority_base", "https://login.microsoftonline.com"),
+                graph_base=cfg.get("graph_base", "https://graph.microsoft.com"),
+            )
+            client = GraphClient(gcfg)
 
-    # Emit
-    write_emit(merged, args.emit, args.out)
+            # Fetch raw Graph items; helper should accept these filters (noop if None)
+            raw_graph = client.fetch_messages(
+                since=args.since, months=args.months, clouds=list(selected_clouds) or None
+            )
+            graph_rows = transform_graph_messages(raw_graph)  # normalize into Row[]
+        except Exception as e:
+            print(f"WARN: graph-fetch failed: {e}")
+            stats["errors"] += 1
+            graph_rows = []
 
-    # Stats
-    final_count = len(merged)
-    stats["final"] = final_count
-    print(f"Done. rows={final_count} sources={stats['sources']} errors={stats['errors']}")
+    # ---- Public fallbacks (only if configured) -------------------------------------
+    # JSON feed
+    try:
+        public_json_url = cfg.get("public_json_url") or ""
+        if public_json_url:
+            raw_pub = fetch_public_json(public_json_url, since=args.since, months=args.months)  # type: ignore[name-defined]
+            pub_rows = transform_public_items(raw_pub)  # Row[]
+    except Exception as e:
+        print(f"WARN: public-json fetch failed: {e}")
+        stats["errors"] += 1
+        pub_rows = []
+
+    # RSS feed
+    try:
+        public_rss_url = cfg.get("public_rss_url") or ""
+        if public_rss_url:
+            raw_rss = fetch_rss(public_rss_url, since=args.since, months=args.months)  # type: ignore[name-defined]
+            rss_rows = transform_rss(raw_rss)  # Row[]
+    except Exception as e:
+        print(f"WARN: rss fetch failed: {e}")
+        stats["errors"] += 1
+        rss_rows = []
+
+    # ---- Optional seed IDs (always allowed) ----------------------------------------
+    if args.seed_ids:
+        for tid in _split_csv_like(args.seed_ids):
+            tid = tid.strip()
+            if not tid:
+                continue
+            seed_rows.append(Row(
+                PublicId=tid,
+                Title=f"[{tid}]",
+                Source="seed",
+                Product_Workload="",
+                Status="",
+                LastModified="",
+                ReleaseDate="",
+                Cloud_instance="",
+                Official_Roadmap_link=f"https://www.microsoft.com/microsoft-365/roadmap?filters=&searchterms={tid}",
+                MessageId="",
+            ))
+
+    # ---- Merge & filter by cloud selection -----------------------------------------
+    # Merge preserves any de-duplication policy implemented by merge_sources()
+    merged_rows: list[Row] = merge_sources(graph_rows, pub_rows, rss_rows, seed_rows)
+
+    # Apply cloud filter (no-op if selected_clouds is empty)
+    merged_rows = [r for r in merged_rows if include_by_cloud(r, selected_clouds)]
+
+    # ---- Update stats & write outputs ----------------------------------------------
+    stats["sources"]["graph"]       = len(graph_rows)
+    stats["sources"]["public-json"] = len(pub_rows)
+    stats["sources"]["rss"]         = len(rss_rows)
+    stats["sources"]["seed"]        = len(seed_rows)
+
+    if args.emit == "csv":
+        write_csv(merged_rows, args.out)
+    elif args.emit == "json":
+        write_json(merged_rows, args.out)
 
     if args.stats_out:
         try:
-            os.makedirs(os.path.dirname(args.stats_out) or ".", exist_ok=True)
             with open(args.stats_out, "w", encoding="utf-8") as f:
-                json.dump(stats, f, ensure_ascii=False, indent=2)
-        except Exception:
-            print("WARN: failed to write stats_out")
+                json.dump(
+                    {
+                        "rows": len(merged_rows),
+                        "sources": stats["sources"],
+                        "errors": stats["errors"],
+                    },
+                    f,
+                    indent=2,
+                )
+        except Exception as e:
+            print(f"WARN: failed to write stats-out: {e}")
+            stats["errors"] += 1
 
-    # Debug directory listing
-    try:
-        out_dir = os.path.dirname(args.out) or "."
-        head = _safe_head(sorted(os.listdir(out_dir)), 10)
-        print(f"DEBUG: files in {out_dir}: {head}")
-    except Exception:
-        pass
+    print(f"Done. rows={len(merged_rows)} sources={stats['sources']} errors={stats['errors']}")
 
 
 if __name__ == "__main__":
