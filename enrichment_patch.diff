@@ -1,0 +1,151 @@
+*** Begin Patch
+*** Add File: scripts/enrich.py
++"""Enrichment helpers to fill Status, Release Date, Clouds, and AI Notes
++before HTML is generated.
++
++Usage:
++    from scripts.enrich import enrich_item
++    enriched = [enrich_item(it) for it in items]
++    # pass `enriched` to your renderer/template
++"""
++from __future__ import annotations
++from typing import Any, Dict, Iterable, List, Mapping, Set
++from datetime import datetime
++import re
++
++# We reuse normalization utilities from fetch_messages_graph if available.
++try:
++    from scripts.fetch_messages_graph import normalize_clouds, extract_clouds
++except Exception:  # pragma: no cover
++    # Minimal fallbacks so this module remains importable in isolation.
++    _SPLIT_RE = re.compile(r"[\,\|;/]+")
++    _CLOUD_SYNONYMS = {
++        "worldwide (standard multi-tenant)":"General", "worldwide":"General", "general":"General",
++        "gcc":"GCC", "gcc high":"GCC High", "gcch":"GCC High", "gcc-high":"GCC High", "dod":"DoD",
++        "government community cloud":"GCC",
++    }
++    def _split_cloud_tokens(val: str) -> List[str]:
++        return [p.strip() for p in _SPLIT_RE.split(val) if p.strip()]
++    def normalize_clouds(value: Any) -> Set[str]:
++        parts: List[str] = []
++        if value is None or value == "":
++            parts = []
++        elif isinstance(value, str):
++            parts = _split_cloud_tokens(value) if any(d in value for d in ",|;/") else [value.strip()]
++        elif isinstance(value, (list, tuple, set)):
++            for v in value:
++                if v is None: continue
++                sv = str(v)
++                parts.extend(_split_cloud_tokens(sv) if any(d in sv for d in ",|;/") else [sv.strip()])
++        else:
++            parts = [str(value).strip()]
++        out: Set[str] = set()
++        for p in parts or ["General"]:
++            key = p.lower()
++            out.add(_CLOUD_SYNONYMS.get(key, p if p else "General"))
++        return out
++    def extract_clouds(source: Any) -> Set[str]:
++        if isinstance(source, dict):
++            for k in ("clouds","cloud","Clouds","Cloud"):
++                if k in source:
++                    return normalize_clouds(source.get(k))
++            return {"General"}
++        return normalize_clouds(source)
++
++_STATUS_MAP = {
++    "launched": "Launched",
++    "rolling out": "Rolling out",
++    "in development": "In development",
++    "cancelled": "Cancelled",
++    "canceled": "Cancelled",
++}
++
++_DATE_KEYS = ("releaseDate", "release", "Release", "Release Date", "release_date", "targetRelease" )
++_STATUS_KEYS = ("status", "Status", "lifecycle", "Lifecycle" )
++_TITLE_KEYS = ("title","Title","subject")
++_PRODUCT_KEYS = ("product","Product","workload","Workload","category")
++
++_PARENS_PREFIX = re.compile(r"^\((updated|update)\)\s*", flags=re.I)
++
++def parse_release_date(it: Mapping[str, Any]) -> str:
++    for k in _DATE_KEYS:
++        if k in it and it[k]:
++            val = str(it[k])
++            # Try ISO or Y-m parsing; fallback to raw string
++            for fmt in ("%Y-%m-%d", "%Y-%m", "%Y/%m/%d", "%Y/%m"):
++                try:
++                    dt = datetime.strptime(val[:10], fmt) if len(val) >= len(fmt) else datetime.strptime(val, fmt)
++                    # Render as YYYY‑MM (roadmap usually month granularity)
++                    return dt.strftime("%Y-%m")
++                except Exception:
++                    pass
++            return val
++    return "—"
++
++def parse_status(it: Mapping[str, Any]) -> str:
++    for k in _STATUS_KEYS:
++        if k in it and it[k]:
++            raw = str(it[k]).strip()
++            key = raw.lower()
++            return _STATUS_MAP.get(key, raw)
++    return "—"
++
++def clean_title(s: str) -> str:
++    s = _PARENS_PREFIX.sub("", s or "").strip()
++    return s
++
++def make_ai_notes(it: Mapping[str, Any]) -> str:
++    """Heuristic, deterministic notes from title + product; no network/LLM calls.
++    Goal: one short sentence users can scan.
++    """
++    title = clean_title(str(next((it.get(k) for k in _TITLE_KEYS if it.get(k)), "")).strip())
++    product = str(next((it.get(k) for k in _PRODUCT_KEYS if it.get(k)), "")).strip()
++    if not title:
++        return "Auto-summary unavailable."
++
++    # Split "Product: change" pattern if present
++    if ":" in title:
++        left, right = [p.strip() for p in title.split(":", 1)]
++        # Prefer explicit left side as product if plausible
++        if not product and len(left.split()) <= 6:
++            product = left
++        change = right
++    else:
++        change = title
++
++    # Light rewrites
++    change = change.replace("Microsoft ", "").strip()
++
++    # Compose
++    if product:
++        note = f"Update to {product}: {change}."
++    else:
++        note = f"Update: {change}."
++    # Keep it concise
++    if len(note) > 220:
++        note = note[:217].rstrip() + "…"
++    return note
++
++def enrich_item(it: Mapping[str, Any]) -> Dict[str, Any]:
++    """Return a copy of the item with display-ready fields:
++        - status_display
++        - release_display
++        - clouds_display (sorted, comma-separated)
++        - ai_notes
++    """
++    status = parse_status(it)
++    release = parse_release_date(it)
++    clouds = extract_clouds(it) or {"General"}
++    clouds_display = ", ".join(sorted(clouds, key=lambda s: (s != "General", s)))  # General first
++    notes = make_ai_notes(it)
++
++    out = dict(it)  # shallow copy
++    out.update({
++        "status_display": status,
++        "release_display": release,
++        "clouds_display": clouds_display,
++        "ai_notes": notes,
++    })
++    return out
++
+*** End Patch
