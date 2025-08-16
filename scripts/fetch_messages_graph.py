@@ -20,6 +20,9 @@ import sys
 from dataclasses import dataclass, asdict, is_dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
+from cryptography.hazmat.primitives.serialization import pkcs12, Encoding, PrivateFormat, NoEncryption
+from cryptography.hazmat.primitives import hashes
+
 
 import datetime as dt  # keep alias `dt` used throughout
 
@@ -53,6 +56,40 @@ _CLOUD_MAP = {
     "gcch": "GCC High",
     "dod": "DoD",
 }
+
+def _load_msal_client_credential_from_pfx_b64(pfx_b64: str, pfx_password: str | None) -> dict[str, str]:
+    """
+    Convert a base64-encoded PFX + password into the MSAL client_credential dict:
+      {
+        "private_key": "<PEM string>",
+        "thumbprint": "<sha1 hex>",
+        "public_certificate": "<PEM string>"
+      }
+    """
+    if not pfx_b64:
+        raise ValueError("No PFX_B64 provided")
+
+    try:
+        pfx_bytes = base64.b64decode(pfx_b64)
+    except Exception as e:
+        raise RuntimeError(f"PFX base64 decode failed: {e}") from e
+
+    try:
+        key, cert, _chain = pkcs12.load_key_and_certificates(
+            pfx_bytes, None if pfx_password is None else pfx_password.encode("utf-8")
+        )
+        if key is None or cert is None:
+            raise RuntimeError("PFX contained no private key or certificate")
+
+        thumb_hex = cert.fingerprint(hashes.SHA1()).hex()  # MSAL wants hex string
+        private_pem = key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()).decode("ascii")
+        public_pem = cert.public_bytes(Encoding.PEM).decode("ascii")
+        return {"private_key": private_pem, "thumbprint": thumb_hex, "public_certificate": public_pem}
+    except Exception as e:
+        raise RuntimeError(f"PFX load failed: {e}") from e
+
+
+
 
 # ---------- Data model ----------
 
@@ -186,105 +223,58 @@ def include_by_cloud(cloud_field: str, selected: set[str]) -> bool:
 # ---------- Data sources ----------
 
 
-def _try_fetch_graph(
-    tenant: str,
-    client_id: str,
-    pfx_b64: str,
-    pfx_pass: str,
-    start_date: Optional[str],
-    months: Optional[int],
-    clouds: set[str],
-    graph_base: str = "https://graph.microsoft.com",
-) -> tuple[list[Row], Optional[str]]:
+def _try_fetch_graph(cfg: dict, clouds: set[str], since: str | None, months: str | None) -> tuple[list[Row], str | None]:
     """
-    Try to fetch via Graph. Returns (rows, error_message).
-    On failure, rows=[], error_message=<why>.
+    Attempt Graph fetch using certificate creds. On any error, return ([], <error>).
     """
-    if not tenant or not client_id or not pfx_b64 or not pfx_pass:
-        return [], "Graph credentials missing/invalid → using public fallback only (as if --no-graph)."
-
     try:
-        import msal  # type: ignore[import-not-found]
-        import requests  # type: ignore[import-not-found]
-    except Exception:
-        return [], "Graph client not available on this runner"
+        tenant = cfg.get("TENANT") or cfg.get("tenant_id") or cfg.get("tenant")
+        client_id = cfg.get("CLIENT") or cfg.get("client_id") or cfg.get("client")
+        pfx_b64 = cfg.get("PFX_B64") or cfg.get("pfx_base64") or os.environ.get("M365_PFX_BASE64")
+        # In your workflow you write "M365_PFX_PASSWORD":"M365_PFX_PASSWORD" into the config.
+        # That string is the *env var name*; resolve it here:
+        pwd_env_key = cfg.get("M365_PFX_PASSWORD") or "M365_PFX_PASSWORD"
+        pfx_password = os.environ.get(pwd_env_key)
 
-    # Build cert from base64 PFX
-    try:
-        pfx_bytes = base64.b64decode(pfx_b64.strip())
-    except Exception as ex:
-        return [], f"PFX decode error: {ex}"
+        if not tenant or not client_id or not pfx_b64:
+            return [], "Graph client not available on this runner"
 
-    # MSAL accepts certificate as dict with 'private_key'/'thumbprint' when you load the PKCS12.
-    # To keep this runner-friendly, we'll use msal's convenience with pfx directly (supported in msal>=1.16).
-    cert_cred = {"pfx": pfx_bytes, "password": pfx_pass}
-    app = msal.ConfidentialClientApplication(
-        client_id=client_id,
-        authority=f"https://login.microsoftonline.com/{tenant}",
-        client_credential=cert_cred,  # <-- this is the correct place (NOT requests)
-    )
+        # Build MSAL client_credential from the PFX
+        client_cred = _load_msal_client_credential_from_pfx_b64(pfx_b64, pfx_password)
 
-    scope = [f"{graph_base}/.default"]
-    try:
-        token_result = app.acquire_token_for_client(scopes=scope)
-    except Exception as ex:
-        return [], f"PFX/token error: {ex}"
+        authority_base = cfg.get("authority") or cfg.get("authority_base") or "https://login.microsoftonline.com"
+        authority = f"{authority_base.rstrip('/')}/{tenant}"
+        graph_base = (cfg.get("graph_base") or "https://graph.microsoft.com").rstrip("/")
 
-    if "access_token" not in token_result:
-        return [], f"Auth failed: {token_result.get('error_description') or token_result!r}"
-
-    access_token = token_result["access_token"]
-    ses = requests.Session()
-    ses.headers.update({"Authorization": f"Bearer {access_token}"})
-
-    # Minimal example query: Message center posts (admin service communications)
-    # For a real implementation, you’d add filter by dates/products as needed.
-    url = f"{graph_base}/v1.0/admin/serviceAnnouncement/messages"
-    params = {"$top": "50"}  # tweak as needed
-
-    try:
-        resp = ses.get(url, params=params, timeout=30)
-        if resp.status_code != 200:
-            return [], f"HTTP {resp.status_code}: {resp.text}"
-        data = resp.json()
-    except Exception as ex:
-        return [], f"Graph request failed: {ex}"
-
-    rows: list[Row] = []
-    for item in data.get("value", []):
-        # Map Graph message center fields -> our unified Row
-        # Fields vary; we defensively .get(...)
-        title = item.get("title") or ""
-        message_id = item.get("id") or ""
-        last_mod = item.get("lastModifiedDateTime") or ""
-        products = item.get("services", []) or item.get("products", [])
-        product_workload = ", ".join(sorted({str(x) for x in products if x})) if products else ""
-        # Extract roadmap id(s) if present in text
-        body = item.get("body", {}) or {}
-        content = body.get("content") or ""
-        matches = _RE_ROADMAP_ID.findall(content)
-        public_id = matches[0] if matches else ""
-        official_link = f"https://www.microsoft.com/microsoft-365/roadmap?filters=&searchterms={public_id}" if public_id else ""
-
-        # We don't get cloud instance in the message; leave blank (treated as General for filtering)
-        rows.append(
-            Row(
-                public_id=public_id,
-                title=title,
-                source="graph",
-                product_workload=product_workload,
-                status="",
-                last_modified=last_mod,
-                release_date="",
-                cloud_instance="",
-                official_roadmap_link=official_link,
-                message_id=message_id,
-            )
+        app = msal.ConfidentialClientApplication(
+            client_id=client_id,
+            authority=authority,
+            client_credential=client_cred,  # <-- proper MSAL format
         )
 
-    # Date range / cloud filter here if you want to pre-trim
-    return rows, None
+        token = app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
+        if "access_token" not in token:
+            # Return a short, useful message
+            short = token.get("error_description") or token.get("error") or "token acquisition failed"
+            return [], f"PFX/token error: {short}"
 
+        headers = {"Authorization": f"Bearer {token['access_token']}"}
+        # Example endpoint: Message center (latest messages)
+        # Adjust your query here (filters by timewindow/clouds handled in transform layer).
+        url = f"{graph_base}/v1.0/admin/serviceAnnouncement/messages?$top=200"
+        resp = requests.get(url, headers=headers, timeout=30)
+        if resp.status_code != 200:
+            return [], f"Graph HTTP {resp.status_code}: {resp.text}"
+
+        payload = resp.json()
+        items = payload.get("value", [])
+
+        # Transform into your Row objects using your existing transformer
+        rows = transform_graph_messages(items, clouds=clouds, since=since, months=months)
+        return rows, None
+
+    except Exception as e:
+        return [], f"graph-fetch failed: {e}"
 
 def _seed_rows_from_ids(ids_csv: str) -> list[Row]:
     rows: list[Row] = []
