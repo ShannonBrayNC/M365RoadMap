@@ -10,5 +10,6 @@ cryptography>=42.0.0
 openai>=1.40.0   # only needed if you enable --use-openai
 pytest>=8.2
 Markdown>=3.4.4
-
-
+streamlit>=1.37
+pandas>=2.1
+python-dateutil>=2.9
