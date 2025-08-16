@@ -11,63 +11,52 @@ from textwrap import dedent
 from typing import Iterable, List, Optional, Sequence
 import re
 from typing import Sequence
+import sys
 
-# We rely on your shared templates/utilities
-# FeatureRecord is the row model; render_header and render_feature_markdown produce MD
-from report_templates import FeatureRecord, render_feature_markdown, render_header  # type: ignore[import-not-found]
-
-
-# ----------------------------
-# CSV I/O
-# ----------------------------
-
-CSV_HEADERS = [
-    "PublicId",
-    "Title",
-    "Source",
-    "Product_Workload",
-    "Status",
-    "LastModified",
-    "ReleaseDate",
-    "Cloud_instance",
-    "Official_Roadmap_link",
-    "MessageId",
-]
-
-
-import re
-from typing import Sequence
-
-# Ensure we can import normalize_clouds from report_templates whether the file is
-# run as a script or via module. Also provide a tiny fallback if import fails.
+# normalize_clouds helper (import, with robust fallback)
 try:
     from report_templates import normalize_clouds
-except ModuleNotFoundError:
-    import os, sys
-    sys.path.append(os.path.dirname(__file__))
-    try:
-        from report_templates import normalize_clouds  # type: ignore
-    except Exception:
+except Exception:
+    def normalize_clouds(values: list[str] | str) -> set[str]:  # very small fallback
+        if isinstance(values, str):
+            values = [values]
+        canon = {
+            "worldwide (standard multi-tenant)": "General",
+            "general": "General",
+            "gcc": "GCC",
+            "gcc high": "GCC High",
+            "dod": "DoD",
+        }
+        out: set[str] = set()
+        for v in values or []:
+            k = (v or "").strip().lower()
+            out.add(canon.get(k, (v or "").strip()))
+        return out
 
 
-        # Very small local fallback – recognizes the 4 canonical clouds and "General"
-        def normalize_clouds(values: list[str] | str) -> set[str]:  # type: ignore[override]
-            if isinstance(values, str):
-                vals = [values]
-            else:
-                vals = values or []
-            canon_map = {
-                "general": "General",
-                "worldwide (standard multi-tenant)": "General",
-                "gcc": "GCC",
-                "gcc high": "GCC High",
-                "dod": "DoD",
-            }
-            out: set[str] = set()
-            for v in vals:
-                k = (v or "").strip().lower()
-                out.add(canon_map.get(k, (v or "").strip()))
-            return out
+# --- FeatureRecord import (with fallback) ------------------------------------
+try:
+    # Preferred: use the shared model from report_templates if present
+    from report_templates import FeatureRecord  # type: ignore[attr-defined]
+except Exception:
+    # Fallback: lightweight local definition that matches fields used here
+    from dataclasses import dataclass, field
+    from typing import List
+
+    @dataclass
+    class FeatureRecord:
+        public_id: str
+        title: str
+        product: str = ""
+        status: str = ""
+        last_modified: str = ""
+        release_date: str = ""
+        clouds: List[str] = field(default_factory=lambda: ["General"])
+        roadmap_link: str = ""
+        source: str = ""
+        message_id: str = ""
+# ---------------------------------------------------------------------------
+
 
 
 
@@ -110,18 +99,67 @@ def _row_to_feature(row: dict[str, str]) -> FeatureRecord:
 
 
 def _read_master_csv(path: str) -> list[FeatureRecord]:
+    def _get(rec: dict[str, str], *names: str) -> str:
+        # try exact keys first
+        for n in names:
+            if n in rec and rec[n] is not None:
+                v = str(rec[n]).strip()
+                if v:
+                    return v
+        # fallback: case-insensitive
+        lower = {k.lower(): k for k in rec.keys()}
+        for n in names:
+            k = lower.get(n.lower())
+            if k:
+                v = str(rec[k] or "").strip()
+                if v:
+                    return v
+        return ""
+
     rows: list[FeatureRecord] = []
-    with open(path, "r", encoding="utf-8", newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            # Skip fully empty lines
-            if not any((v or "").strip() for v in row.values()):
-                continue
-            fr = _row_to_feature(row)
-            if not fr.public_id:
-                # No usable ID — skip
-                continue
-            rows.append(fr)
+    with open(path, newline="", encoding="utf-8") as f:
+        rdr = csv.DictReader(f)
+        for rec in rdr:
+            public_id = _get(rec, "PublicId", "public_id", "Id")
+            title = _get(rec, "Title", "title") or (f"[{public_id}]" if public_id else "")
+            product = _get(rec, "Product_Workload", "Product", "Workload", "product")
+            status = _get(rec, "Status", "status")
+            last_modified = _get(rec, "LastModified", "last_modified")
+            release_date = _get(rec, "ReleaseDate", "release_date")
+            source = _get(rec, "Source", "source") or "graph"
+            message_id = _get(rec, "MessageId", "message_id")
+            roadmap_link = _get(
+                rec, "Official_Roadmap_link", "official_roadmap_link", "Roadmap", "roadmap_link"
+            )
+
+            clouds_raw = _get(rec, "Cloud_instance", "Clouds")
+            if clouds_raw:
+                parts = [p.strip() for p in re.split(r"[|,;/]+", clouds_raw) if p.strip()]
+                try:
+                    clouds = sorted(normalize_clouds(parts))
+                except Exception:
+                    clouds = parts
+            else:
+                # IMPORTANT: treat blank as General
+                clouds = ["General"]
+
+            rows.append(
+                FeatureRecord(
+                    public_id=public_id,
+                    title=title,
+                    product=product,
+                    status=status,
+                    last_modified=last_modified,
+                    release_date=release_date,
+                    clouds=clouds,
+                    roadmap_link=roadmap_link,
+                    source=source,
+                    message_id=message_id,
+                )
+            )
+
+    # tiny debug breadcrumb
+    print(f"[gen] read={len(rows)} from {path}", file=sys.stderr)
     return rows
 
 
@@ -222,7 +260,44 @@ def _filter_by_cloud(rows: list[FeatureRecord], clouds: Sequence[str] | None) ->
             return set(parts)
 
     return [r for r in rows if row_clouds(r) & include]
+def _filter_by_cloud(rows: list[FeatureRecord], clouds: Sequence[str] | None) -> list[FeatureRecord]:
+    if not clouds:
+        return rows
 
+    include: set[str] = set()
+    for c in clouds:
+        if not c:
+            continue
+        try:
+            canon = normalize_clouds([c])
+        except TypeError:
+            canon = normalize_clouds(c)  # tolerate older signatures
+        if isinstance(canon, set):
+            include |= {s for s in canon if s}
+        elif isinstance(canon, str) and canon.strip():
+            include.add(canon.strip())
+
+    if not include:
+        return rows
+
+    def row_clouds(r: FeatureRecord) -> set[str]:
+        cl = getattr(r, "clouds", None)
+        if cl:
+            return set([s for s in cl if s])
+
+        # ultra-defensive legacy fallback
+        raw = getattr(r, "Cloud_instance", "") or ""
+        if not raw:
+            return {"General"}  # IMPORTANT: blank → General
+        parts = [p.strip() for p in re.split(r"[|,;/]+", raw) if p.strip()]
+        try:
+            return set(normalize_clouds(parts))
+        except Exception:
+            return set(parts)
+
+    out = [r for r in rows if row_clouds(r) & include]
+    print(f"[gen] after cloud filter ({sorted(include)}): {len(out)}", file=sys.stderr)
+    return out
 
 
 
@@ -236,17 +311,19 @@ def _parse_products_arg(products: Optional[str]) -> List[str]:
     return [t for t in raw if t]
 
 
-def _filter_by_products(rows: Sequence[FeatureRecord], products: Optional[str]) -> List[FeatureRecord]:
-    tokens = _parse_products_arg(products)
-    if not tokens:
-        return list(rows)
-    toks = [t.lower() for t in tokens]
-    out: List[FeatureRecord] = []
-    for r in rows:
-        val = (r.Product_Workload or "").lower()
-        # include if any token is a substring of the Product_Workload
-        if any(t in val for t in toks):
-            out.append(r)
+def _filter_by_products(rows: list[FeatureRecord], products_csv: str | None) -> list[FeatureRecord]:
+    if not products_csv:
+        return rows
+    wanted = {p.strip().lower() for p in re.split(r"[|,;]+", products_csv) if p.strip()}
+    if not wanted:
+        return rows
+
+    def match(r: FeatureRecord) -> bool:
+        hay = (r.product or "").lower()
+        return any(tok in hay for tok in wanted)
+
+    out = [r for r in rows if match(r)]
+    print(f"[gen] after product filter ({sorted(wanted)}): {len(out)}", file=sys.stderr)
     return out
 
 
@@ -436,6 +513,12 @@ def main() -> None:
     # Filter by cloud/products
     rows = _filter_by_cloud(all_rows, args.cloud)
     rows = _filter_by_products(rows, args.products)
+
+    all_rows = _read_master_csv(args.master)
+    rows = _filter_by_cloud(all_rows, args.cloud)
+    rows = _filter_by_products(rows, args.products)
+    print(f"[gen] final row count: {len(rows)}", file=sys.stderr)
+
 
     # Forced IDs ordering/synthesis
     forced_ids = _parse_forced_ids(args.forced_ids)
