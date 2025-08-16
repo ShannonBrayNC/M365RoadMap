@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-Generate a Markdown roadmap report from a master CSV that contains Microsoft 365
-message center / roadmap rows.
+generate_report.py
+Create a Markdown report from the master CSV produced by fetch_messages_graph.py.
 
-Key additions in this version:
-- --products: comma/pipe list to include only matching Product_Workload rows
-- --forced-ids: comma/pipe list of exact PublicIds to pin to the top, keeping the
-  exact order provided
-- Safer cloud filtering with proper set handling (fixes set |= str errors)
-- Clean typing; resolves previous mypy complaints for this file
+Key features:
+- --forced-ids: comma/space separated list of PublicId values to pin at the top (keeps exact order)
+- --products:   comma-separated filter for Product/Workload (case-insensitive, substring match)
+- --cloud:      may be passed multiple times; accepts friendly “Worldwide (Standard Multi-Tenant)”, GCC, GCC High, DoD
+- --since / --months: time window filters (by LastModified); either may be used
+- Renders header with cloud_display and total feature count
+- Gracefully falls back to local rendering if report_templates is unavailable
 """
 
 from __future__ import annotations
@@ -16,346 +17,381 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
-import re
 from pathlib import Path
-from typing import Iterable, Optional, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-# ---- Local import bootstrap -------------------------------------------------
-# We try both "report_templates" and "scripts.report_templates".
-# If neither is importable, we fall back to tiny local renderers so the script
-# still produces a report rather than crashing.
+# --- Robust imports for the shared renderer (optional) -----------------------
+# If the repo is executed from root, `scripts` may not be on sys.path.
+# Try both styles; if they fail, we use simple local renderers.
 try:
-    from report_templates import (  # type: ignore[import-not-found]
+    from scripts.report_templates import (  # type: ignore
         FeatureRecord,
         render_feature_markdown,
         render_header,
     )
-except Exception:  # pragma: no cover - fallback path
+    HAVE_TEMPLATES = True
+except Exception:
     try:
-        from scripts.report_templates import (  # type: ignore[import-not-found]
+        # Try local import relative to this file (when running inside scripts/)
+        import sys
+
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from report_templates import (  # type: ignore
             FeatureRecord,
             render_feature_markdown,
             render_header,
         )
+
+        HAVE_TEMPLATES = True
     except Exception:
-        # ---- Minimal fallbacks so the report can still be generated ----------
-        from dataclasses import dataclass
-
-        @dataclass
-        class FeatureRecord:  # type: ignore[override]
-            public_id: str
-            title: str
-            product_workload: str
-            status: str
-            cloud_instance: str
-            last_modified: str
-            release_date: str
-            source: str
-            message_id: str
-            official_roadmap_link: str
-
-        def render_header(*, title: str, generated_utc: str, cloud_label: str) -> str:
-            return (
-                f"{title}\n"
-                f"Generated {generated_utc} Cloud filter: {cloud_label or '—'}\n\n"
-            )
-
-        def render_feature_markdown(rec: FeatureRecord) -> str:
-            lines = [
-                f"[{rec.public_id}] {rec.title}",
-                f"Product/Workload: {rec.product_workload} "
-                f"Status: {rec.status or '—'} "
-                f"Cloud(s): {rec.cloud_instance or '—'} "
-                f"Last Modified: {rec.last_modified or '—'} "
-                f"Release Date: {rec.release_date or '—'} "
-                f"Source: {rec.source or '—'} "
-                f"Message ID: {rec.message_id or '—'} "
-                f"Official Roadmap: {rec.official_roadmap_link or '—'}",
-                "",
-                "Summary",
-                "(summary pending)",
-                "",
-                "What’s changing",
-                "(details pending)",
-                "",
-                "Impact and rollout",
-                "(impact pending)",
-                "",
-                "Action items",
-                "(actions pending)",
-                "",
-            ]
-            return "\n".join(lines)
+        HAVE_TEMPLATES = False
 
 
-# ---- Utilities --------------------------------------------------------------
+# --------------------------- Cloud mapping helpers ---------------------------
 
+# Canonical labels we use internally
+CANON_CLOUDS = ("General", "GCC", "GCC High", "DoD")
 
-def _as_set(val: Optional[Iterable[str] | str]) -> set[str]:
-    """Normalize a str / Iterable[str] / None into set[str]."""
-    if val is None:
-        return set()
-    if isinstance(val, str):
-        v = val.strip()
-        return {v} if v else set()
-    return {s.strip() for s in val if isinstance(s, str) and s.strip()}
+DISPLAY_TO_CANON: Dict[str, str] = {
+    "general": "General",
+    "worldwide (standard multi-tenant)": "General",
+    "worldwide": "General",
+    "gcc": "GCC",
+    "gcc high": "GCC High",
+    "gcch": "GCC High",
+    "dod": "DoD",
+    "department of defense": "DoD",
+}
 
-
-def _split_list(s: Optional[str]) -> list[str]:
-    """Split comma/pipe separated string into a clean list (original case)."""
-    if not s:
-        return []
-    parts = re.split(r"[,\|]", s)
-    return [p.strip() for p in parts if p.strip()]
-
-
-# Canonical cloud labels used across the project
-_CLOUD_CANON = {
-    "GENERAL": "General",
-    "WORLDWIDE (STANDARD MULTI-TENANT)": "General",
+CANON_TO_DISPLAY: Dict[str, str] = {
+    "General": "Worldwide (Standard Multi-Tenant)",
     "GCC": "GCC",
-    "GCC HIGH": "GCC High",
-    "DOD": "DoD",
+    "GCC High": "GCC High",
+    "DoD": "DoD",
 }
 
 
-def normalize_clouds(value: str | Iterable[str]) -> set[str]:
+def normalize_cloud_token(token: str) -> Optional[str]:
+    t = token.strip().lower()
+    return DISPLAY_TO_CANON.get(t, None)
+
+
+def row_clouds_to_canon(value: str) -> List[str]:
     """
-    Convert a raw cloud label(s) into a canonical set:
-    {"General", "GCC", "GCC High", "DoD"}.
-    Accepts a single string (optionally comma/pipe separated) or an iterable.
+    Normalize a master CSV 'Cloud_instance' field to a list of canonical labels.
+    Accepts values such as 'General', 'Worldwide (Standard Multi-Tenant)', 'GCC', 'GCC High', 'DoD',
+    possibly combined with commas/semicolons.
     """
-    tokens: list[str]
-    if isinstance(value, str):
-        tokens = _split_list(value) or [value]
-    else:
-        tokens = []
-        for v in value:
-            tokens.extend(_split_list(v) or [v])
-
-    result: set[str] = set()
-    for t in tokens:
-        key = t.strip().upper()
-        if not key:
-            continue
-        canon = _CLOUD_CANON.get(key)
-        if canon:
-            result.add(canon)
-        else:
-            # Keep unknowns verbatim (title-case) so nothing is silently dropped
-            result.add(t.strip())
-    return result
-
-
-def _filter_by_products(rows: list[dict[str, str]], products: Optional[Sequence[str]]) -> list[dict[str, str]]:
-    """
-    Keep rows whose Product_Workload contains ANY of the requested product keywords.
-    `products` may be None or a sequence of strings; blank means 'no filter'.
-    """
-    wanted = {p.lower() for p in (products or []) if p}
-    if not wanted:
-        return rows
-
-    def matches(row: dict[str, str]) -> bool:
-        hay = (row.get("Product_Workload") or "").lower()
-        return any(p in hay for p in wanted)
-
-    return [r for r in rows if matches(r)]
-
-
-def _filter_by_cloud(rows: list[dict[str, str]], cloud: Optional[str]) -> list[dict[str, str]]:
-    """
-    Keep rows whose Cloud_instance (or Cloud(s)) intersects requested clouds.
-    `cloud` may be a single label or a comma/pipe list.
-    """
-    if not cloud:
-        return rows
-
-    requested: set[str] = set()
-    for tok in _split_list(cloud):
-        requested |= normalize_clouds(tok)
-
-    if not requested:
-        return rows
-
-    def row_clouds(r: dict[str, str]) -> set[str]:
-        raw = r.get("Cloud_instance") or r.get("Cloud(s)") or ""
-        return normalize_clouds(raw)
-
-    return [r for r in rows if row_clouds(r) & requested]
-
-
-def _parse_forced_ids(s: Optional[str]) -> list[str]:
-    """Return ordered list of forced PublicIds from a comma/pipe separated string."""
-    return _split_list(s)
-
-
-def _order_by_forced_ids(rows: list[dict[str, str]], forced_ids: list[str]) -> list[dict[str, str]]:
-    """
-    Place any rows whose PublicId matches one of forced_ids (string match) at the top,
-    preserving the exact order of forced_ids. The rest follow in original order.
-    """
-    if not forced_ids:
-        return rows
-
-    by_id: dict[str, dict[str, str]] = {}
-    for r in rows:
-        pid = (r.get("PublicId") or "").strip()
-        if pid and pid not in by_id:
-            by_id[pid] = r
-
-    ordered: list[dict[str, str]] = [by_id[fid] for fid in forced_ids if fid in by_id]
-
-    picked = set(id(x) for x in ordered)
-    for r in rows:
-        if id(r) not in picked:
-            ordered.append(r)
-    return ordered
-
-
-def _within_window(
-    value_iso: str,
-    *,
-    since_iso: Optional[str],
-    months: Optional[int],
-    now: Optional[dt.datetime] = None,
-) -> bool:
-    """
-    Return True if the given ISO date string (YYYY-MM-DD or ISO-ish) is within
-    the requested window (since OR months). If neither filter provided, always True.
-    """
-    if not since_iso and not months:
-        return True
-
-    # Try parsing date; if it fails, we keep the row (fail-open).
-    try:
-        # Accept 'YYYY-MM-DD' or broader ISO
-        if len(value_iso) >= 10:
-            value = dt.datetime.fromisoformat(value_iso[:10])
-        else:
-            return True
-    except Exception:
-        return True
-
-    if since_iso:
-        try:
-            since = dt.datetime.fromisoformat(since_iso[:10])
-        except Exception:
-            since = None
-        if since and value < since:
-            return False
-
-    if months:
-        ref = (now or dt.datetime.utcnow())
-        # naive month window: months * ~30 days
-        cutoff = ref - dt.timedelta(days=30 * months)
-        if value < cutoff:
-            return False
-
-    return True
-
-
-def _filter_by_time_window(
-    rows: list[dict[str, str]],
-    *,
-    since: Optional[str],
-    months: Optional[int],
-) -> list[dict[str, str]]:
-    if not since and not months:
-        return rows
-
-    out: list[dict[str, str]] = []
-    now = dt.datetime.utcnow()
-    for r in rows:
-        # Prefer LastModified; fall back to ReleaseDate
-        lm = (r.get("LastModified") or "").strip()
-        rd = (r.get("ReleaseDate") or "").strip()
-        date_str = lm or rd
-        if not date_str:
-            out.append(r)
-            continue
-        if _within_window(date_str, since_iso=since, months=months, now=now):
-            out.append(r)
+    if not value:
+        return []
+    parts = [p.strip() for p in value.replace(";", ",").split(",") if p.strip()]
+    out: List[str] = []
+    for p in parts:
+        canon = normalize_cloud_token(p) or (p if p in CANON_CLOUDS else None)
+        if canon and canon not in out:
+            out.append(canon)
     return out
 
 
-def _read_rows(csv_path: Path) -> list[dict[str, str]]:
-    with csv_path.open("r", encoding="utf-8", newline="") as f:
+def selected_clouds_to_canon(selected: Sequence[str] | None) -> List[str]:
+    if not selected:
+        return []
+    out: List[str] = []
+    for s in selected:
+        canon = normalize_cloud_token(s) or (s if s in CANON_CLOUDS else None)
+        if canon and canon not in out:
+            out.append(canon)
+    return out
+
+
+def header_cloud_display(selected_canon: List[str]) -> str:
+    if not selected_canon:
+        return "All clouds"
+    disp = [CANON_TO_DISPLAY.get(c, c) for c in selected_canon]
+    return ", ".join(disp)
+
+
+# ------------------------------- Date helpers --------------------------------
+
+def parse_iso_soft(s: str) -> Optional[dt.datetime]:
+    """
+    Parse ISO-ish dates like '2025-08-06' or '2025-08-06T19:53:44.487Z'.
+    Returns a timezone-aware UTC datetime when possible.
+    """
+    if not s:
+        return None
+    s = s.strip()
+    try:
+        # Handle Z suffix quickly
+        if s.endswith("Z"):
+            return dt.datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(dt.timezone.utc)
+        d = dt.datetime.fromisoformat(s)
+        if d.tzinfo is None:
+            return d.replace(tzinfo=dt.timezone.utc)
+        return d.astimezone(dt.timezone.utc)
+    except Exception:
+        # Try date-only
+        try:
+            d2 = dt.datetime.strptime(s[:10], "%Y-%m-%d").replace(tzinfo=dt.timezone.utc)
+            return d2
+        except Exception:
+            return None
+
+
+def cutoff_from_since_or_months(since: Optional[str], months: Optional[int]) -> Optional[dt.datetime]:
+    if since:
+        d = parse_iso_soft(since)
+        return d
+    if months:
+        # Approximate months as 30 days each to avoid heavy deps
+        return dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=30 * months)
+    return None
+
+
+# ------------------------------ CSV / filtering ------------------------------
+
+Row = Dict[str, str]
+
+MASTER_HEADERS = [
+    "PublicId",
+    "Title",
+    "Source",
+    "Product_Workload",
+    "Status",
+    "LastModified",
+    "ReleaseDate",
+    "Cloud_instance",
+    "Official_Roadmap_link",
+    "MessageId",
+]
+
+
+def read_master_csv(path: Path) -> List[Row]:
+    rows: List[Row] = []
+    with path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
-        return [dict({k: (v or "") for k, v in row.items()}) for row in reader]
+        for r in reader:
+            # Normalize missing keys
+            for k in MASTER_HEADERS:
+                r.setdefault(k, "")
+            rows.append(r)
+    return rows
 
 
-def _parse_args() -> argparse.Namespace:
+def any_product_match(product_field: str, needles: List[str]) -> bool:
+    if not needles:
+        return True
+    hay = product_field.lower()
+    return any(n in hay for n in needles)
+
+
+def filter_rows(
+    rows: List[Row],
+    cutoff: Optional[dt.datetime],
+    selected_clouds_canon: List[str],
+    product_terms: List[str],
+) -> List[Row]:
+    out: List[Row] = []
+    for r in rows:
+        # Time window by LastModified (if cutoff provided)
+        if cutoff:
+            lm = parse_iso_soft(r.get("LastModified", ""))
+            if not lm or lm < cutoff:
+                continue
+
+        # Cloud filter (if set)
+        if selected_clouds_canon:
+            row_canon = row_clouds_to_canon(r.get("Cloud_instance", ""))
+            if not set(selected_clouds_canon).intersection(row_canon):
+                continue
+
+        # Product filter
+        if not any_product_match(r.get("Product_Workload", ""), product_terms):
+            continue
+
+        out.append(r)
+    return out
+
+
+def parse_forced_ids(s: str) -> List[str]:
+    """
+    Accepts comma/space/semicolon separated list of IDs (strings).
+    Keeps order and uniqueness in the order provided.
+    """
+    if not s:
+        return []
+    raw = [x.strip() for x in s.replace(";", " ").replace(",", " ").split() if x.strip()]
+    out: List[str] = []
+    for x in raw:
+        if x not in out:
+            out.append(x)
+    return out
+
+
+def format_clouds_for_line(value: str) -> str:
+    c = row_clouds_to_canon(value)
+    if not c:
+        return "—"
+    return ", ".join(CANON_TO_DISPLAY.get(x, x) for x in c)
+
+
+# ------------------------------- Rendering -----------------------------------
+
+def local_render_header(title: str, generated_utc: str, cloud_display: str, total_features: int) -> str:
+    return (
+        f"{title}\n"
+        f"Generated {generated_utc} Cloud filter: {cloud_display}\n\n"
+        f"Total features: {total_features}\n"
+    )
+
+
+def local_render_feature(r: Row) -> str:
+    public_id = r.get("PublicId", "").strip() or "—"
+    title = r.get("Title", "").strip() or "—"
+    product = r.get("Product_Workload", "").strip() or "—"
+    status = r.get("Status", "").strip() or "—"
+    clouds = format_clouds_for_line(r.get("Cloud_instance", ""))
+    last_mod = (r.get("LastModified", "").strip() or "—").replace("T", " ")
+    rel_date = (r.get("ReleaseDate", "").strip() or "—")
+    source = r.get("Source", "").strip() or "—"
+    mid = r.get("MessageId", "").strip() or "—"
+    link = r.get("Official_Roadmap_link", "").strip() or "—"
+
+    lines = [
+        f"[{public_id}] {title}",
+        (
+            f"Product/Workload: {product} "
+            f"Status: {status} "
+            f"Cloud(s): {clouds} "
+            f"Last Modified: {last_mod} "
+            f"Release Date: {rel_date} "
+            f"Source: {source} "
+            f"Message ID: {mid} "
+            f"Official Roadmap: {link}"
+        ),
+        "",
+        "Summary",
+        "(summary pending)",
+        "",
+        "What’s changing",
+        "(details pending)",
+        "",
+        "Impact and rollout",
+        "(impact pending)",
+        "",
+        "Action items",
+        "(actions pending)",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+# ---------------------------------- Main -------------------------------------
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    p.add_argument("--title", required=True)
-    p.add_argument("--master", required=True, help="CSV with master rows")
-    p.add_argument("--out", required=True, help="Output markdown path")
-    p.add_argument("--since")
-    p.add_argument("--months", type=int)
-    p.add_argument("--cloud", help='e.g. "Worldwide (Standard Multi-Tenant)", or "GCC|DoD"')
+    p.add_argument("--title", required=True, help="Report title")
+    p.add_argument("--master", required=True, help="Path to master CSV")
+    p.add_argument("--out", required=True, help="Output Markdown path")
+    p.add_argument("--since", help="YYYY-MM-DD (UTC)")
+    p.add_argument("--months", type=int, help="Include items modified in the last N months")
+    p.add_argument(
+        "--cloud",
+        action="append",
+        help='Repeatable. Examples: "Worldwide (Standard Multi-Tenant)", "GCC", "GCC High", "DoD"',
+    )
     p.add_argument(
         "--products",
-        help="Comma/pipe-separated list of product keywords to include (e.g., 'Intune,Teams|SharePoint')",
+        help="Comma-separated list of product/workload substrings to include (case-insensitive). Blank = all.",
+        default="",
     )
     p.add_argument(
         "--forced-ids",
-        help="Comma/pipe-separated list of PublicIds to force to the top (exact order preserved).",
+        help="Comma/space/semicolon-separated list of PublicId values to pin at top in the exact order provided.",
+        default="",
     )
-    p.add_argument("--no-window", action="store_true", help="Ignore time window filters")
-    return p.parse_args()
+    # Keep backward-compatibility; ignored if present
+    p.add_argument("--no-window", action="store_true", help=argparse.SUPPRESS)
+    return p.parse_args(argv)
 
 
-# ---- Main -------------------------------------------------------------------
+def main(argv: Optional[Sequence[str]] = None) -> None:
+    args = parse_args(argv)
 
-
-def main() -> None:
-    args = _parse_args()
-
-    rows = _read_rows(Path(args.master))
-
-    # Time window
-    if not args.no_window:
-        rows = _filter_by_time_window(rows, since=args.since, months=args.months)
-
-    # Cloud filter
-    rows = _filter_by_cloud(rows, args.cloud)
-
-    # Product filter
-    products_list = _split_list(args.products)
-    rows = _filter_by_products(rows, products_list)
-
-    # Forced IDs ordering (exact-ID, exact ordering)
-    forced_ids = _parse_forced_ids(args.forced_ids)
-    rows = _order_by_forced_ids(rows, forced_ids)
-
-    # Build MD
+    master_path = Path(args.master)
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    generated = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    cloud_label = ", ".join(sorted(normalize_clouds(args.cloud))) if args.cloud else ""
-    parts: list[str] = [render_header(title=args.title, generated_utc=generated, cloud_display=cloud_label)]
+    rows_all = read_master_csv(master_path)
 
-    count = 0
-    for r in rows:
-        rec = FeatureRecord(
-            public_id=(r.get("PublicId") or "").strip(),
-            title=(r.get("Title") or "").strip(),
-            product_workload=(r.get("Product_Workload") or "").strip(),
-            status=(r.get("Status") or "").strip(),
-            cloud_instance=(r.get("Cloud_instance") or "").strip(),
-            last_modified=(r.get("LastModified") or "").strip(),
-            release_date=(r.get("ReleaseDate") or "").strip(),
-            source=(r.get("Source") or "").strip(),
-            message_id=(r.get("MessageId") or "").strip(),
-            official_roadmap_link=(r.get("Official_Roadmap_link") or "").strip(),
+    # Build helpers
+    selected_clouds_canon = selected_clouds_to_canon(args.cloud)
+    products_terms = [t.strip().lower() for t in args.products.split(",") if t.strip()]
+    cutoff = cutoff_from_since_or_months(args.since, args.months)
+
+    # Forced IDs are always included, even if they don’t match filters
+    forced_ids = parse_forced_ids(args.forced_ids)
+    by_id: Dict[str, Row] = {r.get("PublicId", ""): r for r in rows_all}
+    forced_rows: List[Row] = [by_id[i] for i in forced_ids if i in by_id]
+
+    # Apply filters to the rest
+    filtered = filter_rows(rows_all, cutoff, selected_clouds_canon, products_terms)
+
+    # Deduplicate: drop any forced rows from filtered remainder
+    forced_set = {r.get("PublicId", "") for r in forced_rows}
+    remainder = [r for r in filtered if r.get("PublicId", "") not in forced_set]
+
+    final_rows = forced_rows + remainder
+    total = len(final_rows)
+
+    generated = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    cloud_display = header_cloud_display(selected_clouds_canon)
+
+    parts: List[str] = []
+
+    if HAVE_TEMPLATES:
+        # Use shared templates if available
+        header_md = render_header(
+            title=args.title,
+            generated_utc=generated,
+            cloud_display=cloud_display,
+            total_features=total,
         )
-        parts.append(render_feature_markdown(rec))
-        count += 1
+        parts.append(header_md)
 
-    md = "".join(parts)
-    out_path.write_text(md, encoding="utf-8")
-    print(f"Wrote report: {out_path} (features={count})")
+        # Build FeatureRecord objects if the dataclass exists;
+        # if the constructor signature differs, fall back to local rendering.
+        try:
+            recs: List[FeatureRecord] = []
+            for r in final_rows:
+                recs.append(
+                    FeatureRecord(
+                        public_id=r.get("PublicId", ""),
+                        title=r.get("Title", ""),
+                        product=r.get("Product_Workload", ""),
+                        status=r.get("Status", ""),
+                        clouds=format_clouds_for_line(r.get("Cloud_instance", "")),
+                        last_modified=r.get("LastModified", ""),
+                        release_date=r.get("ReleaseDate", ""),
+                        source=r.get("Source", ""),
+                        message_id=r.get("MessageId", ""),
+                        roadmap_link=r.get("Official_Roadmap_link", ""),
+                    )
+                )
+            for rec in recs:
+                parts.append(render_feature_markdown(rec))
+        except Exception:
+            # If the dataclass signature mismatches, render locally instead.
+            for r in final_rows:
+                parts.append(local_render_feature(r))
+    else:
+        # Local simple rendering
+        parts.append(local_render_header(args.title, generated, cloud_display, total))
+        for r in final_rows:
+            parts.append(local_render_feature(r))
+
+    out_path.write_text("\n".join(parts).rstrip() + "\n", encoding="utf-8")
+    print(f"Wrote report: {out_path} (features={total})")
 
 
 if __name__ == "__main__":
