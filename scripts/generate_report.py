@@ -17,15 +17,21 @@ from typing import Iterable, Optional, Sequence
 # ---------------------------------------------------------------------
 # Import path shim: ensure sibling imports work when run as a path
 # ---------------------------------------------------------------------
-_THIS_DIR = Path(__file__).resolve().parent
-if str(_THIS_DIR) not in sys.path:
-    sys.path.insert(0, str(_THIS_DIR))
+from pathlib import Path
+import sys
 
 # ---------------------------------------------------------------------
-# Import report templates utilities (prefer same-folder import; fall back
-# to package-style when run via `python -m scripts.generate_report`)
+# Import path shim: make both "report_templates" and "scripts.report_templates"
+# resolvable regardless of how the script is launched.
 # ---------------------------------------------------------------------
+_THIS_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _THIS_DIR.parent
+for p in (str(_THIS_DIR), str(_REPO_ROOT)):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
 try:
+    # Prefer same-folder module
     from report_templates import (  # type: ignore
         FeatureRecord,
         render_header,
@@ -34,14 +40,14 @@ try:
         CLOUD_LABELS,
     )
 except Exception:
-    from scripts.report_templates import (  # type: ignore[no-redef]
+    # Fallback to package-style (works if repo root is on sys.path)
+    from scripts.report_templates import (  # type: ignore
         FeatureRecord,
         render_header,
         render_feature_markdown,
         normalize_clouds,
         CLOUD_LABELS,
     )
-
 # ---------------------------------------------------------------------
 # Canonical CSV headers produced by fetch_messages_graph.py
 # ---------------------------------------------------------------------

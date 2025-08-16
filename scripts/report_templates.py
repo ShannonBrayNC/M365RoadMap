@@ -1,192 +1,326 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
-"""
-Presentation helpers for roadmap report rendering.
-
-This module is intentionally dependency-light and safe to import from
-GitHub Actions. Everything here is pure string/Markdown assembly.
-
-Exports:
-- CLOUD_LABELS
-- render_header(...)
-- feature_anchor_id(public_id: str) -> str
-- render_feature_markdown(rec: dict, sections: dict | None = None) -> str
-"""
-
 from __future__ import annotations
 
-from html import escape
-from typing import Mapping, MutableMapping
+from dataclasses import dataclass
+from typing import Iterable, Sequence
 
-# Canonical cloud display labels
-CLOUD_LABELS: Mapping[str, str] = {
-    "Worldwide (Standard Multi-Tenant)": "General",
-    "Worldwide": "General",
-    "Public": "General",
+# ---------------------------------------------------------------------
+# Cloud constants and normalization
+# ---------------------------------------------------------------------
+
+# Canonical cloud keys -> display labels
+CLOUD_LABELS: dict[str, str] = {
+    "General": "Worldwide (Standard Multi-Tenant)",
     "GCC": "GCC",
     "GCC High": "GCC High",
     "DoD": "DoD",
 }
 
-EMDASH = "—"
+# Normalize many inputs to the canonical keys above
+_CLOUD_NORMALIZE_MAP: dict[str, str] = {
+    # General / Worldwide
+    "general": "General",
+    "worldwide": "General",
+    "worldwide (standard multi-tenant)": "General",
+    "ww": "General",
+    "public": "General",
+    # GCC
+    "gcc": "GCC",
+    "government community cloud": "GCC",
+    # GCC High
+    "gcch": "GCC High",
+    "gcc high": "GCC High",
+    # DoD
+    "dod": "DoD",
+    "department of defense": "DoD",
+}
+
+def normalize_clouds(values: Sequence[str] | str) -> set[str]:
+    """
+    Accepts a single string (possibly comma/pipe separated) or a list/tuple.
+    Returns a set of canonical cloud keys: {'General','GCC','GCC High','DoD'}.
+    Unrecognized inputs are returned as-is (title-cased) so nothing is lost.
+    """
+    items: list[str] = []
+    if isinstance(values, str):
+        parts = [p.strip() for p in values.replace("|", ",").split(",")]
+        items = [p for p in parts if p]
+    else:
+        items = [str(v).strip() for v in values if str(v).strip()]
+
+    canon: set[str] = set()
+    for raw in items:
+        key = _CLOUD_NORMALIZE_MAP.get(raw.lower())
+        if key:
+            canon.add(key)
+        else:
+            canon.add(raw.title())
+    return canon
 
 
-def _pill(text: str) -> str:
-    """Render a small 'pill' chip using Markdown-compatible inline code style."""
-    t = text.strip() or EMDASH
-    return f"`{escape(t)}`"
+# ---------------------------------------------------------------------
+# Data model
+# ---------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class FeatureRecord:
+    """
+    Canonical feature row used by generate_report.py and friends.
+    Field names use snake_case to avoid CSV header ambiguity.
+    """
+    public_id: str
+    title: str
+    source: str
+    product: str
+    status: str
+    last_modified: str
+    release_date: str
+    clouds: str          # display text as stored in CSV (e.g., "General; GCC")
+    roadmap_link: str    # https://www.microsoft.com/microsoft-365/roadmap?...searchterms=<id>
+    message_id: str      # e.g., "MC1048620"
 
 
-def _safe(v: str | None) -> str:
-    return v.strip() if isinstance(v, str) and v.strip() else EMDASH
+# ---------------------------------------------------------------------
+# URL helpers
+# ---------------------------------------------------------------------
+
+def message_center_url(message_id: str) -> str | None:
+    """
+    Build the Microsoft 365 admin message center URL for an MC id.
+    """
+    mid = (message_id or "").strip()
+    if not mid:
+        return None
+    # Admin center accepts this pattern reliably:
+    return f"https://admin.microsoft.com/?ref=MessageCenter&id={mid}"
 
 
-def feature_anchor_id(public_id: str) -> str:
-    """Generate a stable in-page anchor id for ToC links."""
-    pid = (public_id or "").strip()
-    return f"feature-{pid or 'x'}"
+# ---------------------------------------------------------------------
+# Small formatting helpers
+# ---------------------------------------------------------------------
 
+def _fmt(text: str | None) -> str:
+    return (text or "").strip() or "—"
+
+def _split_csvish(value: str | None) -> list[str]:
+    """
+    Split a product or cloud cell (commas, pipes, slashes, semicolons supported).
+    """
+    if not value:
+        return []
+    raw = value.replace("|", ",").replace(";", ",").replace("/", ",")
+    return [p.strip() for p in raw.split(",") if p.strip()]
+
+def _slug(s: str) -> str:
+    """
+    Very small slug that works well for GitHub Markdown heading anchors.
+    """
+    keep = []
+    s = s.lower()
+    for ch in s:
+        if ch.isalnum() or ch in ("-", " "):
+            keep.append(ch)
+    return "-".join("".join(keep).split())
+
+def _pill_row(label: str, items: list[str]) -> str:
+    """
+    Render a label + "pills" using inline code as the simplest Markdown stand-in.
+    """
+    if not items:
+        return ""
+    pills = " ".join(f"`{i}`" for i in items)
+    return f"**{label}:** {pills}\n"
+
+def _detail_table(rows: list[tuple[str, str]]) -> str:
+    """
+    Render a 2-column Markdown table of key/value pairs.
+    """
+    if not rows:
+        return ""
+    header = "| Field | Value |\n|---|---|\n"
+    body = "\n".join(f"| {k} | {v} |" for k, v in rows)
+    return header + body + "\n"
+
+def _sources_line(roadmap_link: str, message_id: str) -> str:
+    links: list[str] = []
+    if message_id.strip():
+        murl = message_center_url(message_id)
+        if murl:
+            links.append(f"[Message center {message_id}]({murl})")
+    if roadmap_link.strip():
+        links.append(f"[Roadmap #{_fmt(None) if not roadmap_link else 'link'}]({roadmap_link})")
+    if not links:
+        return ""
+    return f"**Sources:** " + ", ".join(links) + "\n"
+
+
+# ---------------------------------------------------------------------
+# Header, TOC, and global UI pieces
+# ---------------------------------------------------------------------
 
 def render_header(
     *,
     title: str,
     generated_utc: str,
     cloud_display: str,
-    total: int | None = None,
+    total_features: int,
+    products: list[str] | None = None,
 ) -> str:
-    """Top-of-report header block."""
-    lines: list[str] = []
-    lines.append(f"# {escape(title)}")
-    sub = f"Generated {escape(generated_utc)} UTC · Cloud filter: {escape(cloud_display or 'All')}"
-    lines.append("")
-    lines.append(sub)
-    if total is not None:
-        lines.append("")
-        lines.append(f"**Total features:** {total}")
-    lines.append("")
+    """
+    Report header block with optional product pill row and a divider.
+    """
+    lines = [
+        f"# {title}",
+        f"Generated {generated_utc}",
+        "",
+        f"**{title}** &nbsp;&nbsp; _Generated {generated_utc}_ &nbsp;&nbsp; **Cloud filter:** {cloud_display}",
+        "",
+        f"**Total features:** {total_features}",
+    ]
+    if products:
+        lines.append(_pill_row("Products", products).rstrip())
+    lines += ["", "---", ""]
     return "\n".join(lines)
 
-
-def _kv_row(k: str, v: str) -> str:
-    return f"| **{escape(k)}** | {escape(v)} |"
-
-
-def _two_col_row(k1: str, v1: str, k2: str, v2: str) -> str:
-    return f"| **{escape(k1)}** | {escape(v1)} | **{escape(k2)}** | {escape(v2)} |"
-
-
-def render_feature_markdown(
-    rec: MutableMapping[str, str],
-    *,
-    sections: Mapping[str, str] | None = None,
-) -> str:
+def render_toc(features: Sequence[FeatureRecord]) -> str:
     """
-    Render one feature card.
-
-    `rec` is a dict-like with (case-insensitive) keys:
-      public_id, title, product_workload, status, last_modified, release_date,
-      cloud_instance, source, roadmap_link, message_id, mc_link,
-      mc_published, mc_last_updated, mc_services, mc_platforms, mc_tags,
-      mc_relevance
+    Mini table of contents linking to each feature's anchor.
     """
-    # normalize keys (case-insensitive access)
-    def g(*names: str) -> str:
-        for n in names:
-            for k in rec.keys():
-                if k.lower() == n.lower():
-                    v = rec[k]
-                    return v if isinstance(v, str) else str(v)
+    if not features:
         return ""
+    items = []
+    for f in features:
+        rid = f.public_id or "id"
+        title = f.title or f"[{rid}]"
+        anchor = f"rid-{rid}"
+        items.append(f"- [{title}](#${anchor})")
+    # Some Markdown renderers don't like the "$" in anchors; we add both forms.
+    toc = ["## Table of contents", ""]
+    toc.extend(items)
+    toc.extend(["", "---", ""])
+    # Replace #$anchor with #anchor for renderers that prefer the simpler form
+    return "\n".join(toc).replace("(#$", "(#")
 
-    public_id = g("public_id")
-    title = g("title") or f"[{public_id}]"
-    product = g("product_workload")
-    status = g("status")
-    clouds = g("cloud_instance")
-    last_modified = g("last_modified")
-    release_date = g("release_date")
-    source = g("source")
-    roadmap_link = g("roadmap_link") or g("official_roadmap_link")
-    message_id = g("message_id")
-    mc_link = g("mc_link")
 
-    # Optional MC meta
-    mc_relevance = g("mc_relevance")
-    mc_services = g("mc_services")
-    mc_platforms = g("mc_platforms")
-    mc_tags = g("mc_tags")
-    mc_published = g("mc_published")
-    mc_last_updated = g("mc_last_updated")
+# ---------------------------------------------------------------------
+# Feature rendering (pretty card)
+# ---------------------------------------------------------------------
 
-    # Title (bold). We keep the Message ID as a hyperlink in the table.
-    md: list[str] = []
-    md.append(f"### **{escape(title)}**")
-    md.append("")
+def render_feature_card(feature: FeatureRecord) -> str:
+    """
+    Pretty, compact feature "card" in Markdown:
+      - Bold title with hyperlink to the roadmap (when available)
+      - Status, Release date, Clouds, Product in a small details table
+      - Products shown again as pill row (nice visual scan)
+      - Sources line including Message Center link (if message_id present)
+      - Placeholder AI sections (kept for downstream PPT use)
+    """
+    rid = feature.public_id or "—"
+    # Title and primary link
+    title_txt = feature.title or f"[{rid}]"
+    title_md = f"**{title_txt}**"
+    if feature.roadmap_link.strip():
+        title_md = f"**[{title_txt}]({feature.roadmap_link})**"
 
-    # Pills row (Status / Release / Clouds) and Products chips row
-    pills = f"**Status:** {_pill(_safe(status))} **Release:** {_pill(_safe(release_date))} **Clouds:** {_pill(_safe(clouds))}"
-    md.append(pills)
-    if product:
-        md.append("")
-        md.append(_pill(product))
-    md.append("")
+    # Stable anchor for TOC
+    anchor = f"rid-{rid}"
 
-    # Primary details table (2x4)
-    md.append("|  |  |  |  |")
-    md.append("|:--|:--|:--|:--|")
-    md.append(_two_col_row("Roadmap ID", _safe(public_id), "Product / Workload", _safe(product)))
-    md.append(_two_col_row("Status", _safe(status), "Cloud(s)", _safe(clouds)))
-    md.append(_two_col_row("Last Modified", _safe(last_modified), "Release Date", _safe(release_date)))
-    msg_link = f"[{escape(message_id)}]({escape(mc_link)})" if message_id and mc_link else _safe(message_id)
-    md.append(_two_col_row("Source", _safe(source), "Message ID", msg_link))
-    md.append("")
+    # Clouds: display raw cell, but also normalize a readable list for pills
+    clouds_disp = _fmt(feature.clouds)
+    clouds_norm = sorted(normalize_clouds(_split_csvish(feature.clouds))) if feature.clouds else []
+    clouds_pills = [CLOUD_LABELS.get(c, c) for c in clouds_norm] if clouds_norm else []
 
-    # Optional MC metadata table (appears only if any of these exist)
-    if any(x.strip() for x in [mc_relevance, mc_services, mc_platforms, mc_tags, mc_published, mc_last_updated]):
-        md.append("<details>")
-        md.append("<summary>More from Message Center</summary>")
-        md.append("")
-        md.append("|  |  |  |  |")
-        md.append("|:--|:--|:--|:--|")
-        md.append(_two_col_row("Relevance", _safe(mc_relevance), "Services", _safe(mc_services)))
-        md.append(_two_col_row("Platforms", _safe(mc_platforms), "Tags", _safe(mc_tags)))
-        md.append(_two_col_row("Published", _safe(mc_published), "Last updated", _safe(mc_last_updated)))
-        md.append("</details>")
-        md.append("")
+    # Products: pills derived from product cell
+    prod_items = _split_csvish(feature.product)
+    prod_pills = prod_items
 
-    # Summary + Sources
-    summary = ""
-    changes = ""
-    impact = ""
-    actions = ""
-    if sections:
-        summary = (sections.get("summary") or "").strip()
-        changes = (sections.get("changes") or "").strip()
-        impact = (sections.get("impact") or "").strip()
-        actions = (sections.get("actions") or "").strip()
+    # Details table
+    details = _detail_table(
+        [
+            ("Status", _fmt(feature.status)),
+            ("Release date", _fmt(feature.release_date)),
+            ("Clouds", clouds_disp if clouds_disp != "—" else "—"),
+            ("Product / Workload", _fmt(feature.product)),
+            ("Source", _fmt(feature.source)),
+            ("Message ID", f"[{feature.message_id}]({message_center_url(feature.message_id)})" if feature.message_id else "—"),
+        ]
+    )
 
-    md.append("**Summary**")
-    md.append(summary or "*summary pending*")
-    # Sources line (Roadmap, Message Center)
-    sources_parts: list[str] = []
-    if roadmap_link:
-        sources_parts.append(f"[Official Roadmap]({escape(roadmap_link)})")
-    if mc_link:
-        sources_parts.append(f"[Message Center]({escape(mc_link)})")
-    if sources_parts:
-        md.append("")
-        md.append("Sources: " + " | ".join(sources_parts))
-    md.append("")
+    # Sources line
+    srcs = _sources_line(feature.roadmap_link, feature.message_id)
 
-    md.append("**▼ What’s changing**")
-    md.append(changes or "*details pending*")
-    md.append("")
-    md.append("**▼ Impact and rollout**")
-    md.append(impact or "*impact pending*")
-    md.append("")
-    md.append("**▼ Action items**")
-    md.append(actions or "*actions pending*")
-    md.append("")
+    # Assemble card
+    parts: list[str] = [
+        f"### <a id=\"{anchor}\"></a> {title_md}",
+        "",
+        details,
+    ]
 
-    return "\n".join(md)
+    # Pills rows
+    if prod_pills:
+        parts.append(_pill_row("Products", prod_pills))
+    if clouds_pills:
+        parts.append(_pill_row("Clouds", clouds_pills))
+
+    if srcs:
+        parts += ["", srcs]
+
+    # Placeholder AI sections the caller can overwrite later if desired
+    parts += [
+        "",
+        "**Summary**  \n(summary pending)",
+        "",
+        "**What’s changing**  \n(details pending)",
+        "",
+        "**Impact and rollout**  \n(impact pending)",
+        "",
+        "**Action items**  \n(actions pending)",
+        "",
+        "---",
+        "",
+    ]
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------
+# Simple legacy block (kept for compatibility with older tests)
+# ---------------------------------------------------------------------
+
+def render_feature_markdown(feature: FeatureRecord) -> str:
+    rid = feature.public_id or "—"
+    title = feature.title or f"[{rid}]"
+    title_md = f"**{title}**"
+    if feature.roadmap_link.strip():
+        title_md = f"**[{title}]({feature.roadmap_link})**"
+    parts = [
+        f"### {title_md}",
+        "",
+        f"- **Roadmap ID:** {rid}",
+        f"- **Product / Workload:** {_fmt(feature.product)}",
+        f"- **Status:** {_fmt(feature.status)}",
+        f"- **Last Modified:** {_fmt(feature.last_modified)}",
+        f"- **Release Date:** {_fmt(feature.release_date)}",
+        f"- **Clouds:** {_fmt(feature.clouds)}",
+        f"- **Source:** {_fmt(feature.source)}",
+    ]
+    if feature.message_id:
+        parts.append(f"- **Message ID:** [{feature.message_id}]({message_center_url(feature.message_id)})")
+    parts.append("")
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------
+
+__all__ = [
+    "CLOUD_LABELS",
+    "normalize_clouds",
+    "FeatureRecord",
+    "render_header",
+    "render_toc",
+    "render_feature_card",
+    "render_feature_markdown",
+    "message_center_url",
+]
