@@ -92,6 +92,28 @@ jobs:
           echo "graph_config.json written:"
           cat graph_config.json | sed 's/"pfx_b64":.*/"pfx_b64":"***redacted***",/'
 
+
+      - name: Validate PFX (optional)
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os, base64, sys
+          from cryptography.hazmat.primitives.serialization import pkcs12
+          from cryptography.hazmat.backends import default_backend
+          cfg = json.load(open("graph_config.json"))
+          pfx = base64.b64decode(cfg["pfx_b64"])
+          pwd = os.getenv(cfg["pfx_password_env"]) or ""
+          try:
+              key, cert, chain = pkcs12.load_key_and_certificates(pfx, pwd.encode(), default_backend())
+              print("PFX OK. Subject:", cert.subject.rfc4514_string())
+          except Exception as e:
+              print("PFX invalid:", e)
+              sys.exit(1)
+          PY
+
+
+
+
       - name: Fetch messages (Graph → fallback → seed)
         shell: bash
         env:
