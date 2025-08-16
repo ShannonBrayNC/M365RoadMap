@@ -179,6 +179,7 @@ jobs:
       - name: Generate markdown report
         shell: bash
         env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           TITLE: ${{ inputs.title }}
           SINCE: ${{ inputs.since }}
           MONTHS: ${{ inputs.months }}

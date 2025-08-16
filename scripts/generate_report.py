@@ -1,66 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Generate a markdown report from a master CSV produced by fetch_messages_graph.py.
-
-Key features:
-- Filters by --since / --months (soft date parsing).
-- Filters by one or more --cloud values (blank/None treated as "General").
-- Filters by --products (comma/pipe/space separated, case-insensitive substring).
-- Supports --forced-ids: will (1) include these first in the exact order given,
-  and (2) synthesize missing rows so the report is never empty when you force IDs.
-- Header uses 'cloud_display' and prints Total features.
-"""
-
 from __future__ import annotations
 
 import argparse
 import csv
 import datetime as dt
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
-
-import re
-
-# ------------------------------
-# Constants / Canonical clouds
-# ------------------------------
-
-CLOUD_LABELS: Dict[str, str] = {
-    "GENERAL": "General",  # i.e., Worldwide (Standard Multi-Tenant)
-    "GCC": "GCC",
-    "GCC HIGH": "GCC High",
-    "DOD": "DoD",
-}
-
-WORLDWIDE_ALIASES: Tuple[str, ...] = (
-    "worldwide (standard multi-tenant)",
-    "worldwide",
-    "standard",
-    "general",
-    "",
-)
-
-CSV_HEADERS: List[str] = [
-    "PublicId",
-    "Title",
-    "Source",
-    "Product_Workload",
-    "Status",
-    "LastModified",
-    "ReleaseDate",
-    "Cloud_instance",
-    "Official_Roadmap_link",
-    "MessageId",
-]
-
-# ------------------------------
-# Types
-# ------------------------------
+from pathlib import Path
+from typing import Iterable, List, Dict, Optional, Sequence
+import os
+from textwrap import dedent
 
 
+# -----------------------------
+# Model
+# -----------------------------
 @dataclass
-class FeatureRecord:
+class Row:
     PublicId: str
     Title: str
     Source: str
@@ -72,351 +28,467 @@ class FeatureRecord:
     Official_Roadmap_link: str
     MessageId: str
 
+# -----------------------------
+# Utilities
+# -----------------------------
+def _now_utc_iso() -> str:
+    return dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
-# ------------------------------
-# Helpers
-# ------------------------------
-
-def parse_date_soft(s: Optional[str]) -> Optional[str]:
-    """Accepts many common date forms; returns ISO YYYY-MM-DD or None."""
+def _split_csv_like(s: Optional[str]) -> list[str]:
     if not s:
-        return None
-    s = s.strip()
-    if not s:
-        return None
-    fmts = (
-        "%Y-%m-%d",
-        "%Y-%m-%dT%H:%M:%S%z",
-        "%Y-%m-%dT%H:%M:%S.%f%z",
-        "%Y-%m-%dT%H:%M:%S",
-        "%m/%d/%Y",
-        "%a, %d %b %Y %H:%M:%S %Z",  # common RSS pubDate
-    )
-    for f in fmts:
-        try:
-            d = dt.datetime.strptime(s, f)
-            return d.date().isoformat()
-        except Exception:
-            continue
-    return s
-
-
-def normalize_clouds(value: Optional[str]) -> Set[str]:
-    """
-    Normalize a free-form cloud string to canonical labels.
-    Blank/None -> {"General"} (Worldwide)
-    """
-    if value is None:
-        return {CLOUD_LABELS["GENERAL"]}
-    v = value.strip()
-    if not v:
-        return {CLOUD_LABELS["GENERAL"]}
-
-    lower = v.lower()
-    if lower in WORLDWIDE_ALIASES:
-        return {CLOUD_LABELS["GENERAL"]}
-
-    tokens = re.split(r"[;,/|]+", lower)
-    out: Set[str] = set()
-    for t in tokens:
-        t = t.strip()
-        if not t:
-            continue
-        if t in WORLDWIDE_ALIASES:
-            out.add(CLOUD_LABELS["GENERAL"])
-        elif t == "gcc":
-            out.add(CLOUD_LABELS["GCC"])
-        elif t in ("gcch", "gcc high", "gcc-high", "gcc_high"):
-            out.add(CLOUD_LABELS["GCC HIGH"])
-        elif t in ("dod", "us dod"):
-            out.add(CLOUD_LABELS["DOD"])
-        else:
-            out.add(t.title())
-
-    if not out:
-        out.add(CLOUD_LABELS["GENERAL"])
-    return out
-
-
-def include_by_cloud(row_cloud_field: Optional[str], selected: Sequence[str] | Set[str]) -> bool:
-    """
-    Decide if a row belongs given the selected cloud set/list.
-    - selected empty => include all
-    - blank row cloud => treat as General
-    """
-    sel: Set[str] = set(selected) if not isinstance(selected, set) else selected
-    if not sel:
-        return True
-    row_set = normalize_clouds(row_cloud_field)
-    return bool(row_set & sel)
-
-
-def parse_forced_ids(raw: Optional[str]) -> List[str]:
-    if not raw:
         return []
-    parts = re.split(r"[,\|\s]+", raw.strip())
-    return [p for p in (x.strip() for x in parts) if p]
+    # allow comma or pipe as separators
+    parts = []
+    for chunk in s.replace("|", ",").split(","):
+        c = chunk.strip()
+        if c:
+            parts.append(c)
+    return parts
 
+def _cloud_display(clouds: Sequence[str]) -> str:
+    if not clouds:
+        return "General"
+    return ", ".join(clouds)
 
-def parse_products(raw: Optional[str]) -> List[str]:
-    if not raw:
-        return []
-    parts = re.split(r"[,\|\s]+", raw.strip())
-    return [p.lower() for p in (x.strip() for x in parts) if p]
-
-
-# ------------------------------
-# IO
-# ------------------------------
-
-def read_master_csv(path: str) -> List[FeatureRecord]:
-    out: List[FeatureRecord] = []
-    with open(path, "r", encoding="utf-8", newline="") as f:
-        r = csv.DictReader(f)
-        # normalize header keys (case-insensitive)
-        for row in r:
-            def g(key: str) -> str:
-                # pull case-insensitive with safe default
-                for k in row.keys():
-                    if k.lower() == key.lower():
-                        return str(row[k] or "").strip()
-                return ""
-
-            out.append(
-                FeatureRecord(
-                    PublicId=g("PublicId"),
-                    Title=g("Title"),
-                    Source=g("Source"),
-                    Product_Workload=g("Product_Workload"),
-                    Status=g("Status"),
-                    LastModified=g("LastModified"),
-                    ReleaseDate=g("ReleaseDate"),
-                    Cloud_instance=g("Cloud_instance"),
-                    Official_Roadmap_link=g("Official_Roadmap_link"),
-                    MessageId=g("MessageId"),
-                )
-            )
-    return out
-
-
-# ------------------------------
-# Synthesis for missing forced IDs
-# ------------------------------
-
-def synthesize_feature(public_id: str) -> FeatureRecord:
-    link = f"https://www.microsoft.com/microsoft-365/roadmap?filters=&searchterms={public_id}"
-    return FeatureRecord(
-        PublicId=public_id,
-        Title=f"[{public_id}]",
-        Source="seed",
-        Product_Workload="",
-        Status="",
-        LastModified="",
-        ReleaseDate="",
-        Cloud_instance="",
-        Official_Roadmap_link=link,
-        MessageId="",
-    )
-
-
-# ------------------------------
-# Rendering
-# ------------------------------
-
-def _dash_if_empty(s: str) -> str:
+def _choose_best_cloud_label(raw: str) -> str:
+    # Accept whatever came from the CSV and normalize a little
+    s = (raw or "").strip()
     return s if s else "—"
 
+def _as_date(s: str) -> Optional[dt.date]:
+    s = (s or "").strip()
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%Y/%m/%d"):
+        try:
+            return dt.datetime.strptime(s, fmt).date()
+        except ValueError:
+            pass
+    return None
 
-def render_header(*, title: str, generated_utc: str, cloud_display: str, total_features: int) -> str:
-    return (
-        f"{title}\n"
-        f"Generated {generated_utc} Cloud filter: {cloud_display}\n\n"
-        f"Total features: {total_features}\n"
-    )
+def _contains_any(text: str, needles: Iterable[str]) -> bool:
+    t = (text or "").lower()
+    return any(n.lower() in t for n in needles)
 
+# -----------------------------
+# IO
+# -----------------------------
+def read_master_csv(path: Path) -> list[Row]:
+    rows: list[Row] = []
+    if not path.exists():
+        return rows
+    with path.open("r", encoding="utf-8", newline="") as f:
+        r = csv.DictReader(f)
+        for d in r:
+            rows.append(
+                Row(
+                    PublicId=d.get("PublicId", "").strip(),
+                    Title=d.get("Title", "").strip(),
+                    Source=d.get("Source", "").strip(),
+                    Product_Workload=d.get("Product_Workload", "").strip(),
+                    Status=d.get("Status", "").strip(),
+                    LastModified=d.get("LastModified", "").strip(),
+                    ReleaseDate=d.get("ReleaseDate", "").strip(),
+                    Cloud_instance=d.get("Cloud_instance", "").strip(),
+                    Official_Roadmap_link=d.get("Official_Roadmap_link", "").strip(),
+                    MessageId=d.get("MessageId", "").strip(),
+                )
+            )
+    return rows
 
-def render_feature_markdown(fr: FeatureRecord) -> str:
-    """
-    Render one feature section, matching the existing style in your sample.
-    """
-    rid = fr.PublicId or "—"
-    title = fr.Title or f"[{rid}]"
-    product = _dash_if_empty(fr.Product_Workload)
-    status = _dash_if_empty(fr.Status)
-    clouds = _dash_if_empty(", ".join(sorted(normalize_clouds(fr.Cloud_instance))) if fr.Cloud_instance != "" else "—")
-    lm = _dash_if_empty(parse_date_soft(fr.LastModified) or fr.LastModified)
-    rd = _dash_if_empty(parse_date_soft(fr.ReleaseDate) or fr.ReleaseDate)
-    src = fr.Source or "—"
-    msgid = _dash_if_empty(fr.MessageId)
-    link = fr.Official_Roadmap_link or f"https://www.microsoft.com/microsoft-365/roadmap?filters=&searchterms={rid}"
+def write_markdown(md: str, out_path: Path) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(md, encoding="utf-8")
 
-    lines = []
-    lines.append(f"[{rid}] {title}")
-    lines.append(
-        f"Product/Workload: {product} "
-        f"Status: {status} "
-        f"Cloud(s): {clouds} "
-        f"Last Modified: {lm} "
-        f"Release Date: {rd} "
-        f"Source: {src} "
-        f"Message ID: {msgid} "
-        f"Official Roadmap: {link}"
-    )
-    lines.append("")  # spacer
-    lines.append("Summary")
-    lines.append("(summary pending)")
-    lines.append("")
-    lines.append("What’s changing")
-    lines.append("(details pending)")
-    lines.append("")
-    lines.append("Impact and rollout")
-    lines.append("(impact pending)")
-    lines.append("")
-    lines.append("Action items")
-    lines.append("(actions pending)")
-    lines.append("")
-    return "\n".join(lines)
-
-
-# ------------------------------
-# Filtering & ordering
-# ------------------------------
-
-def filter_by_date(rows: List[FeatureRecord], since: Optional[str], months: Optional[int]) -> List[FeatureRecord]:
-    out = rows
+# -----------------------------
+# Filtering / ordering
+# -----------------------------
+def filter_by_date(rows: list[Row], since: Optional[str], months: Optional[int]) -> list[Row]:
     if since:
-        try:
-            cutoff = dt.date.fromisoformat(since).isoformat()
-            out = [r for r in out if (parse_date_soft(r.LastModified) or "") >= cutoff]
-        except Exception:
-            pass
-    if months:
-        try:
-            today = dt.date.today()
-            delta_days = months * 30
-            cutoff2 = (today - dt.timedelta(days=delta_days)).isoformat()
-            out = [r for r in out if (parse_date_soft(r.LastModified) or "") >= cutoff2]
-        except Exception:
-            pass
-    return out
+        cutoff = _as_date(since)
+    elif months:
+        cutoff = (dt.date.today() - dt.timedelta(days=months * 30))
+    else:
+        cutoff = None
 
-
-def filter_by_cloud(rows: List[FeatureRecord], selected: Sequence[str] | Set[str]) -> List[FeatureRecord]:
-    sel: Set[str] = set(selected) if not isinstance(selected, set) else selected
-    if not sel:
+    if not cutoff:
         return rows
-    return [r for r in rows if include_by_cloud(r.Cloud_instance, sel)]
 
-
-def filter_by_products(rows: List[FeatureRecord], products_raw: Optional[str]) -> List[FeatureRecord]:
-    tokens = parse_products(products_raw)
-    if not tokens:
-        return rows
-    out: List[FeatureRecord] = []
+    out: list[Row] = []
     for r in rows:
-        p = (r.Product_Workload or "").lower()
-        if any(tok in p for tok in tokens):
+        lm = _as_date(r.LastModified) or _as_date(r.ReleaseDate)
+        if lm and lm >= cutoff:
             out.append(r)
     return out
 
+def filter_by_cloud(rows: list[Row], clouds: Sequence[str]) -> list[Row]:
+    if not clouds:
+        return rows
+    wanted = {c.strip().lower() for c in clouds if c.strip()}
+    if not wanted:
+        return rows
 
-def order_with_forced(rows: List[FeatureRecord], forced_ids: List[str]) -> List[FeatureRecord]:
-    by_id: Dict[str, FeatureRecord] = {r.PublicId: r for r in rows if r.PublicId}
-    ordered: List[FeatureRecord] = []
+    def keep(r: Row) -> bool:
+        if not r.Cloud_instance:
+            return "worldwide" in wanted or "general" in wanted
+        raw = r.Cloud_instance.lower()
+        # simple matching against well-known names
+        for c in wanted:
+            if c in raw:
+                return True
+        return False
 
-    # 1) forced first, in order (skip dups)
-    seen: Set[str] = set()
-    for fid in forced_ids:
-        if fid in seen:
+    return [r for r in rows if keep(r)]
+
+def filter_by_products(rows: list[Row], products: Sequence[str]) -> list[Row]:
+    if not products:
+        return rows
+    wanted = {p.strip().lower() for p in products if p.strip()}
+    if not wanted:
+        return rows
+
+    def keep(r: Row) -> bool:
+        hay = f"{r.Product_Workload} {r.Title}".lower()
+        return any(p in hay for p in wanted)
+
+    return [r for r in rows if keep(r)]
+
+def order_by_forced_ids(rows: list[Row], forced_ids: Sequence[str]) -> list[Row]:
+    if not forced_ids:
+        return rows
+    pos: dict[str, int] = {pid.strip(): i for i, pid in enumerate(forced_ids) if pid.strip()}
+    # Keep natural order for non-forced items, but ensure forced ones appear first in given order.
+    forced: list[Row] = []
+    seen: set[str] = set()
+    for pid in forced_ids:
+        pid = pid.strip()
+        if not pid:
             continue
-        seen.add(fid)
-        fr = by_id.get(fid)
-        if fr is None:
-            fr = synthesize_feature(fid)
-        ordered.append(fr)
+        match = next((r for r in rows if r.PublicId == pid), None)
+        if match:
+            forced.append(match)
+            seen.add(match.PublicId)
+        else:
+            # synth shell row to ensure it appears with a link in the report even if master was empty
+            forced.append(
+                Row(
+                    PublicId=pid,
+                    Title=f"[{pid}]",
+                    Source="seed",
+                    Product_Workload="",
+                    Status="",
+                    LastModified="",
+                    ReleaseDate="",
+                    Cloud_instance="",
+                    Official_Roadmap_link=f"https://www.microsoft.com/microsoft-365/roadmap?filters=&searchterms={pid}",
+                    MessageId="",
+                )
+            )
+            seen.add(pid)
+    tail = [r for r in rows if r.PublicId not in seen]
+    return forced + tail
 
-    # 2) then everything else not already emitted
-    for r in rows:
-        if r.PublicId and r.PublicId in seen:
-            continue
-        ordered.append(r)
+# -----------------------------
+# Synthesis
+# -----------------------------
+def _synth_summary(r: Row, deep: bool) -> str:
+    product = r.Product_Workload or "Microsoft 365"
+    title = r.Title or f"Roadmap item {r.PublicId}"
+    if deep:
+        lines = [
+            f"{product}: {title}.",
+            "This update is part of ongoing improvements delivered via Microsoft 365 service updates and the public roadmap.",
+        ]
+    else:
+        lines = [f"{title} ({product})."]
+    return " ".join(lines)
 
-    return ordered
+def _synth_whats_changing(r: Row, deep: bool) -> str:
+    title = r.Title or ""
+    verbs = []
+    if _contains_any(title, ["new", "add", "introduc"]):
+        verbs.append("introduces")
+    if _contains_any(title, ["updated", "update", "change"]):
+        verbs.append("updates")
+    if not verbs:
+        verbs = ["delivers"]
 
+    if deep:
+        return (
+            f"This release {', and '.join(verbs)} the capability described in the title. "
+            f"Customers will see this appear in the {r.Product_Workload or 'relevant'} experience once rollout reaches their tenant."
+        )
+    return f"This {verbs[0]} the feature described."
 
-# ------------------------------
-# CLI
-# ------------------------------
+def _synth_impact(r: Row, deep: bool) -> str:
+    clouds = _choose_best_cloud_label(r.Cloud_instance)
+    rel = _as_date(r.ReleaseDate)
+    when = rel.strftime("%Y-%m-%d") if rel else "TBD"
+    target = r.Product_Workload or "workload"
+    if deep:
+        return (
+            f"Admins and users of {target} should expect minor UX changes once enabled. "
+            f"Rollout: {clouds}, starting {when}. Adoption and policy review may be required in some environments."
+        )
+    return f"Rollout to {clouds}; start {when}. Expect minor UX changes."
 
-def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Generate markdown report from master CSV.")
-    p.add_argument("--title", required=True, help="Report title and artifact base name.")
-    p.add_argument("--master", required=True, help="Path to the master CSV.")
-    p.add_argument("--out", required=True, help="Markdown output path.")
+def _synth_actions(r: Row, deep: bool) -> str:
+    items = [
+        "Review the item in Message center (if applicable) and the official roadmap card.",
+        "Communicate the change to affected users.",
+        "Update training/help content as needed.",
+    ]
+    if deep:
+        items.append("Evaluate policy/configuration implications in pilot before broad rollout.")
+    mid = f"MC{r.MessageId}" if r.MessageId else ""
+    link = r.Official_Roadmap_link or f"https://www.microsoft.com/microsoft-365/roadmap?searchterms={r.PublicId}"
+    tail = f" Track via {mid} • Roadmap: {link}".strip()
+    return "- " + "\n- ".join(items) + (f"\n\n{tail}" if tail else "")
 
-    p.add_argument("--since", default=None, help="Only include items on/after this date (YYYY-MM-DD).")
-    p.add_argument("--months", type=int, default=None, help="Only include items modified within the last N months.")
+def synthesize_sections(r: Row, deep: bool) -> dict[str, str]:
+    return {
+        "summary": _synth_summary(r, deep),
+        "change": _synth_whats_changing(r, deep),
+        "impact": _synth_impact(r, deep),
+        "actions": _synth_actions(r, deep),
+    }
 
-    p.add_argument(
-        "--cloud",
-        action="append",
-        default=[],
-        help='Cloud filter(s). Examples: "Worldwide (Standard Multi-Tenant)", "GCC", "GCC High", "DoD". Can be repeated.',
+# -----------------------------
+# Rendering
+# -----------------------------
+def render_header(*, title: str, generated_utc: str, cloud_display: str) -> str:
+    return (
+        f"{title}\n"
+        f"Generated {generated_utc}\n\n"
+        f"{title} Generated {generated_utc} Cloud filter: {cloud_display}\n"
     )
-    p.add_argument("--products", default=None, help="Comma/pipe/space-separated product filter (case-insensitive).")
-    p.add_argument("--forced-ids", default=None, help="Comma/pipe/space-separated exact ID list to force/include first.")
-    return p.parse_args(argv)
 
+def render_feature_markdown(r: Row, auto_fill: bool, deep: bool) -> str:
+    cloud_lbl = _choose_best_cloud_label(r.Cloud_instance)
+    status = r.Status or "—"
+    rel = r.ReleaseDate or "—"
+    lm = r.LastModified or "—"
+    src = r.Source or "—"
+    msg = f"MC{r.MessageId}" if r.MessageId else "—"
+    link = r.Official_Roadmap_link or f"https://www.microsoft.com/microsoft-365/roadmap?filters=&searchterms={r.PublicId}"
+    product = r.Product_Workload or "—"
+
+    header = (
+        f"\n[{r.PublicId}] {r.Title} "
+        f"Product/Workload: {product} "
+        f"Status: {status} "
+        f"Cloud(s): {cloud_lbl} "
+        f"Last Modified: {lm} "
+        f"Release Date: {rel} "
+        f"Source: {src} "
+        f"Message ID: {msg} "
+        f"Official Roadmap: {link}\n"
+    )
+
+    if auto_fill:
+        synth = synthesize_sections(r, deep)
+        body = (
+            f"\nSummary\n\n{synth['summary']}\n\n"
+            f"What’s changing\n\n{synth['change']}\n\n"
+            f"Impact and rollout\n\n{synth['impact']}\n\n"
+            f"Action items\n\n{synth['actions']}\n"
+        )
+    else:
+        body = (
+            "\nSummary (summary pending)\n\n"
+            "What’s changing (details pending)\n\n"
+            "Impact and rollout (impact pending)\n\n"
+            "Action items (actions pending)\n"
+        )
+    return header + body
+
+
+
+def _ai_available(args) -> bool:
+    return not args.ai_off and bool(os.getenv("OPENAI_API_KEY"))
+
+def _rule_based_sections(rec) -> tuple[str, str, str, str]:
+    """
+    Deterministic fallback content that requires no external calls.
+    """
+    title = rec.Title or f"[{rec.PublicId}]"
+    product = rec.Product_Workload or "Microsoft 365"
+    status = rec.Status or "—"
+    clouds = rec.Cloud_instance or "General"
+    lm = rec.LastModified or "—"
+    rel = rec.ReleaseDate or "—"
+
+    summary = (
+        f"{product}: **{title}**.\n"
+        f"This roadmap item is tracked under PublicId {rec.PublicId}. "
+        f"Current status: {status}. Cloud: {clouds}. "
+        f"Last modified {lm}; target/release date {rel}."
+    )
+
+    changes = (
+        "Feature work is progressing based on roadmap telemetry and message center updates. "
+        "Naming and scope may evolve as Microsoft ships iterative improvements."
+    )
+
+    impact = (
+        "Low operational impact for most tenants during initial rollout. "
+        "Expect gradual enablement via service-side flighting; timelines depend on ring and cloud. "
+        "Admins should validate any policy side-effects in pilot rings."
+    )
+
+    actions = (
+        "• Communicate the change to affected users/stakeholders.\n"
+        "• Validate tenant- or workload-level policies that may influence rollout.\n"
+        "• Update training/runbooks once the feature is observed in your tenant.\n"
+        "• If applicable, monitor Message center post linked via the MessageId."
+    )
+
+    return summary, changes, impact, actions
+
+
+def _ai_sections(args, rec) -> tuple[str, str, str, str] | None:
+    """
+    Best-effort AI summary using OpenAI if an API key is available.
+    Falls back to None on any error (caller will use rule-based text).
+    """
+    if not _ai_available(args):
+        return None
+
+    try:
+        from openai import OpenAI  # type: ignore[import-not-found]
+        client = OpenAI()
+        prompt = dedent(f"""
+        Summarize this Microsoft 365 Roadmap item for an IT admin audience.
+        Return four short sections titled exactly:
+        Summary, What’s changing, Impact and rollout, Action items.
+
+        PublicId: {rec.PublicId}
+        Title: {rec.Title}
+        Product/Workload: {rec.Product_Workload}
+        Status: {rec.Status}
+        Cloud(s): {rec.Cloud_instance}
+        Last Modified: {rec.LastModified}
+        Release Date: {rec.ReleaseDate}
+        Official Link: {rec.Official_Roadmap_link}
+        Message Center Id: {rec.MessageId}
+
+        Keep each section 1–3 sentences. Avoid marketing fluff.
+        """).strip()
+
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+        )
+        text = resp.choices[0].message.content or ""
+        # naive split by section headers; if parse fails, return as summary + fallbacks
+        sections = {"summary": "", "changes": "", "impact": "", "actions": ""}
+        current = None
+        for line in text.splitlines():
+            l = line.strip()
+            key = None
+            if l.lower().startswith("summary"):
+                key = "summary"
+            elif l.lower().startswith("what’s changing") or l.lower().startswith("whats changing") or l.lower().startswith("what's changing"):
+                key = "changes"
+            elif l.lower().startswith("impact and rollout"):
+                key = "impact"
+            elif l.lower().startswith("action items"):
+                key = "actions"
+
+            if key:
+                current = key
+                # remove the header text after colon, keep any inline content
+                colon = l.find(":")
+                if colon >= 0 and colon < len(l) - 1:
+                    sections[key] = l[colon+1:].strip()
+                else:
+                    sections[key] = ""
+            elif current:
+                sections[current] += ("\n" if sections[current] else "") + l
+
+        # If parsing didn’t find good chunks, bail to None so we use the rule-based copy
+        if not any(sections.values()):
+            return None
+
+        return (
+            sections.get("summary") or "",
+            sections.get("changes") or "",
+            sections.get("impact") or "",
+            sections.get("actions") or "",
+        )
+    except Exception:
+        return None
+
+
+
+
+
+# -----------------------------
+# Main
+# -----------------------------
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser()
+    p.add_argument("--title", required=True)
+    p.add_argument("--master", required=True, help="CSV produced by fetch_messages_graph.py")
+    p.add_argument("--out", required=True)
+    p.add_argument("--since", default="")
+    p.add_argument("--months", type=int, default=None)
+    p.add_argument("--cloud", action="append", default=[], help="Cloud label(s); omit for General")
+    p.add_argument("--products", default="", help="Comma/pipe separated product/workload filters; blank=all")
+    p.add_argument("--forced-ids", default="", help="Comma-separated exact PublicId list; preserves order and creates shells if missing")
+    p.add_argument("--no-auto-fill", action="store_true", help="Disable synthesized sections")
+    p.add_argument("--ai-deep-dive", dest="deep", action="store_true", default=True, help="Richer synthesized content (default on)")
+    p.add_argument("--no-ai-deep-dive", dest="deep", action="store_false", help="Turn off deep-dive verbiage")
+
+    return p.parse_args(argv)
 
 def main() -> None:
     args = parse_args()
+    title = args.title
+    master = Path(args.master)
+    out_path = Path(args.out)
 
-    # Read master
-    rows = read_master_csv(args.master)
+    clouds = args.cloud or []
+    products = _split_csv_like(args.products)
+    forced_ids = _split_csv_like(args.forced_ids)
+    auto_fill = not args.no_auto_fill
+    deep = bool(args.deep)
 
-    # Filters
+    rows = read_master_csv(master)
+    # date filters
     rows = filter_by_date(rows, args.since, args.months)
+    # cloud filter (treat no cloud as General)
+    rows = filter_by_cloud(rows, clouds)
+    # product filter
+    rows = filter_by_products(rows, products)
+    # ordering + synthesis shells for missing forced ids
+    rows = order_by_forced_ids(rows, forced_ids)
 
-    # Cloud selected → canonicalize to set
-    selected_clouds: Set[str] = set()
-    for c in args.cloud or []:
-        selected_clouds |= normalize_clouds(c)
+    generated = _now_utc_iso()
+    header = render_header(title=title, generated_utc=generated, cloud_display=_cloud_display(clouds))
 
-    rows = filter_by_cloud(rows, selected_clouds)
-    rows = filter_by_products(rows, args.products)
+    parts: list[str] = [render_header(title=args.title, generated_utc=generated, cloud_display=cloud_label)]
+    parts.append(f"\nTotal features: {len(rows)}\n")
 
-    # Forced IDs (include/order + synthesize if missing)
-    forced_ids = parse_forced_ids(args.forced_ids)
-    if forced_ids:
-        rows = order_with_forced(rows, forced_ids)
-
-    # Header bits
-    generated = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    if not selected_clouds:
-        cloud_display = "All clouds"
-    else:
-        cloud_display = ", ".join(sorted(selected_clouds))
-
-    total = len(rows)
-
-    # Render
-    parts: List[str] = [
-        render_header(
-            title=args.title,
-            generated_utc=generated,
-            cloud_display=cloud_display,
-            total_features=total,
+    for rec in rows:
+        ai = _ai_sections(args, rec)
+        if ai is None:
+            ai = _rule_based_sections(rec)
+        summary, changes, impact, actions = ai
+        parts.append(
+            render_feature_markdown(
+                rec,
+                summary=summary,
+                changes=changes,
+                impact=impact,
+                actions=actions,
+            )
         )
-    ]
-    for r in rows:
-        parts.append(render_feature_markdown(r))
 
-    out_text = "\n".join(parts)
-    with open(args.out, "w", encoding="utf-8") as f:
-        f.write(out_text)
 
-    print(f"Wrote report: {args.out} (features={total})")
-
+    md = "\n".join(parts).strip() + "\n"
+    write_markdown(md, out_path)
 
 if __name__ == "__main__":
     main()
