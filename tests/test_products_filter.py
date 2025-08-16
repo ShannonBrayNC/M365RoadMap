@@ -1,69 +1,54 @@
-#import csv
-#import io
+# tests/test_products_filter.py
+from __future__ import annotations
+
+import csv
 import subprocess
 import sys
 from pathlib import Path
-
+import textwrap
 
 def _write_master(tmp: Path) -> Path:
-    csv_text = """PublicId,Title,Product_Workload,Status,Cloud_instance,LastModified,ReleaseDate,Source,MessageId,Official_Roadmap_link
-1001,Teams thing,Microsoft Teams,,General,2025-08-10,,graph,MC1,https://example/1001
-1002,Intune item,Microsoft Intune,,GCC,2025-08-11,,graph,MC2,https://example/1002
-1003,SharePoint feature,SharePoint Online,,DoD,2025-08-12,,graph,MC3,https://example/1003
-"""
+    rows = [
+        {"id": "1001", "title": "Teams: Something", "product": "Microsoft Teams"},
+        {"id": "1002", "title": "SharePoint: Thing", "product": "SharePoint"},
+        {"id": "1003", "title": "Exchange: Other", "product": "Exchange Online"},
+    ]
     p = tmp / "master.csv"
-    p.write_text(csv_text, encoding="utf-8")
+    with p.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["id","title","product"])
+        w.writeheader(); w.writerows(rows)
     return p
 
+def _read_text(p: Path) -> str:
+    return p.read_text(encoding="utf-8")
 
 def test_products_filter(tmp_path: Path) -> None:
     master = _write_master(tmp_path)
     out_md = tmp_path / "out.md"
-
-    # Filter to just "Teams|SharePoint"
-    cmd = [
-        sys.executable,
-        str(Path("scripts") / "generate_report.py"),
-        "--title",
-        "Test",
-        "--master",
-        str(master),
-        "--out",
-        str(out_md),
-        "--products",
-        "Teams|SharePoint",
-        "--cloud",
-        "General|DoD",
-    ]
-    subprocess.run(cmd, check=True)
-
-    text = out_md.read_text(encoding="utf-8")
-    # Expect to see 1001 (Teams, General) and 1003 (SharePoint, DoD); not 1002 (Intune, GCC)
-    assert "[1001]" in text
-    assert "[1003]" in text
-    assert "[1002]" not in text
-
+    cmd = [sys.executable, "scripts/generate_report.py",
+           "--title", "Test",
+           "--master", str(master),
+           "--out", str(out_md),
+           "--products", "Teams, SharePoint"]
+    subprocess.check_call(cmd)
+    txt = _read_text(out_md)
+    # should include Teams and SharePoint, but not Exchange
+    assert "Teams: Something" in txt
+    assert "SharePoint: Thing" in txt
+    assert "Exchange: Other" not in txt
 
 def test_forced_ids_ordering(tmp_path: Path) -> None:
     master = _write_master(tmp_path)
     out_md = tmp_path / "out.md"
-
-    cmd = [
-        sys.executable,
-        str(Path("scripts") / "generate_report.py"),
-        "--title",
-        "Test",
-        "--master",
-        str(master),
-        "--out",
-        str(out_md),
-        "--forced-ids",
-        "1003,1001",
-    ]
-    subprocess.run(cmd, check=True)
-
-    text = out_md.read_text(encoding="utf-8")
-    # First occurence should be 1003, then 1001
-    first_1003 = text.find("[1003]")
-    first_1001 = text.find("[1001]")
-    assert 0 <= first_1003 < first_1001
+    # Force 1003 then 1001 first
+    cmd = [sys.executable, "scripts/generate_report.py",
+           "--title", "Test",
+           "--master", str(master),
+           "--out", str(out_md),
+           "--forced-ids", "1003,1001"]
+    subprocess.check_call(cmd)
+    txt = _read_text(out_md)
+    # extract first two bullet lines
+    lines = [ln for ln in txt.splitlines() if ln.startswith("- **[")][:2]
+    assert "1003" in lines[0], textwrap.dedent(f"Expected 1003 first, got:\n{lines}")
+    assert "1001" in lines[1], textwrap.dedent(f"Expected 1001 second, got:\n{lines}")

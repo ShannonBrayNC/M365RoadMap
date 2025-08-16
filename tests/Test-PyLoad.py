@@ -1,11 +1,15 @@
+# tests/Test-PyLoad.py
+from __future__ import annotations
 
 import sys
-import scripts
-import scripts.graph_client
+from pathlib import Path
 
+def test_scripts_package_importable() -> None:
+    root = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(root))
+    import scripts  # noqa: F401
+    import scripts.graph_client  # noqa: F401
 
-# inside GraphClient._build_app()
-
-print("sys.path[0]:", sys.path[0])
-print("scripts package:", scripts.__file__)
-print("graph_client:", scripts.graph_client.__file__)
+    # Sanity: ensure package dir looks valid
+    pkg_file = Path(scripts.__file__).resolve()
+    assert pkg_file.exists(), f"scripts package not found at {pkg_file}"
