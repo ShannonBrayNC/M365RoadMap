@@ -10,5 +10,5 @@ cryptography>=42.0.0
 openai>=1.40.0   # only needed if you enable --use-openai
 pytest>=8.2
 Markdown>=3.4.4
-re
+
 
