@@ -1,36 +1,112 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 from __future__ import annotations
 
 import argparse
 import csv
-import datetime as dt
+import json
+import os
 import re
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Sequence
 
-# Be liberal with import path — works when running as a module or script
+# ---------- try to import UI helpers; fallback to internal pretties ----------
+
 try:
+    # Local import (same folder)
     from report_templates import (  # type: ignore
-        FeatureRecord,
-        normalize_clouds,
-        render_feature_markdown,
         render_header,
-        render_toc,
-    )
-except Exception:  # pragma: no cover
-    from scripts.report_templates import (  # type: ignore[no-redef]
-        FeatureRecord,
-        normalize_clouds,
         render_feature_markdown,
-        render_header,
-        render_toc,
     )
+except Exception:
+    # Fallback renderers so the script still works if report_templates isn't importable.
+    def _md_link(text: str, url: str) -> str:
+        if not url:
+            return text
+        return f"[{text}]({url})"
 
-# --- CSV columns we expect from fetch_messages_graph.py ---
-CSV_COLS = [
+    def render_header(*, title: str, generated_utc: str, cloud_display: str) -> str:
+        return (
+            f"# {title}\n"
+            f"_Generated {generated_utc}_\n\n"
+            f"**Cloud filter:** {cloud_display}\n\n"
+        )
+
+    def render_feature_markdown(
+        *,
+        public_id: str,
+        title: str,
+        product: str,
+        status: str,
+        clouds: str,
+        last_modified: str,
+        release_date: str,
+        source: str,
+        message_id: str,
+        roadmap_link: str,
+        summary: str | None = None,
+        details: str | None = None,
+        impact: str | None = None,
+        actions: str | None = None,
+    ) -> str:
+        # “Products pills”
+        pills = ""
+        if product:
+            parts = [p.strip() for p in re.split(r"[,/|]+", product) if p.strip()]
+            if parts:
+                pills = " ".join([f"`{p}`" for p in parts])
+        # Strong title w/ roadmap link next to it
+        title_line = f"**{title}**"
+        if public_id:
+            title_line += f"  \n{_md_link(f'Roadmap {public_id}', roadmap_link)}"
+        # Source link to Message Center
+        src_line = ""
+        if message_id:
+            src_line = f"Source: {_md_link(f'Message Center {message_id}', f'https://admin.microsoft.com/adminportal/home#/MessageCenter/{message_id}')}"
+        meta = []
+        if status:
+            meta.append(f"Status: {status}")
+        if release_date:
+            meta.append(f"Release: {release_date}")
+        if clouds:
+            meta.append(f"Cloud(s): {clouds}")
+        if last_modified:
+            meta.append(f"Last Modified: {last_modified}")
+        meta_line = " · ".join(meta)
+
+        b = []
+        b.append(title_line)
+        if pills:
+            b.append(f"\n**Products:** {pills}")
+        if meta_line:
+            b.append(f"\n{meta_line}")
+        if src_line:
+            b.append(f"\n{src_line}")
+
+        # AI sections (placeholders)
+        b.append("\n\n**Summary**\n\n_(summary pending)_")
+        b.append("\n\n**What’s changing**\n\n_(details pending)_")
+        b.append("\n\n**Impact and rollout**\n\n_(impact pending)_")
+        b.append("\n\n**Action items**\n\n_(actions pending)_\n")
+
+        return "\n".join(b)
+
+
+# ---------- data model & helpers ----------
+
+CLOUD_CANON = {
+    "Worldwide (Standard Multi-Tenant)": "General",
+    "Worldwide": "General",
+    "General": "General",
+    "GCC": "GCC",
+    "GCC High": "GCC High",
+    "DoD": "DoD",
+}
+
+# Known master CSV headers produced by your fetcher
+KNOWN_HEADERS = [
     "PublicId",
     "Title",
     "Source",
@@ -43,238 +119,259 @@ CSV_COLS = [
     "MessageId",
 ]
 
-# --- utils ---
+
+@dataclass
+class FeatureRecord:
+    public_id: str = ""
+    title: str = ""
+    source: str = ""  # graph | public-json | rss | seed
+    product: str = ""
+    status: str = ""
+    last_modified: str = ""
+    release_date: str = ""
+    clouds: str = ""  # “General”, “GCC”, ...
+    roadmap_link: str = ""
+    message_id: str = ""
+
+
+def _parse_date_soft(s: str | None) -> datetime | None:
+    if not s:
+        return None
+    s = s.strip()
+    if not s:
+        return None
+    try:
+        if len(s) == 10 and s[4] == "-" and s[7] == "-":
+            return datetime(int(s[0:4]), int(s[5:7]), int(s[8:10]), tzinfo=timezone.utc)
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _within_window(r: FeatureRecord, since: str | None, months: str | None) -> bool:
+    if not since and not months:
+        return True
+    # Prefer LastModified, then ReleaseDate
+    dt_s = _parse_date_soft(r.last_modified) or _parse_date_soft(r.release_date)
+    if not dt_s:
+        return False
+    if since:
+        sdt = _parse_date_soft(since)
+        if sdt and dt_s < sdt:
+            return False
+    if months:
+        try:
+            m = int(months)
+            cutoff = datetime.now(timezone.utc) - timedelta(days=30 * m)
+            if dt_s < cutoff:
+                return False
+        except ValueError:
+            pass
+    return True
+
+
+def _canon_cloud(s: str) -> str:
+    s = (s or "").strip()
+    if not s:
+        return "General"  # treat blank as General so we don’t drop rows
+    return CLOUD_CANON.get(s, s)
+
+
+def _products_match(product: str, want: list[str]) -> bool:
+    if not want:
+        return True
+    p = (product or "").lower()
+    return any(w in p for w in want)
 
 
 def _split_csv_like(s: str) -> list[str]:
     if not s:
         return []
-    parts = re.split(r"[,\|\n\r\t]+", s)
-    return [p.strip() for p in parts if p.strip()]
+    parts = [p.strip() for p in re.split(r"[,\|;]", s)]
+    return [p for p in parts if p]
 
 
-def parse_date_soft(s: str) -> Optional[dt.date]:
-    """
-    Best-effort parse 'YYYY-MM-DD' or ISO date/time. Returns date or None.
-    """
-    if not s:
-        return None
-    s = s.strip()
-    # quick YYYY-MM-DD
-    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})", s)
-    if m:
-        try:
-            return dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-        except Exception:
-            pass
-    # ISO-ish
-    s2 = s.replace("Z", "+00:00")
-    try:
-        return dt.datetime.fromisoformat(s2).date()
-    except Exception:
-        return None
+def _row_to_feature(row: dict) -> FeatureRecord:
+    # Map from master CSV names (and a few variants) to FeatureRecord
+    def g(key: str, alts: Sequence[str] = ()) -> str:
+        if key in row:
+            return row[key] or ""
+        for a in alts:
+            if a in row:
+                return row[a] or ""
+        return ""
 
-
-def _cloud_display_from_args(clouds: list[str]) -> str:
-    if not clouds:
-        return "General"
-    normalized = normalize_clouds(clouds)
-    return ", ".join(sorted(normalized)) if normalized else "General"
-
-
-# --- reading & mapping ---
+    # Primary mapping from your fetcher’s CSV
+    return FeatureRecord(
+        public_id=g("PublicId", ("public_id", "id")),
+        title=g("Title", ("title",)),
+        source=g("Source", ("source",)),
+        product=g("Product_Workload", ("product", "workload", "Product", "Workload")),
+        status=g("Status", ("status",)),
+        last_modified=g("LastModified", ("last_modified", "Modified", "Updated")),
+        release_date=g("ReleaseDate", ("release_date", "Release", "ETA")),
+        clouds=_canon_cloud(g("Cloud_instance", ("clouds", "Cloud", "Clouds"))),
+        roadmap_link=g("Official_Roadmap_link", ("roadmap_link", "Roadmap", "Link")),
+        message_id=g("MessageId", ("message_id", "mcid", "MCID")),
+    )
 
 
 def _read_master_csv(path: str | Path) -> list[FeatureRecord]:
     p = Path(path)
-    rows: list[FeatureRecord] = []
     if not p.exists():
-        return rows
+        print(f"[gen] master not found: {p}")
+        return []
+    rows: list[FeatureRecord] = []
     with p.open("r", encoding="utf-8", newline="") as f:
         r = csv.DictReader(f)
-        for d in r:
-            # Defensive get with defaults
-            rows.append(
-                FeatureRecord(
-                    public_id=(d.get("PublicId") or "").strip(),
-                    title=(d.get("Title") or "").strip(),
-                    source=(d.get("Source") or "").strip(),
-                    product_workload=(d.get("Product_Workload") or "").strip(),
-                    status=(d.get("Status") or "").strip(),
-                    last_modified=(d.get("LastModified") or "").strip(),
-                    release_date=(d.get("ReleaseDate") or "").strip(),
-                    cloud_instance=(d.get("Cloud_instance") or "").strip(),
-                    official_roadmap_link=(d.get("Official_Roadmap_link") or "").strip(),
-                    message_id=(d.get("MessageId") or "").strip(),
-                )
-            )
+        for raw in r:
+            rec = _row_to_feature({k.strip(): (v or "").strip() for k, v in raw.items()})
+            # Ensure roadmap link if missing but we have an ID
+            if not rec.roadmap_link and rec.public_id:
+                rec.roadmap_link = f"https://www.microsoft.com/microsoft-365/roadmap?filters=&searchterms={rec.public_id}"
+            rows.append(rec)
+    print(f"[gen] read={len(rows)} from {p}")
     return rows
 
 
-# --- filtering ---
-
-
-def _filter_by_date(rows: list[FeatureRecord], since: Optional[str], months: Optional[int]) -> list[FeatureRecord]:
-    if not since and not months:
-        return rows[:]
-
-    since_date: Optional[dt.date] = parse_date_soft(since) if since else None
-    if not since_date and months:
-        since_date = dt.date.today() - dt.timedelta(days=30 * months)
-
-    if not since_date:
-        return rows[:]
-
-    out: list[FeatureRecord] = []
-    for r in rows:
-        # Prefer LastModified; fall back to ReleaseDate
-        d = parse_date_soft(r.last_modified) or parse_date_soft(r.release_date)
-        if not d or d < since_date:
-            continue
-        out.append(r)
-    return out
-
-
-def _include_by_cloud(cloud_field: str, selected: set[str]) -> bool:
+def _filter_cloud(rows: list[FeatureRecord], selected: list[str]) -> list[FeatureRecord]:
     if not selected:
-        return True
-    raw = (cloud_field or "").strip()
-    canon = normalize_clouds([raw]) if raw else {"General"}
-    return bool(canon & selected)
-
-
-def _filter_by_cloud(rows: list[FeatureRecord], clouds: Iterable[str]) -> list[FeatureRecord]:
-    selected = normalize_clouds(list(clouds)) if clouds else set()
-    if not selected:
-        selected = {"General"}
-    return [r for r in rows if _include_by_cloud(r.cloud_instance, selected)]
-
-
-def _filter_by_products(rows: list[FeatureRecord], products_filter: str) -> list[FeatureRecord]:
-    """
-    products_filter: comma/pipe separated keywords. Any match (case-insensitive) in product_workload keeps the row.
-    Blank → no filtering.
-    """
-    terms = [t.lower() for t in _split_csv_like(products_filter)]
-    if not terms:
-        return rows[:]
-    out: list[FeatureRecord] = []
-    for r in rows:
-        hay = (r.product_workload or "").lower()
-        if any(t in hay for t in terms):
-            out.append(r)
+        # Default to General
+        selected = ["General"]
+    selected_can = {_canon_cloud(c) for c in selected}
+    out = [r for r in rows if _canon_cloud(r.clouds) in selected_can]
+    print(f"[gen] after cloud filter ({sorted(selected_can)}): {len(out)}")
     return out
 
 
-# --- forced ids: synthesize and ordering ---
+def _filter_products(rows: list[FeatureRecord], products: str | None) -> list[FeatureRecord]:
+    want = [w.lower() for w in _split_csv_like(products or "")]
+    if not want:
+        return rows
+    out = [r for r in rows if _products_match(r.product, want)]
+    print(f"[gen] after products filter ({want}): {len(out)}")
+    return out
 
 
-def _synthesize_forced(public_id: str) -> FeatureRecord:
-    link = f"https://www.microsoft.com/microsoft-365/roadmap?filters=&searchterms={public_id}"
-    return FeatureRecord(
-        public_id=public_id,
-        title=f"[{public_id}]",
-        source="seed",
-        product_workload="",
-        status="",
-        last_modified="",
-        release_date="",
-        cloud_instance="",  # treated as General in filters
-        official_roadmap_link=link,
-        message_id="",
-    )
+def _filter_dates(rows: list[FeatureRecord], since: str | None, months: str | None) -> list[FeatureRecord]:
+    out = [r for r in rows if _within_window(r, since, months)]
+    print(f"[gen] after date filter (since={since}, months={months}): {len(out)}")
+    return out
 
 
-def _apply_forced_ids(rows: list[FeatureRecord], forced_ids_csv: str) -> list[FeatureRecord]:
-    """
-    Ensure all forced IDs are present, and order the final list with those IDs first in the given order.
-    Remaining features follow in their original order.
-    """
-    if not forced_ids_csv:
-        return rows[:]
-    forced = [x for x in _split_csv_like(forced_ids_csv) if x]
-    if not forced:
-        return rows[:]
-
-    # Index existing by id
-    by_id = {r.public_id: r for r in rows if r.public_id}
+def _synthesize_missing_ids(ids: list[str]) -> list[FeatureRecord]:
     out: list[FeatureRecord] = []
-
-    # Add all forced (synthesizing when missing)
-    seen: set[str] = set()
-    for pid in forced:
-        r = by_id.get(pid) or _synthesize_forced(pid)
-        out.append(r)
-        seen.add(r.public_id)
-
-    # Append the rest preserving original order
-    for r in rows:
-        if r.public_id and r.public_id in seen:
+    for pid in ids:
+        pid = pid.strip()
+        if not pid:
             continue
-        out.append(r)
-
+        out.append(
+            FeatureRecord(
+                public_id=pid,
+                title=f"[{pid}]",
+                source="seed",
+                product="",
+                status="",
+                last_modified="",
+                release_date="",
+                clouds="General",
+                roadmap_link=f"https://www.microsoft.com/microsoft-365/roadmap?filters=&searchterms={pid}",
+                message_id="",
+            )
+        )
     return out
 
 
-# --- writing ---
-
-def _write_text(path: str | Path, text: str) -> None:
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(text, encoding="utf-8")
-
-
-# --- CLI ---
-
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser()
-    p.add_argument("--title", required=True)
-    p.add_argument("--master", required=True, help="CSV file from fetch_messages_graph")
-    p.add_argument("--out", required=True, help="Output markdown path")
-    p.add_argument("--since", default="")
-    p.add_argument("--months", default="")
-    p.add_argument("--cloud", action="append", default=[], help="Repeatable; if omitted, defaults to General")
-    p.add_argument("--products", default="", help="Comma/pipe-separated filter. Blank = all.")
-    p.add_argument("--forced-ids", default="", help="Comma-separated PublicId list to force/include (ordered).")
-    return p.parse_args()
+def _order_forced_first(rows: list[FeatureRecord], forced_ids: list[str]) -> list[FeatureRecord]:
+    if not forced_ids:
+        return rows
+    pos = {pid: i for i, pid in enumerate(forced_ids)}
+    rows.sort(key=lambda r: (pos.get(r.public_id, 10_000_000), (r.last_modified or ""), r.title))
+    return rows
 
 
-# --- MAIN ---
+def _make_toc(rows: list[FeatureRecord]) -> str:
+    items = []
+    for r in rows:
+        anchor = re.sub(r"[^a-z0-9]+", "-", (r.title or f"[{r.public_id}]").lower()).strip("-")
+        items.append(f"- [{r.title or r.public_id}](#{anchor})")
+    if not items:
+        return ""
+    return "## Table of Contents\n\n" + "\n".join(items) + "\n"
 
-def main() -> None:
-    args = parse_args()
 
-    # Load
+# ---------- CLI ----------
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--title", required=True)
+    ap.add_argument("--master", required=True, help="Path to *_master.csv produced by fetch script")
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--since", default=None)
+    ap.add_argument("--months", default=None)
+    ap.add_argument("--cloud", action="append", default=[], help="Repeatable. e.g. 'Worldwide (Standard Multi-Tenant)', 'GCC'")
+    ap.add_argument("--products", default=None, help="Comma/pipe-separated keywords; blank=all")
+    ap.add_argument("--forced-ids", default="", help="Comma-separated exact PublicId list (ordered)")
+    return ap.parse_args(argv)
+
+
+# ---------- MAIN ----------
+
+def main(argv: Sequence[str] | None = None) -> None:
+    args = parse_args(argv)
+
+    # Read and normalize
     all_rows = _read_master_csv(args.master)
 
-    # Time filter
-    rows = _filter_by_date(all_rows, since=args.since or None, months=int(args.months) if (args.months or "").isdigit() else None)
+    # Filters
+    clouds = args.cloud[:] if args.cloud else ["General"]
+    rows = _filter_cloud(all_rows, clouds)
+    rows = _filter_products(rows, args.products)
+    rows = _filter_dates(rows, args.since, args.months)
 
-    # Cloud filter
-    rows = _filter_by_cloud(rows, args.cloud)
+    # Forced IDs handling
+    forced_ids = _split_csv_like(args.forced_ids)
+    if forced_ids:
+        have = {r.public_id for r in rows}
+        missing = [pid for pid in forced_ids if pid not in have]
+        if missing:
+            synth = _synthesize_missing_ids(missing)
+            rows = rows + synth
+            print(f"[gen] synthesized {len(synth)} forced IDs not present in master: {missing}")
+        rows = _order_forced_first(rows, forced_ids)
 
-    # Product filter
-    rows = _filter_by_products(rows, args.products)
+    print(f"[gen] final row count: {len(rows)}")
 
-    # Forced IDs (synthesize + put first in provided order)
-    rows = _apply_forced_ids(rows, args.forced_ids)
+    # Output assembly
+    generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    cloud_display = ", ".join(sorted({_canon_cloud(c) for c in clouds}))
 
-    # Build header & sections
-    generated = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    cloud_display = _cloud_display_from_args(args.cloud)
-    header = render_header(title=args.title, generated_utc=generated, cloud_display=cloud_display)
+    parts: list[str] = []
+    parts.append(render_header(title=args.title, generated_utc=generated, cloud_display=cloud_display))
+    parts.append(f"**Total features:** {len(rows)}\n")
+    parts.append(_make_toc(rows))
 
-    count_line = f"**Total features:** {len(rows)}\n\n"
-    toc = render_toc(rows)
-
-    parts = [header, count_line, toc]
-
-    # Feature sections
     for r in rows:
-        parts.append(render_feature_markdown(r))
+        parts.append(
+            render_feature_markdown(
+                public_id=r.public_id,
+                title=r.title or (f"[{r.public_id}]" if r.public_id else "(untitled)"),
+                product=r.product,
+                status=r.status,
+                clouds=r.clouds,
+                last_modified=r.last_modified,
+                release_date=r.release_date,
+                source=r.source,
+                message_id=r.message_id,
+                roadmap_link=r.roadmap_link,
+            )
+        )
+        parts.append("\n---\n")
 
-    # Write
-    _write_text(args.out, "".join(parts))
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text("\n".join(parts), encoding="utf-8")
+    print(f"[gen] wrote: {out_path}")
 
 
 if __name__ == "__main__":
