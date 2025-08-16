@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from textwrap import dedent
 from typing import Iterable, List, Optional, Sequence
+import re
 
 # We rely on your shared templates/utilities
 # FeatureRecord is the row model; render_header and render_feature_markdown produce MD
@@ -33,7 +34,60 @@ CSV_HEADERS = [
 ]
 
 
-def _read_master_csv(path: str) -> List[FeatureRecord]:
+def _row_to_feature(row: dict[str, str]) -> FeatureRecord:
+    """
+    Convert a CSV row (with headers like PublicId, Product_Workload, Cloud_instance, etc.)
+    into a FeatureRecord. Handles common header variants and normalizes clouds.
+    """
+    def g(*names: str) -> str:
+        for n in names:
+            if n in row and row[n] is not None:
+                v = str(row[n]).strip()
+                if v:
+                    return v
+        return ""
+
+    # Public ID (required-ish; empty rows are skipped by caller)
+    public_id = g("PublicId", "public_id", "Id", "ID")
+
+    # Clouds: split on common separators then normalize to canonical short names
+    clouds_raw = g("Cloud_instance", "Clouds", "Cloud", "CloudInstance")
+    cloud_tokens: list[str] = []
+    if clouds_raw:
+        cloud_tokens = [t.strip() for t in re.split(r"[|,;/]+", clouds_raw) if t.strip()]
+    clouds_norm = list(normalize_clouds(cloud_tokens)) if cloud_tokens else []
+
+    return FeatureRecord(
+        public_id=public_id,
+        title=g("Title", "title", "Name"),
+        product=g("Product_Workload", "Product", "Workload"),
+        status=g("Status"),
+        clouds=clouds_norm,
+        last_modified=g("LastModified", "Last Modified", "Modified"),
+        release_date=g("ReleaseDate", "Release Date"),
+        source=g("Source"),
+        message_id=g("MessageId", "Message ID", "MC_ID", "MCId"),
+        roadmap_link=g("Official_Roadmap_link", "Roadmap", "RoadmapLink"),
+    )
+
+
+def _read_master_csv(path: str) -> list[FeatureRecord]:
+    rows: list[FeatureRecord] = []
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            # Skip fully empty lines
+            if not any((v or "").strip() for v in row.values()):
+                continue
+            fr = _row_to_feature(row)
+            if not fr.public_id:
+                # No usable ID — skip
+                continue
+            rows.append(fr)
+    return rows
+
+
+
     rows: List[FeatureRecord] = []
     with open(path, "r", encoding="utf-8", newline="") as f:
         rdr = csv.DictReader(f)
