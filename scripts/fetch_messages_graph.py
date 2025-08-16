@@ -186,39 +186,65 @@ def _extract_roadmap_ids(*texts: str) -> set[str]:
     return ids
 
 def _graph_token_from_pfx(cfg: dict[str, Any]) -> tuple[Optional[str], str]:
+    """Return (access_token, error_message). error_message is '' on success."""
+    # Hard dependencies
     if msal is None or pkcs12 is None or Encoding is None or hashes is None:
         return (None, "Graph client not available on this runner (missing msal/cryptography).")
+
     tenant = (cfg.get("TENANT") or cfg.get("tenant") or "").strip()
     client = (cfg.get("CLIENT") or cfg.get("client") or "").strip()
     pfx_b64 = (cfg.get("PFX_B64") or cfg.get("pfx_b64") or "").strip()
-    pw_env = _graph_env_password_name(cfg)
+    pw_env = _graph_env_password_name(cfg)  # typically 'M365_PFX_PASSWORD'
     pw_text = os.environ.get(pw_env, "")
 
+    if not tenant or not client or not pfx_b64:
+        return (None, "Missing TENANT/CLIENT/PFX_B64 in config.")
+    if not pw_text:
+        return (None, f"Password env var '{pw_env}' is empty/missing.")
+
     try:
+        # Decode PFX → key/cert
         pfx_bytes = base64.b64decode(pfx_b64.encode("utf-8"), validate=False)
-        key, cert, _ = pkcs12.load_key_and_certificates(
-            pfx_bytes, pw_text.encode("utf-8") if pw_text else None
+        key, cert, _chain = pkcs12.load_key_and_certificates(
+            pfx_bytes,
+            pw_text.encode("utf-8"),
         )
         if key is None or cert is None:
-            return (None, "PFX decode yielded no key/cert (check password).")
+            return (None, "PFX decode yielded no key/cert (wrong password or corrupt PFX).")
 
-        private_key_pem = key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()).decode("utf-8")
+        # Convert to PEM and compute thumbprint
+        private_key_pem = key.private_bytes(
+            Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()
+        ).decode("utf-8")
         thumb = cert.fingerprint(hashes.SHA1()).hex()
 
+        # Authority base (defaults to public cloud)
+        authority_base = (cfg.get("authority_base") or "https://login.microsoftonline.com").rstrip("/")
+        authority = f"{authority_base}/{tenant}"
+
+        # Construct MSAL app WITH the client_credential here (not later)
         app = msal.ConfidentialClientApplication(
             client_id=client,
-            authority=f"https://login.microsoftonline.com/{tenant}",
+            authority=authority,
+            client_credential={"private_key": private_key_pem, "thumbprint": thumb},
         )
-        cred = {"private_key": private_key_pem, "thumbprint": thumb}
-        result = app.acquire_token_for_client(
-            scopes=["https://graph.microsoft.com/.default"],
-            client_credential=cred,
-        )
+
+        # Acquire token — NO client_credential kwarg here
+        result = app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
         if not result or "access_token" not in result:
-            return (None, f"Token acquisition failed: {result!r}")
+            err = result.get("error_description") if isinstance(result, dict) else repr(result)
+            return (None, f"Token acquisition failed: {err}")
+
+        # Tiny debug so you can verify flow in logs
+        print(f"DEBUG: MSAL {getattr(msal, '__version__', '?')} token OK, thumb={thumb[:8]}…")
+
         return (result["access_token"], "")
+
     except Exception as e:
         return (None, f"PFX/token error: {e}")
+
+
+
 
 def _fetch_graph_messages(cfg: dict[str, Any], selected_clouds: set[str], debug: bool = False) -> list[Row]:
     token, warn = _graph_token_from_pfx(cfg)
