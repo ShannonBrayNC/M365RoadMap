@@ -120,6 +120,88 @@ CSV_HEADERS: List[str] = [
 # Helpers
 # ------------------------------
 
+# --- helpers: split/serialize/write ------------------------------------------------
+from __future__ import annotations
+
+import csv
+import json
+import os
+import re
+from dataclasses import asdict, is_dataclass
+from typing import Any, Iterable, List, Dict, Sequence, Optional
+
+
+def _split_csv_like(value: str) -> list[str]:
+    """
+    Split a CSV/pipe/whitespace separated string into tokens.
+    Empty tokens are removed; surrounding quotes/space are stripped.
+    Examples:
+      'a,b|c  d' -> ['a','b','c','d']
+      '  "x" , y | z  ' -> ['x','y','z']
+    """
+    if not value:
+        return []
+    # split on comma, pipe, semicolon, or any whitespace
+    parts = re.split(r'[,\|;\s]+', value.strip())
+    # strip quotes/space and drop empties
+    cleaned = []
+    for p in parts:
+        p = p.strip().strip('"').strip("'")
+        if p:
+            cleaned.append(p)
+    return cleaned
+
+
+# Canonical field order we write to CSV/JSON
+_OUTPUT_FIELDS: list[str] = [
+    "PublicId",
+    "Title",
+    "Source",
+    "Product_Workload",
+    "Status",
+    "LastModified",
+    "ReleaseDate",
+    "Cloud_instance",
+    "Official_Roadmap_link",
+    "MessageId",
+]
+
+
+def _row_to_dict(row: Any) -> Dict[str, Any]:
+    """Convert a Row (dataclass or dict-like) to a plain dict with our fields."""
+    if is_dataclass(row):
+        data = asdict(row)
+    elif isinstance(row, dict):
+        data = dict(row)
+    else:
+        # Fall back to attribute access if it's a simple object
+        data = {k: getattr(row, k, None) for k in _OUTPUT_FIELDS}
+
+    # ensure all expected fields exist (fill missing with "")
+    for k in _OUTPUT_FIELDS:
+        if k not in data or data[k] is None:
+            data[k] = ""
+    return {k: data.get(k, "") for k in _OUTPUT_FIELDS}
+
+
+def write_csv(rows: Iterable[Any], out_path: str) -> None:
+    """Write rows to CSV in the canonical column order."""
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    with open(out_path, "w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=_OUTPUT_FIELDS)
+        w.writeheader()
+        for r in rows:
+            w.writerow(_row_to_dict(r))
+
+
+def write_json(rows: Iterable[Any], out_path: str) -> None:
+    """Write rows to JSON (list of dicts) in the canonical field order."""
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    out_list = [_row_to_dict(r) for r in rows]
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(out_list, f, indent=2, ensure_ascii=False)
+
+
 def parse_date_soft(s: Optional[str]) -> Optional[str]:
     """Accepts many common date forms; returns ISO YYYY-MM-DD or None."""
     if not s:
@@ -565,6 +647,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         "sources": {"graph": 0, "public-json": 0, "rss": 0, "seed": 0},
         "errors": 0,
     }
+
+
+
+
+
+
+
 
     # ---- Clouds (canonical set) ---------------------------------------------------
     selected_clouds: set[str] = set()
