@@ -96,26 +96,37 @@ def _section(label: str, body: str | None) -> str:
     return f"{label}\n{(body or '(pending)')}\n"
 
 
-def render_feature_markdown(fr: FeatureRecord) -> str:
-    header = f"[{fr.public_id}] {fr.title}"
-    meta = (
-        f"Product/Workload: {_dash(fr.product_workload)} "
-        f"Status: {_dash(fr.status)} "
-        f"Cloud(s): {_dash(fr.clouds_display)} "
-        f"Last Modified: {_dash(fr.last_modified)} "
-        f"Release Date: {_dash(fr.release_date)} "
-        f"Source: {_dash(fr.source)} "
-        f"Message ID: {_dash(fr.message_id)} "
-        f"Official Roadmap: {_dash(fr.official_url)}"
+def render_feature_markdown(
+    rec: FeatureRecord,
+    *,
+    summary: str | None = None,
+    changes: str | None = None,
+    impact: str | None = None,
+    actions: str | None = None,
+) -> str:
+    """
+    Render one feature card. If section strings are provided, use them;
+    otherwise render the legacy '(… pending)' placeholders.
+    """
+    header = (
+        f"[{rec.PublicId}] {rec.Title}\n"
+        f"Product/Workload: {rec.Product_Workload or '—'} "
+        f"Status: {rec.Status or '—'} "
+        f"Cloud(s): {rec.Cloud_instance or '—'} "
+        f"Last Modified: {rec.LastModified or '—'} "
+        f"Release Date: {rec.ReleaseDate or '—'} "
+        f"Source: {rec.Source or '—'} "
+        f"Message ID: {rec.MessageId or '—'} "
+        f"Official Roadmap: {rec.Official_Roadmap_link or '—'}\n"
     )
 
-    parts = [
-        header,
-        meta,
-        "",
-        _section("Summary", fr.summary),
-        _section("What’s changing", fr.whats_changing),
-        _section("Impact and rollout", fr.impact_rollout),
-        _section("Action items", fr.action_items),
-    ]
-    return "\n".join(parts) + "\n"
+    def sect(title: str, body: str | None, placeholder: str) -> str:
+        return f"\n{title}\n{body if (body and body.strip()) else f'({placeholder})'}\n"
+
+    return (
+        header
+        + sect("Summary", summary, "summary pending")
+        + sect("What’s changing", changes, "details pending")
+        + sect("Impact and rollout", impact, "impact pending")
+        + sect("Action items", actions, "actions pending")
+    )
