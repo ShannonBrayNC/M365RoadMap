@@ -1,0 +1,56 @@
+name: Build (fetch → enrich → replace)
+
+on:
+  schedule:
+    - cron: "0 3 * * *"   # daily
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # needed if you commit the replaced master files
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          pip install -r requirements.txt
+
+      - name: Fetch + Build (your existing steps)
+        run: |
+          python src/fetch_roadmap.py
+          python src/build_report.py
+
+      - name: Enrich (produce enriched files)
+        run: |
+          python src/m365_enrich.py \
+            --input data/roadmap_report_master.json \
+            --out-json data/roadmap_report_enriched.json \
+            --out-csv  data/roadmap_report_enriched.csv
+
+      - name: Replace master with enriched (JSON is source of truth)
+        run: |
+          # Keep a backup for audit (optional)
+          cp data/roadmap_report_master.json data/roadmap_report_master.backup.json || true
+
+          # Replace the canonical master with enriched
+          mv -f data/roadmap_report_enriched.json data/roadmap_report_master.json
+
+          # (Optional) keep CSV sidecar in repo for analysts
+          mv -f data/roadmap_report_enriched.csv  data/roadmap_report_master.csv || true
+
+      - name: Commit updated master (so downstream & website get latest)
+        if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
+        run: |
+          git config user.name  "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add data/roadmap_report_master.json data/roadmap_report_master.csv || true
+          git commit -m "chore: replace master with enriched dataset [skip ci]" || echo "No changes to commit"
+          git push
